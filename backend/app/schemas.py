@@ -19,8 +19,8 @@ FLIP_VERTICAL: dict[str, str] = {
 
 
 # ---------- Gemma output ----------
-class FrameAnalysis(BaseModel):
-    """Structured JSON Gemma returns for one keyframe."""
+class GemmaFrame(BaseModel):
+    """Structured JSON Gemma returns for one keyframe (this exact schema is sent to the model)."""
     has_sign: bool = False
     texts: list[str] = []
     room_numbers: list[str] = []
@@ -28,7 +28,13 @@ class FrameAnalysis(BaseModel):
     place_type: PlaceType = "hallway"
     stairs: Literal["none", "ahead_up", "ahead_down", "on_stairs_up", "on_stairs_down"] = "none"
     floor_hint: str = ""
-    description: str = Field("", description="Short landmark phrase, e.g. 'the glass doors beside Room 204'")
+    description: str = Field("", description="Short landmark phrase that completes 'Turn left at ___'")
+
+
+class FrameAnalysis(GemmaFrame):
+    """Gemma's answer after OCR grounding, plus the OCR evidence."""
+    ocr: list[str] = []
+    grounded: bool = False
 
 
 class SamePlace(BaseModel):

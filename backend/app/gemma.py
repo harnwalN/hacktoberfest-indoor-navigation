@@ -5,17 +5,18 @@ Runs fully offline once the model is pulled. Every answer is cached on disk keye
 """
 import hashlib
 import io
+import re
 import threading
 from pathlib import Path
 
 import ollama
 from PIL import Image
 
-from . import config
-from .schemas import FrameAnalysis, SamePlace
+from . import config, ocr
+from .schemas import FrameAnalysis, GemmaFrame, SamePlace
 from .store import read_json, write_json_atomic
 
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 
 ANALYZE_PROMPT = """You are helping map the inside of a building from a walkthrough video.
 The image is the camera view, looking in the walking direction.
@@ -45,6 +46,13 @@ Fill in the JSON fields:
 ZOOM_NOTE = """
 Image 1 is the full camera view. Images 2 and 3 are zoomed crops of its LEFT and RIGHT parts:
 use them to read small door plaques and signs exactly.
+"""
+
+OCR_NOTE = """
+An on-device text recognizer found exactly these text strings in the image (one per line):
+{lines}
+texts and room_numbers MUST be copied from these strings (only the wayfinding ones). If none of them
+is a wayfinding sign, return empty lists and has_sign=false. Do not report any other text or number.
 """
 
 SAME_PLACE_PROMPT = """Both images were taken while walking through the same building, at different times.
@@ -158,18 +166,59 @@ def _chat(model: str, prompt: str, images: list[bytes], schema_cls):
     raise GemmaUnavailable(f"Gemma returned unusable output: {last_exc}")
 
 
+def _strip_ungrounded_numbers(text: str, tokens: set[str]) -> tuple[str, bool]:
+    """Remove number-bearing words that OCR never saw. Returns (cleaned, changed)."""
+    words, changed = [], False
+    for w in text.split():
+        core = re.sub(r"[^A-Za-z0-9]", "", w).upper()
+        if any(ch.isdigit() for ch in core) and core not in tokens:
+            changed = True
+            continue
+        words.append(w)
+    return " ".join(words).strip(" -,–:"), changed
+
+
+def _ground(result: FrameAnalysis, lines: list[str]) -> FrameAnalysis:
+    tokens = ocr.ocr_tokens(lines)
+    result.texts = [t for t in result.texts if ocr.grounded(t, lines)]
+    result.room_numbers = [r for r in result.room_numbers if ocr.grounded(r, lines)]
+    result.has_sign = bool(result.texts or result.room_numbers)
+    if result.floor_hint and not ocr.grounded(result.floor_hint, lines):
+        result.floor_hint = ""
+    result.description, _ = _strip_ungrounded_numbers(result.description, tokens)
+    label, changed = _strip_ungrounded_numbers(result.suggested_label, tokens)
+    if changed:  # the label was built on an invented number: rebuild it from what is real
+        if result.room_numbers:
+            label = f"Room {result.room_numbers[0]}"
+        elif result.description:
+            label = result.description[:1].upper() + result.description[1:]
+        else:
+            label = result.place_type.capitalize()
+    result.suggested_label = label
+    result.grounded = True
+    return result
+
+
 def analyze_frame(path: Path, cache: GemmaCache, model: str | None = None) -> FrameAnalysis:
     model = model or resolve_model()
-    key = f"analyze:{PROMPT_VERSION}:{model}:{_sha(path)}"
+    use_ocr = ocr.available()
+    key = f"analyze:{PROMPT_VERSION}:{model}:{'ocr' if use_ocr else 'plain'}:{_sha(path)}"
     if (hit := cache.get(key)) is not None:
         return FrameAnalysis.model_validate(hit)
     views = _views(path)
-    result = _chat(model, ANALYZE_PROMPT, views[:1], FrameAnalysis)
-    if (result.has_sign and not result.texts) or (result.place_type == "room" and not result.room_numbers):
-        # A sign is visible but unreadable at 896px: re-ask with zoomed side crops.
-        zoomed = _chat(model, ANALYZE_PROMPT + ZOOM_NOTE, views, FrameAnalysis)
-        if zoomed.texts or zoomed.room_numbers:
-            result = zoomed
+    if use_ocr:
+        lines = ocr.read_text(path)
+        listing = "\n".join(f"- {l}" for l in lines) if lines else "(none)"
+        raw = _chat(model, ANALYZE_PROMPT + OCR_NOTE.format(lines=listing), views[:1], GemmaFrame)
+        result = _ground(FrameAnalysis(**raw.model_dump(), ocr=lines), lines)
+    else:
+        raw = _chat(model, ANALYZE_PROMPT, views[:1], GemmaFrame)
+        if (raw.has_sign and not raw.texts) or (raw.place_type == "room" and not raw.room_numbers):
+            # A sign is visible but unreadable at 896px: re-ask with zoomed side crops.
+            zoomed = _chat(model, ANALYZE_PROMPT + ZOOM_NOTE, views, GemmaFrame)
+            if zoomed.texts or zoomed.room_numbers:
+                raw = zoomed
+        result = FrameAnalysis(**raw.model_dump())
     result.texts = [t.strip() for t in result.texts if t.strip()]
     result.room_numbers = [r.strip() for r in result.room_numbers if r.strip()]
     cache.put(key, result.model_dump())

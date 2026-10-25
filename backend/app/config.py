@@ -22,6 +22,10 @@ GEMMA_IMAGE_MAX = int(os.getenv("GEMMA_IMAGE_MAX", 896))  # Gemma 3 vision encod
 GEMMA_TIMEOUT_SEC = _f("GEMMA_TIMEOUT_SEC", 300)
 GEMMA_CONCURRENCY = int(os.getenv("GEMMA_CONCURRENCY", 3))  # pair with OLLAMA_NUM_PARALLEL>=3
 
+# On-device OCR (macOS Vision) grounds Gemma's sign text so it cannot invent room numbers.
+OCR_ENABLED = os.getenv("OCR_ENABLED", "1") != "0"
+OCR_MIN_CONFIDENCE = _f("OCR_MIN_CONFIDENCE", 0.5)
+
 # --- Video normalization ---
 ANALYSIS_FPS = int(os.getenv("ANALYSIS_FPS", 10))
 ANALYSIS_LONG_SIDE = int(os.getenv("ANALYSIS_LONG_SIDE", 640))

@@ -64,7 +64,17 @@ def build_graph(bundle: MapBundle) -> nx.Graph:
 
 
 def _place(node: Node) -> str:
-    return node.description.strip() or node.label
+    """Landmark phrase that reads naturally after 'at': 'the glass doors with a plaque'."""
+    d = node.description.strip().rstrip(".")
+    if not d:
+        return node.label
+    if node.texts and node.label.lower() not in d.lower():
+        return node.label  # a named place reads better than a description of it
+    first, _, rest = d.partition(" ")
+    if not any(ch.isdigit() for ch in first) and not first.isupper():
+        first = first.lower()
+    d = f"{first} {rest}".strip()
+    return d if d.split(" ", 1)[0] in ("the", "a", "an") else f"the {d}"
 
 
 def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:

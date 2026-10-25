@@ -102,7 +102,7 @@ class WalkNode:
 
     @property
     def texts(self) -> list[str]:
-        return list(dict.fromkeys(self.analysis.texts + self.analysis.room_numbers + self.extra_texts))
+        return list(dict.fromkeys(wayfinding_texts(self.analysis) + self.extra_texts))
 
 
 def _stairs_state(a: FrameAnalysis | None) -> str:
@@ -111,12 +111,43 @@ def _stairs_state(a: FrameAnalysis | None) -> str:
     return {"on_stairs_up": "up", "on_stairs_down": "down"}.get(a.stairs, "none")
 
 
+# Safety/notice words OCR picks up that are never wayfinding (Gemma sometimes keeps them anyway).
+NOT_WAYFINDING = {"CAUTION", "NOTICE", "WARNING", "SECURITY", "CAMERAS", "CAMERA", "PREMISES", "AUTOMATIC",
+                  "DOOR", "PUSH", "PULL", "ON", "THE", "AND", "FOR", "OPERATE", "ACTIVATE", "SWITCH", "TO",
+                  "WET", "FLOOR", "DANGER", "EMERGENCY", "EVACUATION", "PLAN", "DO", "NOT", "ENTER"}
+
+
+def wayfinding_texts(a: FrameAnalysis | None) -> list[str]:
+    if a is None:
+        return []
+    keep = []
+    for t in a.texts + a.room_numbers:
+        words = [re.sub(r"[^A-Z0-9]", "", w) for w in t.upper().split()]
+        words = [w for w in words if w]
+        if words and not all(w in NOT_WAYFINDING for w in words):
+            keep.append(t)
+    return list(dict.fromkeys(keep))
+
+
+def _has_sign(a: FrameAnalysis | None) -> bool:
+    return bool(wayfinding_texts(a))
+
+
+def _key_place(a: FrameAnalysis | None) -> bool:
+    """Entrances/restrooms/exits/elevators need sign evidence when OCR grounding is on;
+    a staircase is recognizable from the picture alone."""
+    if a is None:
+        return False
+    if a.place_type == "stairs" or a.stairs in ("ahead_up", "ahead_down"):
+        return True
+    return a.place_type in KEY_TYPES and (_has_sign(a) or not a.grounded)
+
+
 def _worthy(kf: Keyframe) -> bool:
     a = kf.analysis
     if kf.kind in NODE_KINDS:
         return True
-    return bool(a and (a.room_numbers or a.place_type in KEY_TYPES or (a.place_type == "room" and a.has_sign)
-                       or a.stairs in ("ahead_up", "ahead_down")))
+    return bool(a and (a.room_numbers or _key_place(a) or (a.place_type == "room" and _has_sign(a))))
 
 
 def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
@@ -141,7 +172,7 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
         wn = WalkNode(kf=k, t_arrive=k.t_arrive if k.t_arrive is not None else k.t,
                       t_depart=k.t_depart if k.t_depart is not None else k.t, analysis=a)
         prev = nodes[-1] if nodes else None
-        if prev and not _crosses_stairs(kfs, states, prev, wn) and (
+        if prev and not _crosses_stairs(kfs, states, prev, wn) and not _keep_apart(prev, wn) and (
                 wn.t_arrive - prev.t_depart < config.NODE_MIN_GAP_SEC
                 or (wn.t_arrive - prev.t_depart < config.SAME_PLACE_WINDOW_SEC and _same_spot(prev, wn))):
             _absorb(prev, wn)
@@ -161,6 +192,12 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
 
 def _norm_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def _keep_apart(a: WalkNode, b: WalkNode) -> bool:
+    """Keep the walk's start/end separate from an adjacent turn, so that turn stays routable."""
+    kinds = {a.kf.kind, b.kf.kind}
+    return bool(kinds & {"start", "end"}) and "turn_start" in kinds
 
 
 def _same_spot(a: WalkNode, b: WalkNode) -> bool:
@@ -183,11 +220,11 @@ def _crosses_stairs(kfs, states, a: WalkNode, b: WalkNode) -> bool:
 def _absorb(keep: WalkNode, other: WalkNode) -> None:
     """Merge two walk nodes that are too close in time into one."""
     def rank(w: WalkNode):
-        return (0 if w.analysis.has_sign else 1, KIND_PRIORITY.get(w.kf.kind, 9))
+        return (0 if _has_sign(w.analysis) else 1, KIND_PRIORITY.get(w.kf.kind, 9))
     if KIND_PRIORITY.get(other.kf.kind, 9) < KIND_PRIORITY.get(keep.kf.kind, 9):
         keep.kf, keep.depart_frame = other.kf, other.depart_frame or keep.depart_frame
     if rank(other) < rank(keep):
-        keep.extra_texts += keep.analysis.texts + keep.analysis.room_numbers
+        keep.extra_texts += wayfinding_texts(keep.analysis)
         keep.analysis = other.analysis
     else:
         keep.extra_texts += other.texts
@@ -200,7 +237,7 @@ def _label(wn: WalkNode) -> tuple[str, str]:
     ptype = a.place_type
     if wn.kf.kind == "turn_start" and ptype == "hallway":
         ptype = "intersection"
-    if a.suggested_label and (a.has_sign or ptype != "hallway"):
+    if a.suggested_label and (_has_sign(a) or ptype != "hallway"):
         return a.suggested_label.strip(), ptype
     defaults = {"start": "Walk start", "end": "Walk end", "turn_start": "Hallway junction",
                 "glance": "Doorway", "dwell": "Hallway point"}
@@ -341,8 +378,8 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
                 id=f"n{node_counter:03d}", label=label, type=ptype, frame_id=wn.kf.frame_id,
                 texts=wn.texts, description=wn.analysis.description, soft=wn.kf.soft,
                 video_id=video_id, t=wn.kf.t,
-                verified=bool(wn.analysis.room_numbers) or ptype in KEY_TYPES
-                or (ptype == "room" and wn.analysis.has_sign and bool(wn.texts)),
+                verified=bool(wn.analysis.room_numbers) or _key_place(wn.analysis)
+                or (ptype == "room" and _has_sign(wn.analysis)),
             )
             node_counter += 1
             bundle.nodes.append(node)
