@@ -1,0 +1,11 @@
+# raw walkthrough videos are large; keep them out of git
+*.MOV
+*.mov
+*.mp4
+backend/.venv/
+backend/data/buildings/*/videos/
+backend/static/
+frontend/node_modules/
+__pycache__/
+.pytest_cache/
+.DS_Store
