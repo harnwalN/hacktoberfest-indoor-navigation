@@ -11,18 +11,21 @@ export const api = {
   createBuilding: (name) => http.post('/buildings', { name }).then((r) => r.data),
   getMap: (b) => http.get(`/buildings/${b}/map`).then((r) => r.data),
   saveMap: (b, map) => http.put(`/buildings/${b}/map`, map).then((r) => r.data.map),
-  uploadVideo: (b, file, { sensors, model, priority, onProgress } = {}) => {
+  uploadVideo: (b, file, { sensors, model, priority, startFloor, onProgress } = {}) => {
     const form = new FormData()
     form.append('video', file, file.name || 'walk.mp4')
     if (sensors) form.append('sensors', new Blob([JSON.stringify(sensors)], { type: 'application/json' }), 'sensors.json')
     if (model) form.append('model', model)
     if (priority) form.append('priority', 'true')
+    if (startFloor !== '' && startFloor != null) form.append('start_floor', String(startFloor))
     return http
       .post(`/buildings/${b}/videos`, form, {
         onUploadProgress: (e) => onProgress?.(e.total ? e.loaded / e.total : 0),
       })
       .then((r) => r.data)
   },
+  setVideoFloor: (b, v, startFloor) => http.patch(`/buildings/${b}/videos/${v}`, { start_floor: Number(startFloor) }).then((r) => r.data),
+  consolidate: (b) => http.post(`/buildings/${b}/consolidate`).then((r) => r.data),
   rebuild: (b) => http.post(`/buildings/${b}/rebuild`).then((r) => r.data),
   job: (id) => http.get(`/jobs/${id}`).then((r) => r.data),
   queue: (b) => http.get(`/buildings/${b}/queue`).then((r) => r.data),

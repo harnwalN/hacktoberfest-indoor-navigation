@@ -22,6 +22,7 @@ export default function Recorder({ building, onUploaded }) {
   const [motion, setMotion] = useState('unknown')
   const [elapsed, setElapsed] = useState(0)
   const [status, setStatus] = useState('')
+  const [startFloor, setStartFloor] = useState('')
 
   useEffect(() => () => stream?.getTracks().forEach((t) => t.stop()), [stream])
 
@@ -91,6 +92,7 @@ export default function Recorder({ building, onUploaded }) {
       await api.uploadVideo(building, result.file, {
         sensors: result.sensors.samples.length > 20 ? result.sensors : null,
         priority: true, // phone recordings jump the queue so you can try them right away
+        startFloor,
         onProgress: (p) => setStatus(`Uploading ${Math.round(p * 100)}%`),
       })
       setStatus('Uploaded. It jumps the queue: processing starts on the laptop now (see Build → Queue).')
@@ -112,6 +114,12 @@ export default function Recorder({ building, onUploaded }) {
       {!stream && <button className="primary big" onClick={start}>Enable camera & motion</button>}
       {stream && !recording && <button className="primary big" onClick={record}><Circle size={18} /> Start recording</button>}
       {recording && <button className="danger big" onClick={stop}><Square size={18} /> Stop</button>}
+      {result && !recording && (
+        <label className="field">
+          <span>This walk starts on floor</span>
+          <input type="number" inputMode="numeric" placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+        </label>
+      )}
       {result && !recording && (
         <button className="primary big" onClick={upload}>
           <UploadCloud size={18} /> Upload ({(result.file.size / 1e6).toFixed(0)} MB, {result.sensors.samples.length} gyro samples)

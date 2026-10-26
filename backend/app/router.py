@@ -10,6 +10,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from . import gemma, jobs, mapper, routing, store
 from .schemas import (
     CreateBuilding, FrameAnalysis, ManualMerge, MapBundle, MergeDecision, Node, RouteRequest, RouteResponse,
+    VideoUpdate,
 )
 
 api = APIRouter(prefix="/api")
@@ -91,6 +92,7 @@ async def upload_video(
     sensors: UploadFile | None = File(None),
     model: str | None = Form(None),
     priority: bool = Form(False),
+    start_floor: int | None = Form(None),
 ):
     _load(building_id)
     tmp = Path(tempfile.mkstemp(suffix=Path(video.filename or "v.mp4").suffix)[1])
@@ -103,10 +105,37 @@ async def upload_video(
             sensor_data = json.loads(await sensors.read())
         except json.JSONDecodeError:
             raise HTTPException(400, "sensors must be JSON")
-    job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None, front=priority)
+    job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None, front=priority,
+                           start_floor=start_floor)
     if priority:
         jobs.run_next(job.id)
     return {"job_id": job.id, "video_id": job.video_id}
+
+
+@api.patch("/buildings/{building_id}/videos/{video_id}")
+def update_video(building_id: str, video_id: str, body: VideoUpdate):
+    """Set the floor a walk starts on. Places from an already-processed walk move instantly."""
+    with store.lock_for(building_id):
+        bundle = _load(building_id)
+        v = next((v for v in bundle.videos if v.id == video_id), None)
+        if v is None:
+            raise HTTPException(404, "Unknown video")
+        v.start_floor = body.start_floor
+        if v.status == "done":
+            delta = body.start_floor - v.floor_offset
+            for n in bundle.nodes:
+                if n.video_id == video_id:
+                    n.floor += delta
+            v.floor_offset = body.start_floor
+        store.save_map(bundle)
+    return v
+
+
+@api.post("/buildings/{building_id}/consolidate")
+def consolidate(building_id: str):
+    """Link all walks into one map now (runs next in the queue; fast, Gemma answers are cached)."""
+    _load(building_id)
+    return {"job_id": jobs.submit_consolidate(building_id).id}
 
 
 @api.post("/buildings/{building_id}/rebuild")

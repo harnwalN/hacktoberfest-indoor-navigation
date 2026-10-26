@@ -123,7 +123,7 @@ def _worker_loop() -> None:
 
 
 def submit_video(building_id: str, upload_path: Path, filename: str, sensors: dict | None, model: str | None,
-                 front: bool = False) -> Job:
+                 front: bool = False, start_floor: int | None = None) -> Job:
     video_id = f"v{time.strftime('%H%M%S')}{uuid.uuid4().hex[:4]}"
     vdir = store.video_dir(building_id, video_id)
     vdir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +133,7 @@ def submit_video(building_id: str, upload_path: Path, filename: str, sensors: di
         store.write_json_atomic(vdir / "sensors.json", sensors)
     with store.lock_for(building_id):
         bundle = store.load_map(building_id)
-        bundle.videos.append(VideoInfo(id=video_id, filename=filename, has_sensors=bool(sensors)))
+        bundle.videos.append(VideoInfo(id=video_id, filename=filename, has_sensors=bool(sensors), start_floor=start_floor))
         store.save_map(bundle)
     job = Job(id=uuid.uuid4().hex[:10], building_id=building_id, video_id=video_id, kind="video", filename=filename)
     return _enqueue(job, lambda: _process_video(job, src, sensors, model), front)
@@ -289,12 +289,18 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     job.enter("mapping"); job.say("Building graph and closing loops")
     with store.lock_for(bid):
         bundle = store.load_map(bid)
+        info = next(v for v in bundle.videos if v.id == vid)
         result = mapper.integrate_walk(bundle, vid, keyframes, track, store.frames_dir(bid),
-                                       gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say)
+                                       gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
+                                       start_floor=info.start_floor)
         if use_gemma:
             bundle.processed_with = {"model": model or gemma.resolve_model(), "prompt": gemma.PROMPT_VERSION}
         v = next(v for v in bundle.videos if v.id == vid)
         v.duration, v.keyframes, v.status = round(duration, 1), len(keyframes), "done"
+        v.floor_offset = result.get("floor_offset") or 0
+        job.say("Linking with the rest of the building map")
+        result["consolidate"] = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
+                                                   use_gemma, log=job.say)
         store.save_map(bundle)
     job.result = result
     job.say(f"Map updated: {result}")
@@ -307,7 +313,8 @@ def _rebuild(job: Job) -> None:
         bundle = store.load_map(bid)
         bundle.nodes, bundle.edges, bundle.suggested_merges = [], [], []
         store.save_map(bundle)
-    videos = [v for v in bundle.videos if (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
+    # only finished walks: queued/paused ones will be integrated when their own job runs
+    videos = [v for v in bundle.videos if v.status == "done" and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
     for i, v in enumerate(videos):
         job.say(f"Reprocessing {v.filename} ({i + 1}/{len(videos)})")
         vdir = store.video_dir(bid, v.id)
@@ -329,7 +336,36 @@ def _rebuild(job: Job) -> None:
         with store.lock_for(bid):
             bundle = store.load_map(bid)
             res = mapper.integrate_walk(bundle, v.id, keyframes, track, store.frames_dir(bid),
-                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say)
+                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
+                                        start_floor=v.start_floor)
+            info = next(x for x in bundle.videos if x.id == v.id)
+            info.floor_offset = res.get("floor_offset") or 0
             store.save_map(bundle)
         job.say(f"{v.filename}: {res}")
     job.video_id = None
+    _consolidate(job)
+
+
+def submit_consolidate(building_id: str) -> Job:
+    job = Job(id=uuid.uuid4().hex[:10], building_id=building_id, video_id=None, kind="consolidate",
+              filename="(link videos)")
+    return _enqueue(job, lambda: _consolidate(job), front=True)
+
+
+def _consolidate(job: Job) -> None:
+    bid = job.building_id
+    job.enter("mapping")
+    job.say("Linking all walks into one building map")
+    with store.lock_for(bid):
+        bundle = store.load_map(bid)
+        job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
+                                        _gemma_ok(), log=job.say)
+        store.save_map(bundle)
+
+
+def _gemma_ok() -> bool:
+    try:
+        gemma.resolve_model()
+        return True
+    except gemma.GemmaUnavailable:
+        return False

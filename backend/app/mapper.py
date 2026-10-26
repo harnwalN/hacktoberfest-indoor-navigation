@@ -249,6 +249,41 @@ def _next_id(prefix: str, existing: list[str]) -> int:
     return max(nums, default=0) + 1
 
 
+# ---------------------------------------------------------------- floors
+def room_floor(texts: list[str]) -> int | None:
+    """Floor implied by room numbers, using the 'first digit(s) = floor' convention (121 -> 1, 1210 -> 12)."""
+    if not config.ROOM_NUMBER_FLOORS:
+        return None
+    floors = []
+    for tok in text_tokens(texts):
+        m = re.fullmatch(r"[A-Z]?(\d{3,4})[A-Z]?", tok)
+        if m:
+            floors.append(int(m.group(1)[:-2]))
+    return max(set(floors), key=floors.count) if floors else None
+
+
+def assign_floors(wnodes: list[WalkNode], start_floor: int | None) -> list[int | None]:
+    """Absolute floor per walk node, or None when unknown.
+
+    Relative floor changes come from detected stairs (rel_floor). The absolute offset comes from the
+    uploader's start floor and/or room-number evidence; a persistent change in room-number floors that
+    stairs do not explain (e.g. an elevator ride, missed stairs) starts a new floor segment.
+    """
+    ev = [(i, f - wn.rel_floor) for i, wn in enumerate(wnodes) if (f := room_floor(wn.texts)) is not None]
+    offsets: list[int | None] = []
+    cur = start_floor if start_floor is not None else (ev[0][1] if ev else None)
+    j = 0
+    for i in range(len(wnodes)):
+        while j < len(ev) and ev[j][0] == i:
+            off = ev[j][1]
+            confirmed = j + 1 >= len(ev) or ev[j + 1][1] == off  # one misread number is not a floor change
+            if off != cur and confirmed and not (cur == start_floor and j == 0 and len(ev) == 1):
+                cur = off
+            j += 1
+        offsets.append(cur)
+    return [wn.rel_floor + o if o is not None else None for wn, o in zip(wnodes, offsets)]
+
+
 # ---------------------------------------------------------------- loop closure
 @dataclass
 class Match:
@@ -261,13 +296,15 @@ class Match:
 
 
 def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma: bool,
-                exclude: set[str], walk_times: dict[str, float], log) -> Match | None:
+                exclude: set[str], walk_times: dict[str, float], log, w_floor: int | None = None) -> Match | None:
     w_tokens = text_tokens(wn.texts)
     w_path = frames / wn.kf.frame_id
     cands = []
     for node in bundle.nodes:
         if node.id in exclude or not node.frame_id:
             continue
+        if w_floor is not None and node.floor != w_floor:
+            continue  # similar corridors on different floors are never the same place
         if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < 15:
             continue  # same walk, a few seconds ago: that's just the previous stretch of hallway
         text_hit = bool(w_tokens & text_tokens(node.texts))
@@ -332,7 +369,7 @@ def _fit_correction(abs_c: list[tuple[float, float]], rel_c: list[tuple[float, f
 
 # ---------------------------------------------------------------- integrate one walk
 def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], track: dict,
-                   frames: Path, cache, use_gemma: bool, log=print) -> dict:
+                   frames: Path, cache, use_gemma: bool, log=print, start_floor: int | None = None) -> dict:
     wnodes = walk_nodes(keyframes)
     if not wnodes:
         return {"nodes": 0, "merged": 0}
@@ -346,13 +383,17 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     abs_c: list[tuple[float, float]] = [(0.0, 0.0)] if first_walk else []
     rel_c: list[tuple[float, float, float]] = []
     pending_suggestions: list[tuple[Match, WalkNode]] = []
-    floor_offset: int | None = 0 if first_walk else None
+    # Floors: start floor and room numbers first; still-unknown floors inherit from the first known place
+    # this walk passes (or default to 0 for the very first walk).
+    floors = assign_floors(wnodes, start_floor)
+    inherit: int | None = 0 if first_walk and all(f is None for f in floors) else None
     created: list[tuple[Node, WalkNode]] = []
     merged = 0
     recent: list[str] = []
 
-    for wn in wnodes:
-        match = _find_match(wn, bundle, frames, cache, use_gemma, set(recent[-2:]), walk_times, log)
+    for i, wn in enumerate(wnodes):
+        w_floor = floors[i] if floors[i] is not None else (wn.rel_floor + inherit if inherit is not None else None)
+        match = _find_match(wn, bundle, frames, cache, use_gemma, set(recent[-2:]), walk_times, log, w_floor)
         if match and match.auto:
             node = match.node
             wn.node_id = node.id
@@ -362,8 +403,8 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
                 node.frame_id, node.soft = wn.kf.frame_id, False
                 node.frame_heading = None  # re-set below once headings are corrected
             log(f"Loop closure: walk t={wn.kf.t:.1f}s is '{node.label}' ({match.reason})")
-            if floor_offset is None:
-                floor_offset = node.floor - wn.rel_floor
+            if floors[i] is None and inherit is None:
+                inherit = node.floor - wn.rel_floor
             # Same view seen twice => headings must agree (up to the measured relative yaw).
             if match.rel_yaw is not None:
                 observed = wn.kf.heading
@@ -398,11 +439,13 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         log("No geometric anchor to the existing map for this walk; its headings use their own frame")
     if abs_c or rel_c:
         log(f"Heading correction: offset {c0:+.1f} deg, drift {k * 60:+.1f} deg/min")
-    if floor_offset is None:
-        floor_offset = 0
+    for i, wn in enumerate(wnodes):
+        if floors[i] is None:
+            floors[i] = wn.rel_floor + (inherit or 0)
+    floor_of = {id(wn): f for wn, f in zip(wnodes, floors)}
     for node, wn in created:
         node.frame_heading = round(wrap360(wn.kf.heading - corr(wn.kf.t)), 1)
-        node.floor = wn.rel_floor + floor_offset
+        node.floor = floor_of[id(wn)]
     for node in bundle.nodes:
         if node.frame_heading is None and node.frame_id:
             wn = next((w for w in wnodes if w.kf.frame_id == node.frame_id), None)
@@ -432,8 +475,14 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         up = sum(states[k.frame_id] == "up" for k in seg)
         down = sum(states[k.frame_id] == "down" for k in seg)
         vertical = "stairs_up" if up > down else "stairs_down" if down > up else "none"
-        if vertical == "none" and b.rel_floor != a.rel_floor:
-            vertical = "stairs_up" if b.rel_floor > a.rel_floor else "stairs_down"
+        fa, fb = floor_of[id(a)], floor_of[id(b)]
+        inferred = False
+        if vertical == "none" and fb != fa:
+            vertical = "stairs_up" if fb > fa else "stairs_down"
+            inferred = b.rel_floor == a.rel_floor  # room numbers say new floor, but no stairs were seen
+            if inferred:
+                log(f"Floor {fa} -> {fb} inferred from room numbers between t={a.kf.t:.0f}s and t={b.kf.t:.0f}s "
+                    "(no stairs seen: check stairs vs elevator in Map)")
         frames_seq = [a.depart_frame or a.kf.frame_id] + [k.frame_id for k in seg
                                                           if k.kind not in ("glance",) and k.frame_id != a.depart_frame]
         frames_seq.append(b.kf.frame_id)
@@ -447,13 +496,18 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         bundle.edges.append(Edge(
             id=f"e{edge_counter:03d}", from_node=a.node_id, to_node=b.node_id,
             heading_out=h_out, heading_in=h_in, heading_out_raw=round(h_out, 1), heading_in_raw=round(h_in, 1),
-            vertical=vertical, frames_fwd=frames_seq, source="walk",
+            vertical=vertical, frames_fwd=frames_seq, source="walk", video_id=video_id,
+            inferred_floor_change=inferred,
         ))
         edge_counter += 1
         new_edges += 1
 
+    info = next((v for v in bundle.videos if v.id == video_id), None)
+    if info is not None:
+        info.anchored = first_walk or bool(abs_c)
     finalize(bundle)
-    return {"nodes": len(created), "merged": merged, "edges": new_edges,
+    return {"nodes": len(created), "merged": merged, "edges": new_edges, "floor_offset": floors[0] - wnodes[0].rel_floor,
+            "floors": sorted(set(floors)),
             "suggested": len(pending_suggestions), "drift_deg_per_min": round(k * 60, 1)}
 
 
@@ -534,6 +588,146 @@ def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str) -> None:
         s.remove = keep_id if s.remove == remove_id else s.remove
     bundle.suggested_merges = [s for s in bundle.suggested_merges if s.keep != s.remove]
     finalize(bundle)
+
+
+# ---------------------------------------------------------------- map-wide consolidation
+def _room_ids(node: Node) -> set[str]:
+    return {t for t in text_tokens(node.texts) if re.fullmatch(r"[A-Z]?\d{3,4}[A-Z]?", t)}
+
+
+def _directions_at(bundle: MapBundle, node_id: str, video_id: str | None, include: bool) -> list[float]:
+    """Travel directions leaving `node_id` along edges recorded by `video_id` (include) or by others."""
+    out = []
+    for e in bundle.edges:
+        if (e.video_id == video_id) != include or e.heading_out_raw is None:
+            continue
+        if e.from_node == node_id:
+            out.append(e.heading_out_raw)
+        elif e.to_node == node_id:
+            out.append((e.heading_in_raw + 180) % 360)
+    return out
+
+
+def _align_video(bundle: MapBundle, video_id: str, log) -> bool:
+    """Rotate an unanchored walk by the multiple of 90 deg that best lines its corridors up with the
+    anchored map at the places they share (buildings are mostly orthogonal)."""
+    anchored = {v.id for v in bundle.videos if v.anchored}
+    shared = {n for e in bundle.edges if e.video_id == video_id for n in (e.from_node, e.to_node)} & \
+             {n for e in bundle.edges if e.video_id in anchored for n in (e.from_node, e.to_node)}
+    if not shared:
+        return False
+    best, best_score = 0, float("inf")
+    for rot in (0, 90, 180, 270):
+        score = 0.0
+        for n in shared:
+            mine = _directions_at(bundle, n, video_id, True)
+            theirs = _directions_at(bundle, n, video_id, False)
+            for d in mine:
+                score += min((abs(wrap180(d + rot - o)) for o in theirs), default=45)
+        if score < best_score:
+            best, best_score = rot, score
+    for e in bundle.edges:
+        if e.video_id == video_id:
+            e.heading_out_raw = round(wrap360((e.heading_out_raw or 0) + best), 1)
+            e.heading_in_raw = round(wrap360((e.heading_in_raw or 0) + best), 1)
+    for n in bundle.nodes:
+        if n.video_id == video_id and n.frame_heading is not None:
+            n.frame_heading = round(wrap360(n.frame_heading + best), 1)
+    next(v for v in bundle.videos if v.id == video_id).anchored = True
+    log(f"Aligned walk {video_id} to the building frame (rotated {best} deg at {len(shared)} shared place(s))")
+    return True
+
+
+def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=print) -> dict:
+    """One map from n videos: merge places seen in different walks, independent of upload order.
+
+    1. identity: the same OCR-verified room number on the same floor is the same place (even when the
+       two walks faced opposite directions and the photos look nothing alike);
+    2. appearance: strong ORB geometry, or ORB + Gemma 'same place', between walks on the same floor;
+    3. heading alignment for walks that joined the map without a geometric anchor.
+    Floors are never mixed: similar corridors on different floors stay separate.
+    """
+    merged, suggested = 0, 0
+    existing_pairs = {frozenset((s.keep, s.remove)) for s in bundle.suggested_merges}
+
+    def alive(nid):
+        return any(n.id == nid for n in bundle.nodes)
+
+    # 1. room-number identity
+    nodes = list(bundle.nodes)
+    for i, a in enumerate(nodes):
+        for b in nodes[i + 1:]:
+            if not (alive(a.id) and alive(b.id)) or a.floor != b.floor:
+                continue
+            ra, rb = _room_ids(a), _room_ids(b)
+            if ra and rb and ra & rb and (len(ra) <= 2 and len(rb) <= 2):
+                log(f"Same room {'/'.join(sorted(ra & rb))}: merging '{b.label}' into '{a.label}'")
+                merge_nodes(bundle, a.id, b.id)
+                merged += 1
+
+    # 2. appearance across walks
+    nodes = list(bundle.nodes)
+    for i, a in enumerate(nodes):
+        for b in nodes[i + 1:]:
+            if (not (alive(a.id) and alive(b.id)) or a.floor != b.floor or a.video_id == b.video_id
+                    or not a.frame_id or not b.frame_id):
+                continue
+            inliers, _ = orb_match(frames / a.frame_id, frames / b.frame_id)
+            if inliers < config.ORB_WEAK_INLIERS:
+                continue
+            verdict = None
+            if use_gemma and inliers < 1.5 * config.ORB_STRONG_INLIERS:
+                try:
+                    verdict = gemma.same_place(frames / a.frame_id, frames / b.frame_id, cache)
+                except gemma.GemmaUnavailable:
+                    use_gemma = False
+            strong = inliers >= 1.5 * config.ORB_STRONG_INLIERS
+            if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE):
+                why = f"{inliers} matching features" + (f"; Gemma: {verdict.reason}" if verdict else "")
+                log(f"Same place across walks: merging '{b.label}' into '{a.label}' ({why})")
+                merge_nodes(bundle, a.id, b.id)
+                merged += 1
+            elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place
+                                                                        and verdict.confidence >= 0.7):
+                bundle.suggested_merges.append(SuggestedMerge(
+                    id=f"m{_next_id('m', [s.id for s in bundle.suggested_merges]):03d}", keep=a.id, remove=b.id,
+                    confidence=round(verdict.confidence if verdict else inliers / (2 * config.ORB_STRONG_INLIERS), 2),
+                    reason=(f"Gemma: {verdict.reason}" if verdict else f"{inliers} matching image features"),
+                    signals={"orb_inliers": inliers, **({"gemma": verdict.model_dump()} if verdict else {})},
+                ))
+                existing_pairs.add(frozenset((a.id, b.id)))
+                suggested += 1
+
+    # 3. align walks that joined without a geometric anchor
+    aligned = 0
+    for _ in range(len(bundle.videos)):
+        progress = False
+        for v in bundle.videos:
+            if not v.anchored and v.status == "done" and _align_video(bundle, v.id, log):
+                aligned += 1
+                progress = True
+        if not progress:
+            break
+
+    finalize(bundle)
+    g_components = _components(bundle)
+    log(f"Consolidated: {merged} merged, {suggested} suggested, {aligned} walks aligned; "
+        f"map has {len(bundle.nodes)} places in {g_components} connected piece(s)")
+    return {"merged": merged, "suggested": suggested, "aligned": aligned, "components": g_components}
+
+
+def _components(bundle: MapBundle) -> int:
+    parent = {n.id: n.id for n in bundle.nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for e in bundle.edges:
+        if e.from_node in parent and e.to_node in parent:
+            parent[find(e.from_node)] = find(e.to_node)
+    return len({find(x) for x in parent})
 
 
 def flip_vertical(v: str) -> str:

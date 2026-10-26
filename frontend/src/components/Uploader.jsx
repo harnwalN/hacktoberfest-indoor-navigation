@@ -12,6 +12,7 @@ export default function Uploader({ building, onDone }) {
   const [sensorFile, setSensorFile] = useState(null)
   const [model, setModel] = useState('')
   const [priority, setPriority] = useState(false)
+  const [startFloor, setStartFloor] = useState('')
   const [uploadPct, setUploadPct] = useState(null)
   const [jobId, setJobId] = useState(null)
   const [inspect, setInspect] = useState(null)
@@ -30,7 +31,7 @@ export default function Uploader({ building, onDone }) {
     try {
       const sensors = sensorFile ? JSON.parse(await sensorFile.text()) : null
       setUploadPct(0)
-      const r = await api.uploadVideo(building, file, { sensors, model, priority, onProgress: setUploadPct })
+      const r = await api.uploadVideo(building, file, { sensors, model, priority, startFloor, onProgress: setUploadPct })
       setJobId(r.job_id)
       setInspect(null)
     } catch (e) {
@@ -77,6 +78,10 @@ export default function Uploader({ building, onDone }) {
             </select>
           </label>
         )}
+        <label className="field">
+          <span>Starts on floor (keeps floors from stacking; leave blank to inherit from places it passes)</span>
+          <input type="number" placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+        </label>
         <label className="check">
           <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
           Process next (pauses the current video; it resumes afterwards)
@@ -130,6 +135,11 @@ export default function Uploader({ building, onDone }) {
                 {v.filename} <small className="muted">· {v.duration}s · {v.keyframes} keyframes{v.has_sensors ? ' · gyro' : ''}</small>
               </span>
               <span className={`pill ${v.status}`}>{v.status}</span>
+              <label className="floor-input" title="Floor this walk starts on">
+                Floor
+                <input type="number" defaultValue={v.start_floor ?? v.floor_offset ?? 0}
+                  onBlur={(e) => e.target.value !== '' && api.setVideoFloor(building, v.id, e.target.value).then(reload).catch((err) => setError(detail(err)))} />
+              </label>
               {v.status === 'done' && (
                 <button className="ghost" onClick={() => setInspect(v.id)}>
                   <Search size={14} /> Inspect

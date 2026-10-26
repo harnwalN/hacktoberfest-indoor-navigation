@@ -212,3 +212,11 @@ input[type='file'] { padding: 7px; }
 .q-actions button { padding: 4px 10px; font-size: 13px; }
 .bar.slim { height: 4px; margin: 0; }
 .pill.paused, .pill.queued { color: var(--warn); }
+
+/* floors */
+.floor-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 10px; }
+.floor-tabs button { padding: 6px 12px; font-size: 14px; }
+.floor-tabs button.active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.schematic .floor-link { fill: var(--warn); font-size: 0.16px; }
+.floor-input { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+.floor-input input { width: 56px; padding: 3px 6px; }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Check, GitMerge, ImagePlus, Plus, Save, Trash2, X } from 'lucide-react'
+import { Check, GitMerge, ImagePlus, Link2, Plus, Save, Trash2, X } from 'lucide-react'
 import { api, detail, frameUrl } from '../api'
 
 const TYPES = ['room', 'intersection', 'hallway', 'entrance', 'stairs', 'elevator', 'exit', 'restroom', 'landmark']
@@ -7,18 +7,18 @@ const VERTICALS = ['none', 'stairs_up', 'stairs_down', 'elevator', 'ramp_up', 'r
 const DIRS = [0, 45, 90, 135, 180, 225, 270, 315]
 const ARROWS = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖']
 
-// Dead-reckoning schematic: walk the graph breadth-first, placing each neighbour one unit along the
-// travel heading. It is not to scale (no distances), but loops and branches read clearly.
-function layout(map) {
+// Dead-reckoning schematic of ONE floor: walk that floor's graph breadth-first, placing each neighbour
+// one unit along the travel heading. Not to scale (no distances), but loops and branches read clearly.
+// Connections to other floors (stairs/elevators) are drawn as "↕ floor N" badges instead of lines.
+function layout(nodes, edges, axis) {
   const pos = {}
   const adj = {}
-  for (const e of map.edges) {
-    ;(adj[e.from_node] ||= []).push({ to: e.to_node, h: e.heading_out, e })
-    ;(adj[e.to_node] ||= []).push({ to: e.from_node, h: (e.heading_in + 180) % 360, e })
+  for (const e of edges) {
+    ;(adj[e.from_node] ||= []).push({ to: e.to_node, h: e.heading_out })
+    ;(adj[e.to_node] ||= []).push({ to: e.from_node, h: (e.heading_in + 180) % 360 })
   }
-  const axis = map.dominant_axis_deg || 0
   let offsetX = 0
-  for (const n of map.nodes) {
+  for (const n of nodes) {
     if (pos[n.id]) continue
     pos[n.id] = [offsetX, 0]
     const queue = [n.id]
@@ -36,31 +36,47 @@ function layout(map) {
   return pos
 }
 
-function Schematic({ map, selected, onSelect }) {
-  const pos = useMemo(() => layout(map), [map])
+function Schematic({ map, floor, selected, onSelect }) {
+  const floorOf = Object.fromEntries(map.nodes.map((n) => [n.id, n.floor]))
+  const nodes = map.nodes.filter((n) => n.floor === floor)
+  const sameFloor = map.edges.filter((e) => floorOf[e.from_node] === floor && floorOf[e.to_node] === floor)
+  const links = {} // node id -> other floors it connects to
+  for (const e of map.edges) {
+    const [a, b] = [floorOf[e.from_node], floorOf[e.to_node]]
+    if (a === b) continue
+    if (a === floor) (links[e.from_node] ||= new Set()).add(b)
+    if (b === floor) (links[e.to_node] ||= new Set()).add(a)
+  }
+  const pos = useMemo(() => layout(nodes, sameFloor, map.dominant_axis_deg || 0), [map, floor])
   const pts = Object.values(pos)
-  if (!pts.length) return null
+  if (!pts.length) return <p className="muted">No places on this floor.</p>
   const xs = pts.map((p) => p[0])
   const ys = pts.map((p) => p[1])
   const pad = 0.8
-  const [minX, maxX, minY, maxY] = [Math.min(...xs) - pad, Math.max(...xs) + pad, Math.min(...ys) - pad, Math.max(...ys) + pad]
+  const [minX, maxX, minY, maxY] = [Math.min(...xs) - pad, Math.max(...xs) + pad * 2, Math.min(...ys) - pad, Math.max(...ys) + pad]
   return (
     <svg className="schematic" viewBox={`${minX} ${minY} ${maxX - minX} ${maxY - minY}`} preserveAspectRatio="xMidYMid meet">
-      {map.edges.map((e) => {
+      {sameFloor.map((e) => {
         const a = pos[e.from_node]
         const b = pos[e.to_node]
         if (!a || !b) return null
         return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} className={`edge ${e.vertical !== 'none' ? 'vertical' : ''}`} />
       })}
-      {map.nodes.map((n) => {
+      {nodes.map((n) => {
         const p = pos[n.id]
         if (!p) return null
+        const other = links[n.id] ? [...links[n.id]].sort((x, y) => x - y) : []
         return (
           <g key={n.id} onClick={() => onSelect(n.id)} className={`snode ${n.type} ${selected === n.id ? 'sel' : ''} ${n.verified ? 'verified' : ''}`}>
             <circle cx={p[0]} cy={p[1]} r={0.16} />
             <text x={p[0] + 0.22} y={p[1] + 0.07}>
               {n.label.length > 22 ? `${n.label.slice(0, 21)}…` : n.label}
             </text>
+            {other.length > 0 && (
+              <text x={p[0] + 0.22} y={p[1] + 0.32} className="floor-link">
+                ↕ floor {other.join(', ')}
+              </text>
+            )}
           </g>
         )
       })}
@@ -89,6 +105,8 @@ export default function MapReview({ building, onChanged }) {
   const [newEdge, setNewEdge] = useState({ from_node: '', to_node: '', heading_out: 0, vertical: 'none' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [floor, setFloor] = useState(null)
+  const [note, setNote] = useState('')
 
   const load = () => api.getMap(building).then((m) => { setMap(m); setDirty(false) }).catch((e) => setError(detail(e)))
   useEffect(() => {
@@ -96,6 +114,8 @@ export default function MapReview({ building, onChanged }) {
   }, [building])
 
   if (!map) return <div className="card">Loading…</div>
+  const floors = [...new Set(map.nodes.map((n) => n.floor))].sort((a, b) => a - b)
+  const shownFloor = floors.includes(floor) ? floor : floors[0] ?? 0
   const byId = Object.fromEntries(map.nodes.map((n) => [n.id, n]))
 
   const patchNode = (id, patch) => {
@@ -167,6 +187,28 @@ export default function MapReview({ building, onChanged }) {
         <div className="row spread">
           <h2>Building map</h2>
           <div className="row">
+            <button className="ghost" disabled={busy} title="Merge places seen in several videos into one map"
+              onClick={async () => {
+                setBusy(true)
+                try {
+                  const { job_id } = await api.consolidate(building)
+                  for (;;) {
+                    const j = await api.job(job_id)
+                    if (j.status === 'done' || j.status === 'error') {
+                      setError(j.status === 'error' ? j.error : '')
+                      setNote(j.log.filter((l) => /Same|Aligned|Consolidated/.test(l)).map((l) => l.slice(11)).join('\n'))
+                      break
+                    }
+                    await new Promise((r) => setTimeout(r, 1000))
+                  }
+                  await load()
+                  onChanged?.()
+                } finally {
+                  setBusy(false)
+                }
+              }}>
+              <Link2 size={16} /> {busy ? 'Linking…' : 'Link videos'}
+            </button>
             <label className="ghost file-btn">
               <ImagePlus size={16} /> Add photo
               <input type="file" accept="image/*" hidden onChange={(e) => addPhoto(e.target.files[0])} />
@@ -181,7 +223,17 @@ export default function MapReview({ building, onChanged }) {
           {map.processed_with?.model ? ` · labeled by ${map.processed_with.model}` : ''}
         </p>
         {error && <div className="banner error" onClick={() => setError('')}>{error}</div>}
-        <Schematic map={map} selected={selected} onSelect={setSelected} />
+        {note && <pre className="log" onClick={() => setNote('')}>{note}</pre>}
+        {floors.length > 1 && (
+          <div className="floor-tabs">
+            {floors.map((f) => (
+              <button key={f} className={f === shownFloor ? 'active' : ''} onClick={() => setFloor(f)}>
+                Floor {f} <small>({map.nodes.filter((n) => n.floor === f).length})</small>
+              </button>
+            ))}
+          </div>
+        )}
+        <Schematic map={map} floor={shownFloor} selected={selected} onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
       </section>
 
       {map.suggested_merges.length > 0 && (
@@ -272,7 +324,8 @@ export default function MapReview({ building, onChanged }) {
                   <td>{byId[e.to_node]?.label}</td>
                   <td><DirSelect value={e.heading_out} onChange={(v) => patchEdge(e.id, { heading_out: v })} /></td>
                   <td><DirSelect value={e.heading_in} onChange={(v) => patchEdge(e.id, { heading_in: v })} /></td>
-                  <td>
+                  <td title={e.inferred_floor_change ? 'Floor change inferred from room numbers; no stairs seen' : ''}>
+                    {e.inferred_floor_change && <span className="pill paused">check</span>}
                     <select value={e.vertical} onChange={(ev) => patchEdge(e.id, { vertical: ev.target.value })}>
                       {VERTICALS.map((v) => <option key={v}>{v}</option>)}
                     </select>
@@ -315,7 +368,7 @@ export default function MapReview({ building, onChanged }) {
               {n.frame_id ? <img src={frameUrl(building, n.frame_id)} loading="lazy" alt="" /> : <div className="nophoto" />}
               <span>{n.label}</span>
               <small>
-                {n.type}
+                {n.type} · F{n.floor}
                 {n.verified ? ' · ✓' : ''}
                 {n.soft ? ' · blurry' : ''}
               </small>
