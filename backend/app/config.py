@@ -61,5 +61,6 @@ SAME_PLACE_WINDOW_SEC = _f("SAME_PLACE_WINDOW_SEC", 8.0)  # collapse consecutive
 ORB_STRONG_INLIERS = int(os.getenv("ORB_STRONG_INLIERS", 40))
 ORB_WEAK_INLIERS = int(os.getenv("ORB_WEAK_INLIERS", 20))
 AUTO_MERGE_CONFIDENCE = _f("AUTO_MERGE_CONFIDENCE", 0.8)
+DEFAULT_FLOOR = int(os.getenv("DEFAULT_FLOOR", 1))  # ground floor number when nothing says otherwise
 ROOM_NUMBER_FLOORS = os.getenv("ROOM_NUMBER_FLOORS", "1") != "0"  # 121 -> floor 1, 208 -> floor 2
 SNAP_TOLERANCE_DEG = _f("SNAP_TOLERANCE_DEG", 20.0)

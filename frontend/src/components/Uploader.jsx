@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Cpu, RefreshCw, Search, UploadCloud } from 'lucide-react'
+import { Cpu, RefreshCw, Search, Trash2, UploadCloud } from 'lucide-react'
 import { api, detail } from '../api'
 import JobProgress from './JobProgress'
 import QueuePanel from './QueuePanel'
@@ -145,6 +145,22 @@ export default function Uploader({ building, onDone }) {
                   <Search size={14} /> Inspect
                 </button>
               )}
+              <button className="ghost danger" title="Remove this video and its data"
+                onClick={async () => {
+                  if (!confirm(`Remove ${v.filename}? Its processing stops and its places, photos and files are deleted. Places other videos also pass through are kept.`)) return
+                  try {
+                    const r = await api.deleteVideo(building, v.id)
+                    if (inspect === v.id) setInspect(null)
+                    setError('')
+                    alert(`Removed ${v.filename}: ${r.removed_places} places, ${r.deleted_files} photos deleted.`)
+                    reload()
+                    onDone?.()
+                  } catch (err) {
+                    setError(detail(err))
+                  }
+                }}>
+                <Trash2 size={14} />
+              </button>
             </li>
           ))}
         </ul>

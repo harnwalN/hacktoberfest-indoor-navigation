@@ -52,6 +52,46 @@ def text_tokens(texts: list[str]) -> set[str]:
     return out
 
 
+GENERIC_WORDS = {
+    "ENTRANCE", "EXIT", "ROOM", "ROOMS", "HALL", "HALLWAY", "STAIR", "STAIRS", "STAIRWELL", "ELEVATOR",
+    "ELEVATORS", "RESTROOM", "RESTROOMS", "MENS", "WOMEN", "WOMENS", "FLOOR", "LEVEL", "OFFICE", "OFFICES",
+    "LOBBY", "DOOR", "DOORS", "CLOSED", "OPEN", "CAUTION", "NOTICE", "WARNING", "PLEASE", "THIS", "THAT",
+    "WITH", "FROM", "ONLY", "AREA", "MAIN", "BUILDING", "SUITE", "LABORATORY", "CENTER", "CENTRE",
+}
+
+
+def sign_words(texts: list[str]) -> set[str]:
+    """Distinctive words from sign text (named places like MAKER SPACE, QUALCOMM INSTITUTE)."""
+    out = set()
+    for t in texts:
+        for w in re.split(r"[^A-Za-z]+", t.upper()):
+            if len(w) > 4 and w.endswith("S"):
+                w = w[:-1]  # MAKERS == MAKER
+            if len(w) >= 4 and w not in GENERIC_WORDS:
+                out.add(w)
+    return out
+
+
+def shared_sign_words(a: list[str], b: list[str]) -> set[str]:
+    """Shared distinctive words, tolerant of OCR merges/fragments (MAKERSPACE vs MAKER SPACE)."""
+    wa, wb = sign_words(a), sign_words(b)
+    shared = wa & wb
+    ja, jb = "".join(sorted(wa)), "".join(sorted(wb))
+    shared |= {w for w in wa if len(w) >= 5 and w in jb.replace(" ", "")}
+    shared |= {w for w in wb if len(w) >= 5 and w in ja.replace(" ", "")}
+    return shared
+
+
+def strong_name_match(a: list[str], b: list[str]) -> bool:
+    """Same named place: shared distinctive words that make up most of the (short) sign.
+    Busy text (posters, wall graphics) is never used: it is visible from many places."""
+    wa, wb = sign_words(a), sign_words(b)
+    if not wa or not wb or len(wa) > 6 or len(wb) > 6:
+        return False
+    s = shared_sign_words(a, b)
+    return (len(s) >= 2 or any(len(w) >= 7 for w in s)) and len(s) >= 0.5 * min(len(wa), len(wb))
+
+
 @lru_cache(maxsize=2048)
 def _orb_features(path: str):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -207,6 +247,8 @@ def _same_spot(a: WalkNode, b: WalkNode) -> bool:
     ra, rb = text_tokens(a.texts), text_tokens(b.texts)
     if ra and rb:
         return bool(ra & rb)  # room numbers decide
+    if strong_name_match(wayfinding_texts(a.analysis), wayfinding_texts(b.analysis)):
+        return True  # several frames of the same named place (e.g. MAKER SPACE)
     la, lb = _norm_label(a.analysis.suggested_label), _norm_label(b.analysis.suggested_label)
     if la and la == lb:
         return True
@@ -262,7 +304,7 @@ def room_floor(texts: list[str]) -> int | None:
     return max(set(floors), key=floors.count) if floors else None
 
 
-def assign_floors(wnodes: list[WalkNode], start_floor: int | None) -> list[int | None]:
+def assign_floors(wnodes: list[WalkNode], start_floor: int | None) -> list[int | None]:  # noqa: C901
     """Absolute floor per walk node, or None when unknown.
 
     Relative floor changes come from detected stairs (rel_floor). The absolute offset comes from the
@@ -303,7 +345,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
     for node in bundle.nodes:
         if node.id in exclude or not node.frame_id:
             continue
-        if w_floor is not None and node.floor != w_floor:
+        if w_floor is not None and node.floor_source != "default" and node.floor != w_floor:
             continue  # similar corridors on different floors are never the same place
         if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < 15:
             continue  # same walk, a few seconds ago: that's just the previous stretch of hallway
@@ -386,7 +428,9 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     # Floors: start floor and room numbers first; still-unknown floors inherit from the first known place
     # this walk passes (or default to 0 for the very first walk).
     floors = assign_floors(wnodes, start_floor)
-    inherit: int | None = 0 if first_walk and all(f is None for f in floors) else None
+    has_rooms = any(room_floor(wn.texts) is not None for wn in wnodes)
+    known_source = "user" if start_floor is not None else ("rooms" if has_rooms else None)
+    inherit: int | None = None
     created: list[tuple[Node, WalkNode]] = []
     merged = 0
     recent: list[str] = []
@@ -403,7 +447,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
                 node.frame_id, node.soft = wn.kf.frame_id, False
                 node.frame_heading = None  # re-set below once headings are corrected
             log(f"Loop closure: walk t={wn.kf.t:.1f}s is '{node.label}' ({match.reason})")
-            if floors[i] is None and inherit is None:
+            if floors[i] is None and inherit is None and node.floor_source != "default":
                 inherit = node.floor - wn.rel_floor
             # Same view seen twice => headings must agree (up to the measured relative yaw).
             if match.rel_yaw is not None:
@@ -417,7 +461,8 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             label, ptype = _label(wn)
             node = Node(
                 id=f"n{node_counter:03d}", label=label, type=ptype, frame_id=wn.kf.frame_id,
-                texts=wn.texts, description=wn.analysis.description, soft=wn.kf.soft,
+                texts=wn.texts, sign_texts=wayfinding_texts(wn.analysis), description=wn.analysis.description,
+                soft=wn.kf.soft,
                 video_id=video_id, t=wn.kf.t,
                 verified=bool(wn.analysis.room_numbers) or _key_place(wn.analysis)
                 or (ptype == "room" and _has_sign(wn.analysis)),
@@ -439,13 +484,20 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         log("No geometric anchor to the existing map for this walk; its headings use their own frame")
     if abs_c or rel_c:
         log(f"Heading correction: offset {c0:+.1f} deg, drift {k * 60:+.1f} deg/min")
+    sources = []
     for i, wn in enumerate(wnodes):
-        if floors[i] is None:
-            floors[i] = wn.rel_floor + (inherit or 0)
+        if floors[i] is not None:
+            sources.append(known_source or "rooms")
+        elif inherit is not None:
+            floors[i], _ = wn.rel_floor + inherit, sources.append("linked")
+        else:  # nothing known yet: a guess that later linking may correct
+            floors[i], _ = wn.rel_floor + config.DEFAULT_FLOOR, sources.append("default")
     floor_of = {id(wn): f for wn, f in zip(wnodes, floors)}
+    source_of = {id(wn): src for wn, src in zip(wnodes, sources)}
     for node, wn in created:
         node.frame_heading = round(wrap360(wn.kf.heading - corr(wn.kf.t)), 1)
         node.floor = floor_of[id(wn)]
+        node.floor_source = source_of[id(wn)]
     for node in bundle.nodes:
         if node.frame_heading is None and node.frame_id:
             wn = next((w for w in wnodes if w.kf.frame_id == node.frame_id), None)
@@ -653,23 +705,33 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
     def alive(nid):
         return any(n.id == nid for n in bundle.nodes)
 
-    # 1. room-number identity
+    def merge(a: Node, b: Node, why: str) -> None:
+        nonlocal merged
+        keep, drop = (a, b) if _floor_rank(a) <= _floor_rank(b) else (b, a)
+        _adopt_floor(bundle, drop, keep, log)
+        log(f"{why}: merging '{drop.label}' into '{keep.label}' (floor {keep.floor})")
+        merge_nodes(bundle, keep.id, drop.id)
+        merged += 1
+
+    # 1. identity: same room number, or the same named sign (MAKER SPACE / QUALCOMM INSTITUTE)
     nodes = list(bundle.nodes)
     for i, a in enumerate(nodes):
         for b in nodes[i + 1:]:
-            if not (alive(a.id) and alive(b.id)) or a.floor != b.floor:
+            if not (alive(a.id) and alive(b.id)) or not _floors_compatible(a, b):
                 continue
             ra, rb = _room_ids(a), _room_ids(b)
-            if ra and rb and ra & rb and (len(ra) <= 2 and len(rb) <= 2):
-                log(f"Same room {'/'.join(sorted(ra & rb))}: merging '{b.label}' into '{a.label}'")
-                merge_nodes(bundle, a.id, b.id)
-                merged += 1
+            if ra and rb:
+                if ra & rb and len(ra) <= 2 and len(rb) <= 2:
+                    merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}")
+                continue  # different room numbers: different places
+            if strong_name_match(a.sign_texts, b.sign_texts) and a.video_id != b.video_id:
+                merge(a, b, f"Same sign {'/'.join(sorted(shared_sign_words(a.sign_texts, b.sign_texts)))}")
 
     # 2. appearance across walks
     nodes = list(bundle.nodes)
     for i, a in enumerate(nodes):
         for b in nodes[i + 1:]:
-            if (not (alive(a.id) and alive(b.id)) or a.floor != b.floor or a.video_id == b.video_id
+            if (not (alive(a.id) and alive(b.id)) or not _floors_compatible(a, b) or a.video_id == b.video_id
                     or not a.frame_id or not b.frame_id):
                 continue
             inliers, _ = orb_match(frames / a.frame_id, frames / b.frame_id)
@@ -684,9 +746,7 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
             strong = inliers >= 1.5 * config.ORB_STRONG_INLIERS
             if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE):
                 why = f"{inliers} matching features" + (f"; Gemma: {verdict.reason}" if verdict else "")
-                log(f"Same place across walks: merging '{b.label}' into '{a.label}' ({why})")
-                merge_nodes(bundle, a.id, b.id)
-                merged += 1
+                merge(a, b, f"Same place across walks ({why})")
             elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place
                                                                         and verdict.confidence >= 0.7):
                 bundle.suggested_merges.append(SuggestedMerge(
@@ -709,11 +769,127 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         if not progress:
             break
 
+    # 4. connect floors: the same stairwell / elevator bank seen on adjacent floors
+    linked = _link_floors(bundle, frames, cache, use_gemma, log)
+
     finalize(bundle)
     g_components = _components(bundle)
-    log(f"Consolidated: {merged} merged, {suggested} suggested, {aligned} walks aligned; "
-        f"map has {len(bundle.nodes)} places in {g_components} connected piece(s)")
-    return {"merged": merged, "suggested": suggested, "aligned": aligned, "components": g_components}
+    floors = sorted({n.floor for n in bundle.nodes})
+    log(f"Consolidated: {merged} merged, {suggested} suggested, {aligned} walks aligned, {linked} floor links; "
+        f"{len(bundle.nodes)} places on floors {floors} in {g_components} connected piece(s)")
+    return {"merged": merged, "suggested": suggested, "aligned": aligned, "floor_links": linked,
+            "components": g_components}
+
+
+_RANK = {"user": 0, "rooms": 1, "linked": 2, "default": 3}
+
+
+def _floor_rank(n: Node) -> int:
+    return _RANK.get(n.floor_source, 3)
+
+
+def _floors_compatible(a: Node, b: Node) -> bool:
+    return a.floor == b.floor or "default" in (a.floor_source, b.floor_source)
+
+
+def _adopt_floor(bundle: MapBundle, guessed: Node, sure: Node, log) -> None:
+    """A walk whose floor was only a guess learns its floor from a place it shares with a known walk."""
+    if guessed.floor_source != "default" or sure.floor_source == "default" or not guessed.video_id:
+        return
+    delta = sure.floor - guessed.floor
+    moved = 0
+    for n in bundle.nodes:
+        if n.video_id == guessed.video_id and n.floor_source == "default":
+            n.floor += delta
+            n.floor_source = "linked"
+            moved += 1
+    if delta:
+        log(f"Walk {guessed.video_id} placed on floor {sure.floor} via '{sure.label}' ({moved} places moved)")
+
+
+def _is_vertical(n: Node) -> str | None:
+    words = " ".join(n.texts).upper() + " " + n.label.upper()
+    if n.type == "elevator" or "ELEVATOR" in words:
+        return "elevator"
+    if n.type == "stairs" or "STAIR" in words:
+        return "stairs"
+    return None
+
+
+def _connected(bundle: MapBundle, a: str, b: str) -> bool:
+    adj: dict[str, set[str]] = {}
+    for e in bundle.edges:
+        adj.setdefault(e.from_node, set()).add(e.to_node)
+        adj.setdefault(e.to_node, set()).add(e.from_node)
+    seen, stack = {a}, [a]
+    while stack:
+        u = stack.pop()
+        if u == b:
+            return True
+        for v in adj.get(u, ()):
+            if v not in seen:
+                seen.add(v); stack.append(v)
+    return False
+
+
+def _link_floors(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log) -> int:
+    """Add stairs/elevator connections between adjacent floors that no single walk climbed."""
+    linked = 0
+    by_kind: dict[tuple[str, int], list[Node]] = {}
+    for n in bundle.nodes:
+        if (kind := _is_vertical(n)):
+            by_kind.setdefault((kind, n.floor), []).append(n)
+    floors = sorted({f for _, f in by_kind})
+    for kind in ("stairs", "elevator"):
+        for f in floors:
+            lower, upper = by_kind.get((kind, f), []), by_kind.get((kind, f + 1), [])
+            if not lower or not upper:
+                continue
+            pairs = []
+            for a in lower:
+                for b in upper:
+                    if _connected(bundle, a.id, b.id) and any(
+                            e for e in bundle.edges if e.vertical != "none" and {e.from_node, e.to_node} & {a.id, b.id}):
+                        continue  # a walk already climbed between these
+                    score, why = 0.0, ""
+                    ids_a, ids_b = text_tokens(a.texts), text_tokens(b.texts)
+                    if ids_a & ids_b:
+                        score, why = 1.0, f"same {kind} sign {'/'.join(sorted(ids_a & ids_b))}"
+                    elif use_gemma and a.frame_id and b.frame_id:
+                        try:
+                            v = gemma.same_stairwell(frames / a.frame_id, frames / b.frame_id, cache)
+                            if v.same_place:
+                                score, why = v.confidence, f"Gemma: {v.reason}"
+                        except gemma.GemmaUnavailable:
+                            use_gemma = False
+                    pairs.append((score, why, a, b))
+            pairs.sort(key=lambda p: -p[0])
+            used: set[str] = set()
+            for score, why, a, b in pairs:
+                if a.id in used or b.id in used:
+                    continue
+                inferred = score < 0.7
+                if inferred and not (len(lower) == 1 and len(upper) == 1):
+                    continue  # ambiguous: several staircases and no evidence which one
+                _add_vertical_edge(bundle, a, b, kind, inferred)
+                used |= {a.id, b.id}
+                linked += 1
+                log(f"Floor link: '{a.label}' (floor {f}) <-> '{b.label}' (floor {f + 1}) by {kind} "
+                    f"({why or 'only ' + kind + ' on both floors; check'})")
+    return linked
+
+
+def _add_vertical_edge(bundle: MapBundle, lower: Node, upper: Node, kind: str, inferred: bool) -> None:
+    h = lower.frame_heading or 0.0
+    bundle.edges.append(Edge(
+        id=f"e{_next_id('e', [e.id for e in bundle.edges]):03d}", from_node=lower.id, to_node=upper.id,
+        heading_out=h, heading_in=upper.frame_heading if upper.frame_heading is not None else h,
+        heading_out_raw=h, heading_in_raw=upper.frame_heading if upper.frame_heading is not None else h,
+        vertical="stairs_up" if kind == "stairs" else "elevator",
+        frames_fwd=[f for f in (lower.frame_id, upper.frame_id) if f],
+        frames_rev=[f for f in (upper.frame_id, lower.frame_id) if f],
+        source="merge", verified=not inferred, inferred_floor_change=inferred,
+    ))
 
 
 def _components(bundle: MapBundle) -> int:
@@ -728,6 +904,39 @@ def _components(bundle: MapBundle) -> int:
         if e.from_node in parent and e.to_node in parent:
             parent[find(e.from_node)] = find(e.to_node)
     return len({find(x) for x in parent})
+
+
+def remove_video(bundle: MapBundle, video_id: str) -> dict:
+    """Drop one walk from the map. Places another walk also uses are kept (re-owned by that walk);
+    returns the frame ids nothing references any more, so the caller can delete the files."""
+    prefix = f"{video_id}_"
+    bundle.edges = [e for e in bundle.edges if e.video_id != video_id]
+    for e in bundle.edges:  # imagery this walk contributed to other walks' edges
+        e.frames_fwd = [f for f in e.frames_fwd if not f.startswith(prefix)]
+        if e.frames_rev is not None:
+            e.frames_rev = [f for f in e.frames_rev if not f.startswith(prefix)] or None
+    used_by_others: dict[str, str] = {}
+    for e in bundle.edges:
+        for nid in (e.from_node, e.to_node):
+            used_by_others.setdefault(nid, e.video_id or "")
+    kept, removed = [], 0
+    for n in bundle.nodes:
+        if n.video_id != video_id:
+            kept.append(n)
+        elif n.id in used_by_others:
+            n.video_id = used_by_others[n.id] or None  # still part of another walk
+            kept.append(n)
+        else:
+            removed += 1
+    bundle.nodes = kept
+    ids = {n.id for n in kept}
+    bundle.suggested_merges = [s for s in bundle.suggested_merges if s.keep in ids and s.remove in ids]
+    bundle.videos = [v for v in bundle.videos if v.id != video_id]
+    referenced = {n.frame_id for n in kept} | {f for e in bundle.edges for f in e.frames_fwd + (e.frames_rev or [])}
+    finalize(bundle)
+    return {"removed_places": removed, "kept_shared": sum(1 for n in kept if n.id in used_by_others
+                                                          and n.frame_id and n.frame_id.startswith(prefix)),
+            "referenced_frames": referenced}
 
 
 def flip_vertical(v: str) -> str:

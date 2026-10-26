@@ -69,9 +69,11 @@ class Node(BaseModel):
     type: str = "hallway"
     frame_id: str | None = None
     frame_heading: float | None = None  # building-frame heading the node photo was taken facing
-    texts: list[str] = []
+    texts: list[str] = []  # everything read here, including from merged places
+    sign_texts: list[str] = []  # wayfinding text from this place's own photo (used for identity matching)
     description: str = ""
-    floor: int = 0
+    floor: int = 1
+    floor_source: Literal["user", "rooms", "linked", "default"] = "default"  # how sure we are of `floor`
     verified: bool = False
     soft: bool = False
     video_id: str | None = None
@@ -147,7 +149,7 @@ class Step(BaseModel):
     vertical: Vertical = "none"
     instruction_text: str
     view_note: str | None = None
-    floor: int = 0
+    floor: int = 1
     turn_degrees: float = 0.0
 
 

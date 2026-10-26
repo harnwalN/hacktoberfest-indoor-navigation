@@ -131,6 +131,17 @@ def update_video(building_id: str, video_id: str, body: VideoUpdate):
     return v
 
 
+@api.delete("/buildings/{building_id}/videos/{video_id}")
+def delete_video(building_id: str, video_id: str):
+    """Remove a video: cancels its processing, drops its places/connections, frames and files.
+    Places that other videos also pass through are kept."""
+    _load(building_id)
+    try:
+        return jobs.delete_video(building_id, video_id)
+    except KeyError:
+        raise HTTPException(404, "Unknown video")
+
+
 @api.post("/buildings/{building_id}/consolidate")
 def consolidate(building_id: str):
     """Link all walks into one map now (runs next in the queue; fast, Gemma answers are cached)."""

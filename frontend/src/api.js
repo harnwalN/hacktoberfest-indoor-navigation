@@ -25,6 +25,7 @@ export const api = {
       .then((r) => r.data)
   },
   setVideoFloor: (b, v, startFloor) => http.patch(`/buildings/${b}/videos/${v}`, { start_floor: Number(startFloor) }).then((r) => r.data),
+  deleteVideo: (b, v) => http.delete(`/buildings/${b}/videos/${v}`).then((r) => r.data),
   consolidate: (b) => http.post(`/buildings/${b}/consolidate`).then((r) => r.data),
   rebuild: (b) => http.post(`/buildings/${b}/rebuild`).then((r) => r.data),
   job: (id) => http.get(`/jobs/${id}`).then((r) => r.data),

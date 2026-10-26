@@ -106,6 +106,8 @@ def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:
     url, note = photo(first, t0.frames, 0)
     nxt = nodes[path[1]]
     move = VERTICAL_TEXT.get(t0.vertical)
+    if move and nxt.floor != first.floor:
+        move += f" to floor {nxt.floor}"
     text = f"Start at {first.label}. Face the direction shown and " + (
         f"{move} toward {nxt.label}." if move else f"walk forward toward {nxt.label}.")
     steps.append(Step(step_index=0, node_id=first.id, label=first.label, frame_url=url, view_note=note,
@@ -118,8 +120,23 @@ def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:
         delta = wrap180(leave.heading_out - arrive.heading_in)
         turn = quantize_turn(delta)
         url, note = photo(node, arrive.frames, -1)
+        # A floor link joined two separate walks: no measured direction across it, so say where to head.
+        if arrive.edge.source == "merge" and arrive.vertical != "none":
+            word = "top" if arrive.vertical in ("stairs_up", "ramp_up") else "bottom"
+            where = f"{'Leaving the elevator' if arrive.vertical == 'elevator' else f'At the {word} of the stairs'}"
+            steps.append(Step(
+                step_index=i, node_id=node.id, label=node.label, frame_url=url, view_note=note,
+                action="go_straight", vertical="none", floor=node.floor,
+                instruction_text=f"{where} ({node.label}, floor {node.floor}), head toward {nodes[path[i + 1]].label} "
+                                 "as shown in the photo.",
+            ))
+            continue
+        if leave.edge.source == "merge" and leave.vertical != "none":
+            turn, delta = "go_straight", 0.0
         move = VERTICAL_TEXT.get(leave.vertical)
         place, upcoming = _place(node), nodes[path[i + 1]]
+        if move and upcoming.floor != node.floor:
+            move += f" to floor {upcoming.floor}"
         if turn == "go_straight":
             text = f"At {place}, {move}." if move else f"Continue straight past {place}."
         else:

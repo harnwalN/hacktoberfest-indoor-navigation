@@ -10,31 +10,77 @@ const ARROWS = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖']
 // Dead-reckoning schematic of ONE floor: walk that floor's graph breadth-first, placing each neighbour
 // one unit along the travel heading. Not to scale (no distances), but loops and branches read clearly.
 // Connections to other floors (stairs/elevators) are drawn as "↕ floor N" badges instead of lines.
+const STEP = 1.6 // spacing between connected places
+const MIN_GAP = 1.3 // places never closer than this
+
 function layout(nodes, edges, axis) {
+  // 1. seed: walk each piece breadth-first, one step along the travel heading
   const pos = {}
   const adj = {}
+  const dirs = []
   for (const e of edges) {
     ;(adj[e.from_node] ||= []).push({ to: e.to_node, h: e.heading_out })
     ;(adj[e.to_node] ||= []).push({ to: e.from_node, h: (e.heading_in + 180) % 360 })
+    const r = ((e.heading_out - axis) * Math.PI) / 180
+    dirs.push([e.from_node, e.to_node, Math.sin(r), -Math.cos(r)])
   }
   let offsetX = 0
   for (const n of nodes) {
     if (pos[n.id]) continue
     pos[n.id] = [offsetX, 0]
+    const piece = [n.id]
     const queue = [n.id]
     while (queue.length) {
       const u = queue.shift()
       for (const { to, h } of adj[u] || []) {
         if (pos[to]) continue
         const r = ((h - axis) * Math.PI) / 180
-        pos[to] = [pos[u][0] + Math.sin(r), pos[u][1] - Math.cos(r)]
+        pos[to] = [pos[u][0] + STEP * Math.sin(r), pos[u][1] - STEP * Math.cos(r)]
         queue.push(to)
+        piece.push(to)
       }
     }
-    offsetX = Math.max(...Object.values(pos).map((p) => p[0])) + 2
+    // 2. relax: keep edges near their direction/length, push overlapping places apart
+    for (let it = 0; it < 220; it++) {
+      for (const [a, b, dx, dy] of dirs) {
+        if (!pos[a] || !pos[b] || !piece.includes(a)) continue
+        const tx = pos[a][0] + STEP * dx - pos[b][0]
+        const ty = pos[a][1] + STEP * dy - pos[b][1]
+        pos[b][0] += tx * 0.08; pos[b][1] += ty * 0.08
+        pos[a][0] -= tx * 0.08; pos[a][1] -= ty * 0.08
+      }
+      for (let i = 0; i < piece.length; i++) {
+        for (let j = i + 1; j < piece.length; j++) {
+          const p = pos[piece[i]]
+          const q = pos[piece[j]]
+          let dx = q[0] - p[0]
+          let dy = q[1] - p[1]
+          let d = Math.hypot(dx, dy)
+          if (d >= MIN_GAP) continue
+          if (d < 1e-3) { dx = 0.7; dy = 0.7; d = 1 }
+          const push = ((MIN_GAP - d) / d) * 0.5
+          p[0] -= dx * push; p[1] -= dy * push
+          q[0] += dx * push; q[1] += dy * push
+        }
+      }
+    }
+    const xs = piece.map((id) => pos[id][0])
+    const minX = Math.min(...xs)
+    for (const id of piece) pos[id][0] += offsetX - minX
+    offsetX = Math.max(...piece.map((id) => pos[id][0])) + 4
   }
   return pos
 }
+
+// Put each label on whichever side has room.
+function labelSide(id, pos) {
+  const [x, y] = pos[id]
+  const crowdedRight = Object.entries(pos).some(([o, [ox, oy]]) => o !== id && ox > x && ox - x < 3 && Math.abs(oy - y) < 0.5)
+  const crowdedLeft = Object.entries(pos).some(([o, [ox, oy]]) => o !== id && ox < x && x - ox < 3 && Math.abs(oy - y) < 0.5)
+  return crowdedRight && !crowdedLeft ? 'left' : 'right'
+}
+
+const kindOf = (n) => (n.type === 'elevator' ? '🛗' : '🪜')
 
 function Schematic({ map, floor, selected, onSelect }) {
   const floorOf = Object.fromEntries(map.nodes.map((n) => [n.id, n.floor]))
@@ -53,7 +99,7 @@ function Schematic({ map, floor, selected, onSelect }) {
   const xs = pts.map((p) => p[0])
   const ys = pts.map((p) => p[1])
   const pad = 0.8
-  const [minX, maxX, minY, maxY] = [Math.min(...xs) - pad, Math.max(...xs) + pad * 2, Math.min(...ys) - pad, Math.max(...ys) + pad]
+  const [minX, maxX, minY, maxY] = [Math.min(...xs) - pad * 3.5, Math.max(...xs) + pad * 3.5, Math.min(...ys) - pad, Math.max(...ys) + pad]
   return (
     <svg className="schematic" viewBox={`${minX} ${minY} ${maxX - minX} ${maxY - minY}`} preserveAspectRatio="xMidYMid meet">
       {sameFloor.map((e) => {
@@ -68,15 +114,24 @@ function Schematic({ map, floor, selected, onSelect }) {
         const other = links[n.id] ? [...links[n.id]].sort((x, y) => x - y) : []
         return (
           <g key={n.id} onClick={() => onSelect(n.id)} className={`snode ${n.type} ${selected === n.id ? 'sel' : ''} ${n.verified ? 'verified' : ''}`}>
-            <circle cx={p[0]} cy={p[1]} r={0.16} />
-            <text x={p[0] + 0.22} y={p[1] + 0.07}>
-              {n.label.length > 22 ? `${n.label.slice(0, 21)}…` : n.label}
-            </text>
-            {other.length > 0 && (
-              <text x={p[0] + 0.22} y={p[1] + 0.32} className="floor-link">
-                ↕ floor {other.join(', ')}
-              </text>
-            )}
+            <circle cx={p[0]} cy={p[1]} r={0.18} />
+            {(() => {
+              const left = labelSide(n.id, pos) === 'left'
+              const x = p[0] + (left ? -0.28 : 0.28)
+              const anchor = left ? 'end' : 'start'
+              return (
+                <>
+                  <text x={x} y={p[1] + 0.08} textAnchor={anchor}>
+                    {n.label.length > 20 ? `${n.label.slice(0, 19)}…` : n.label}
+                  </text>
+                  {other.length > 0 && (
+                    <text x={x} y={p[1] + 0.36} textAnchor={anchor} className="floor-link">
+                      {kindOf(n)} ↕ floor {other.join(', ')}
+                    </text>
+                  )}
+                </>
+              )
+            })()}
           </g>
         )
       })}

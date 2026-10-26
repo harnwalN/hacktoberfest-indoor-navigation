@@ -64,6 +64,13 @@ that clearly differ, e.g. different room numbers). Identical sign text in both i
 conflicting. Then give same_place, confidence (0 to 1), and a one-sentence reason."""
 
 
+SAME_STAIRWELL_PROMPT = """These two photos were taken on DIFFERENT floors of the same building.
+Do they show the SAME staircase / stairwell (or the same elevator bank), just seen from different floors
+or landings? Compare railing style and color, step material, wall finish, windows, and any stair or
+elevator number signs. Different stairwells in one building often look alike, so rely on specific details.
+First list shared_details and conflicting_details, then same_place, confidence (0 to 1) and a reason."""
+
+
 class GemmaUnavailable(RuntimeError):
     pass
 
@@ -233,6 +240,19 @@ def same_place(path_a: Path, path_b: Path, cache: GemmaCache) -> SamePlace:
         return SamePlace.model_validate(hit)
     imgs = [_encode(Image.open(path_a)), _encode(Image.open(path_b))]
     result = _chat(model, SAME_PLACE_PROMPT, imgs, SamePlace)
+    result.confidence = max(0.0, min(1.0, float(result.confidence)))
+    cache.put(key, result.model_dump())
+    return result
+
+
+def same_stairwell(path_a: Path, path_b: Path, cache: GemmaCache) -> SamePlace:
+    model = resolve_model()
+    ha, hb = sorted((_sha(path_a), _sha(path_b)))
+    key = f"stairs:{PROMPT_VERSION}:{model}:{ha}:{hb}"
+    if (hit := cache.get(key)) is not None:
+        return SamePlace.model_validate(hit)
+    imgs = [_encode(Image.open(path_a)), _encode(Image.open(path_b))]
+    result = _chat(model, SAME_STAIRWELL_PROMPT, imgs, SamePlace)
     result.confidence = max(0.0, min(1.0, float(result.confidence)))
     cache.put(key, result.model_dump())
     return result

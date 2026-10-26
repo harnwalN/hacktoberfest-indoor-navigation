@@ -45,6 +45,7 @@ class Job:
     created: float = field(default_factory=time.time)
     order: float = field(default_factory=time.time)  # queue position; smaller runs first
     pause_requested: bool = False
+    cancelled: bool = False
     fn: object = field(default=None, repr=False)
 
     def say(self, msg: str) -> None:
@@ -61,7 +62,7 @@ class Job:
             raise JobPaused()
 
     def public(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if k not in ("fn", "pause_requested")}
+        return {k: v for k, v in self.__dict__.items() if k not in ("fn", "pause_requested", "cancelled")}
 
 
 JOBS: dict[str, Job] = {}
@@ -192,6 +193,11 @@ def _run(job: Job) -> None:
         job.say("Done")
     except JobPaused:
         job.pause_requested = False
+        if job.cancelled:
+            job.status, job.stage = "cancelled", "cancelled"
+            job.say("Cancelled: video removed")
+            _purge_files(job.building_id, job.video_id)  # anything written after the delete
+            return
         auto = getattr(job, "auto_resume", False)
         job.auto_resume = False
         job.status, job.stage, job.pct = ("queued" if auto else "paused"), "queued", 0.0
@@ -204,6 +210,41 @@ def _run(job: Job) -> None:
         traceback.print_exc()
         if job.video_id:
             _set_video_status(job.building_id, job.video_id, status="error")
+
+
+def delete_video(building_id: str, video_id: str) -> dict:
+    """Stop the video's job (if any) and remove the walk and all its data from the building."""
+    for j in JOBS.values():
+        if j.video_id == video_id and j.building_id == building_id:
+            with _cv:
+                j.cancelled = True
+                if j.status in ("queued", "paused"):
+                    j.status, j.stage = "cancelled", "cancelled"
+                    j.say("Cancelled: video removed")
+                elif j.status == "running":
+                    j.pause_requested = True
+    with store.lock_for(building_id):
+        bundle = store.load_map(building_id)
+        if not any(v.id == video_id for v in bundle.videos):
+            raise KeyError(video_id)
+        res = mapper.remove_video(bundle, video_id)
+        store.save_map(bundle)
+    referenced = res.pop("referenced_frames")
+    res["deleted_files"] = _purge_files(building_id, video_id, keep=referenced)
+    return res
+
+
+def _purge_files(building_id: str, video_id: str | None, keep: set[str] | None = None) -> int:
+    if not video_id:
+        return 0
+    keep = keep or set()
+    n = 0
+    for f in store.frames_dir(building_id).glob(f"{video_id}_*.jpg"):
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
+            n += 1
+    shutil.rmtree(store.video_dir(building_id, video_id), ignore_errors=True)
+    return n
 
 
 def recover() -> None:

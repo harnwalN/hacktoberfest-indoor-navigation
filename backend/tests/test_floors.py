@@ -1,4 +1,6 @@
 """Floors from room numbers + stairs, and map-wide consolidation across walks."""
+from pathlib import Path
+
 from app import mapper
 from app.schemas import Edge, FrameAnalysis, Keyframe, MapBundle, Node, VideoInfo
 
@@ -39,11 +41,11 @@ def test_start_floor_used_without_evidence():
 
 def _bundle():
     nodes = [
-        Node(id="n001", label="Room 208", texts=["208"], floor=2, video_id="vA", frame_id=None),
+        Node(id="n001", label="Room 208", texts=["208"], floor=2, floor_source="rooms", video_id="vA", frame_id=None),
         Node(id="n002", label="Hall A", floor=2, video_id="vA"),
-        Node(id="n003", label="Room 208 door", texts=["208"], floor=2, video_id="vB", frame_id=None),
+        Node(id="n003", label="Room 208 door", texts=["208"], floor=2, floor_source="rooms", video_id="vB", frame_id=None),
         Node(id="n004", label="Hall B", floor=2, video_id="vB"),
-        Node(id="n005", label="Room 208?", texts=["208"], floor=3, video_id="vC"),
+        Node(id="n005", label="Room 208?", texts=["208"], floor=3, floor_source="user", video_id="vC"),
     ]
     edges = [
         Edge(id="e001", from_node="n002", to_node="n001", heading_out=0, heading_in=0,
@@ -66,3 +68,51 @@ def test_consolidate_merges_same_room_across_walks_but_not_floors(tmp_path):
     assert "n005" in ids  # same number on floor 3 is a different place
     assert res["components"] == 2  # floor-2 walks joined; floor 3 separate
     assert next(v for v in b.videos if v.id == "vB").anchored
+
+
+def test_guessed_walk_adopts_floor_from_named_sign(tmp_path):
+    nodes = [
+        Node(id="n001", label="Maker Space", texts=["MAKER SPACE", "QUALCOMM INSTITUTE"],
+             sign_texts=["MAKER SPACE", "QUALCOMM INSTITUTE"], floor=2,
+             floor_source="rooms", video_id="vA"),
+        Node(id="n002", label="Maker Space Entrance", texts=["MAKERSPACE", "QUALCOMM"],
+             sign_texts=["MAKER SPACE", "QUALCOMM"], floor=1,
+             floor_source="default", video_id="vB"),
+        Node(id="n003", label="Hallway", floor=1, floor_source="default", video_id="vB"),
+    ]
+    edges = [Edge(id="e001", from_node="n002", to_node="n003", heading_out=0, heading_in=0,
+                  heading_out_raw=0, heading_in_raw=0, video_id="vB")]
+    videos = [VideoInfo(id="vA", filename="a", status="done", anchored=True),
+              VideoInfo(id="vB", filename="b", status="done", anchored=True)]
+    b = MapBundle(building_id="t", nodes=nodes, edges=edges, videos=videos)
+    mapper.consolidate(b, tmp_path, None, use_gemma=False, log=lambda *_: None)
+    assert {n.id for n in b.nodes} == {"n001", "n003"}
+    assert next(n for n in b.nodes if n.id == "n003").floor == 2  # whole walk moved to floor 2
+
+
+def test_single_staircases_on_adjacent_floors_get_linked(tmp_path):
+    nodes = [Node(id="n001", label="Stairs", type="stairs", floor=1, floor_source="rooms", video_id="vA"),
+             Node(id="n002", label="Stairwell", type="stairs", floor=2, floor_source="rooms", video_id="vB")]
+    b = MapBundle(building_id="t", nodes=nodes, videos=[])
+    res = mapper.consolidate(b, tmp_path, None, use_gemma=False, log=lambda *_: None)
+    assert res["floor_links"] == 1
+    e = b.edges[0]
+    assert (e.from_node, e.to_node, e.vertical, e.inferred_floor_change) == ("n001", "n002", "stairs_up", True)
+
+
+def test_remove_video_keeps_shared_places():
+    b = _bundle()
+    mapper.consolidate(b, Path("."), None, use_gemma=False, log=lambda *_: None)  # B's 208 merged into A's
+    res = mapper.remove_video(b, "vA")
+    ids = {n.id for n in b.nodes}
+    assert "n002" not in ids  # A-only place removed
+    assert "n001" in ids  # Room 208 is still on walk B's route
+    assert all(e.video_id != "vA" for e in b.edges)
+    assert res["removed_places"] == 1 and not any(v.id == "vA" for v in b.videos)
+
+
+def test_busy_or_partial_text_does_not_snowball():
+    wall = ["WELCOME", "INNOVATORS", "CHANGEMAKERS", "ENGINEERS", "SCIENTISTS", "FOUNDERS", "ARTISTS"]
+    assert not mapper.strong_name_match(wall, wall)  # wall graphic visible from everywhere
+    assert not mapper.strong_name_match(["MAKERS"], ["MAKER SPACE", "QUALCOMM INSTITUTE"])
+    assert mapper.strong_name_match(["MAKER SPACE"], ["MAKER SPACE BY QUALCOMM INSTITUTE"])
