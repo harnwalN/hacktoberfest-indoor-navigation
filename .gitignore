@@ -1,11 +1,40 @@
-# raw walkthrough videos are large; keep them out of git
+# Raw walkthrough videos (large) and phone sensor logs that sit next to them
 *.MOV
 *.mov
 *.mp4
+*.m4v
+*.webm
+*.avi
+*.mkv
+*.hevc
+*.sensors.json
+
+# Generated building data: maps, Gemma cache, keyframe photos of the building, normalized videos.
+# Machine-specific and potentially private; rebuild with `uv run python -m app.cli ingest`.
+backend/data/
+
+# Python
 backend/.venv/
-backend/data/buildings/*/videos/
-backend/static/
-frontend/node_modules/
 __pycache__/
+*.pyc
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Frontend build output (npm run build writes into backend/static) and deps
+backend/static/
+frontend/dist/
+frontend/node_modules/
+frontend/.vite/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Logs, OS and editor files
+*.log
 .DS_Store
+.idea/
+.vscode/
+*.swp
