@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, GitMerge, ImagePlus, Link2, Plus, Save, Trash2, X } from 'lucide-react'
 import { api, detail, frameUrl } from '../api'
 
@@ -10,11 +10,12 @@ const ARROWS = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖']
 // Dead-reckoning schematic of ONE floor: walk that floor's graph breadth-first, placing each neighbour
 // one unit along the travel heading. Not to scale (no distances), but loops and branches read clearly.
 // Connections to other floors (stairs/elevators) are drawn as "↕ floor N" badges instead of lines.
-const STEP = 1.6 // spacing between connected places
-const MIN_GAP = 1.3 // places never closer than this
+const STEP = 1.8 // spacing between connected places
+const MIN_GAP = 1.4 // places never closer than this
 
+// Dead-reckoning seed (one step along each travel heading), then a relaxation pass that keeps
+// corridors near their direction while pushing places apart. Not to scale: the graph has no distances.
 function layout(nodes, edges, axis) {
-  // 1. seed: walk each piece breadth-first, one step along the travel heading
   const pos = {}
   const adj = {}
   const dirs = []
@@ -40,10 +41,10 @@ function layout(nodes, edges, axis) {
         piece.push(to)
       }
     }
-    // 2. relax: keep edges near their direction/length, push overlapping places apart
-    for (let it = 0; it < 220; it++) {
+    const inPiece = new Set(piece)
+    for (let it = 0; it < 240; it++) {
       for (const [a, b, dx, dy] of dirs) {
-        if (!pos[a] || !pos[b] || !piece.includes(a)) continue
+        if (!inPiece.has(a) || !pos[b]) continue
         const tx = pos[a][0] + STEP * dx - pos[b][0]
         const ty = pos[a][1] + STEP * dy - pos[b][1]
         pos[b][0] += tx * 0.08; pos[b][1] += ty * 0.08
@@ -64,29 +65,29 @@ function layout(nodes, edges, axis) {
         }
       }
     }
-    const xs = piece.map((id) => pos[id][0])
-    const minX = Math.min(...xs)
+    const minX = Math.min(...piece.map((id) => pos[id][0]))
     for (const id of piece) pos[id][0] += offsetX - minX
     offsetX = Math.max(...piece.map((id) => pos[id][0])) + 4
   }
   return pos
 }
 
-// Put each label on whichever side has room.
-function labelSide(id, pos) {
-  const [x, y] = pos[id]
-  const crowdedRight = Object.entries(pos).some(([o, [ox, oy]]) => o !== id && ox > x && ox - x < 3 && Math.abs(oy - y) < 0.5)
-  const crowdedLeft = Object.entries(pos).some(([o, [ox, oy]]) => o !== id && ox < x && x - ox < 3 && Math.abs(oy - y) < 0.5)
-  return crowdedRight && !crowdedLeft ? 'left' : 'right'
-}
+// Minor waypoints (walk ends, unnamed hallway points) render as quiet dots without labels.
+const isMinor = (n) =>
+  !n.verified && !(n.sign_texts || []).length && ['hallway', 'intersection', 'landmark'].includes(n.type)
+const glyphClass = (n) =>
+  isMinor(n) ? 'minor'
+    : n.type === 'stairs' || n.type === 'elevator' ? 'vertical'
+      : ['entrance', 'exit', 'restroom'].includes(n.type) ? 'key' : 'place'
 
-const kindOf = (n) => (n.type === 'elevator' ? '🛗' : '🪜')
+const LABEL_H = 0.42
+const labelW = (text) => 0.2 * Math.min(text.length, 22) + 0.2
 
-function Schematic({ map, floor, selected, onSelect }) {
+function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
   const floorOf = Object.fromEntries(map.nodes.map((n) => [n.id, n.floor]))
   const nodes = map.nodes.filter((n) => n.floor === floor)
   const sameFloor = map.edges.filter((e) => floorOf[e.from_node] === floor && floorOf[e.to_node] === floor)
-  const links = {} // node id -> other floors it connects to
+  const links = {}
   for (const e of map.edges) {
     const [a, b] = [floorOf[e.from_node], floorOf[e.to_node]]
     if (a === b) continue
@@ -94,48 +95,143 @@ function Schematic({ map, floor, selected, onSelect }) {
     if (b === floor) (links[e.to_node] ||= new Set()).add(a)
   }
   const pos = useMemo(() => layout(nodes, sameFloor, map.dominant_axis_deg || 0), [map, floor])
+  const [view, setView] = useState(null)
+  const drag = useRef(null)
+  const svgRef = useRef(null)
+
   const pts = Object.values(pos)
-  if (!pts.length) return <p className="muted">No places on this floor.</p>
-  const xs = pts.map((p) => p[0])
-  const ys = pts.map((p) => p[1])
-  const pad = 0.8
-  const [minX, maxX, minY, maxY] = [Math.min(...xs) - pad * 3.5, Math.max(...xs) + pad * 3.5, Math.min(...ys) - pad, Math.max(...ys) + pad]
+  const bounds = pts.length
+    ? [Math.min(...pts.map((p) => p[0])) - 3.2, Math.min(...pts.map((p) => p[1])) - 1.2,
+       Math.max(...pts.map((p) => p[0])) + 4.5, Math.max(...pts.map((p) => p[1])) + 1.2]
+    : [0, 0, 10, 6]
+  const fit = { x: bounds[0], y: bounds[1], w: bounds[2] - bounds[0], h: bounds[3] - bounds[1] }
+  useEffect(() => setView(null), [floor, map])
+  const v = view || fit
+
+  // Greedy label placement: important places first, skip a label rather than overlap another.
+  const labels = useMemo(() => {
+    const placed = []
+    const out = {}
+    const order = [...nodes].sort((a, b) =>
+      (b.id === selected) - (a.id === selected) || isMinor(a) - isMinor(b) || b.verified - a.verified)
+    for (const n of order) {
+      if (isMinor(n) && n.id !== selected) continue
+      const p = pos[n.id]
+      if (!p) continue
+      const text = n.label.length > 22 ? `${n.label.slice(0, 21)}…` : n.label
+      const w = labelW(text)
+      for (const side of ['right', 'left', 'below']) {
+        const x = side === 'right' ? p[0] + 0.32 : side === 'left' ? p[0] - 0.32 - w : p[0] - w / 2
+        const y = side === 'below' ? p[1] + 0.32 : p[1] - LABEL_H / 2
+        const box = [x, y, x + w, y + LABEL_H]
+        const hit = placed.some((q) => box[0] < q[2] && box[2] > q[0] && box[1] < q[3] && box[3] > q[1])
+          || nodes.some((m) => m.id !== n.id && pos[m.id] && pos[m.id][0] > box[0] - 0.15 && pos[m.id][0] < box[2] + 0.15
+            && pos[m.id][1] > box[1] - 0.15 && pos[m.id][1] < box[3] + 0.15)
+        if (!hit) {
+          placed.push(box)
+          out[n.id] = { text, x: side === 'left' ? x + w : side === 'below' ? p[0] : x, y: y + LABEL_H * 0.72,
+                        anchor: side === 'left' ? 'end' : side === 'below' ? 'middle' : 'start' }
+          break
+        }
+      }
+    }
+    return out
+  }, [pos, selected, floor])
+
+  const toSvg = (e) => {
+    const r = svgRef.current.getBoundingClientRect()
+    return [v.x + ((e.clientX - r.left) / r.width) * v.w, v.y + ((e.clientY - r.top) / r.height) * v.h]
+  }
+  const zoom = (factor, center) => {
+    const [cx, cy] = center || [v.x + v.w / 2, v.y + v.h / 2]
+    const w = Math.min(Math.max(v.w * factor, 3), fit.w * 3)
+    const h = (w / v.w) * v.h
+    setView({ x: cx - ((cx - v.x) / v.w) * w, y: cy - ((cy - v.y) / v.h) * h, w, h })
+  }
+  const onWheel = (e) => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.15 : 0.87, toSvg(e)) }
+  useEffect(() => {
+    const el = svgRef.current
+    if (!el) return
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  })
+  const onDown = (e) => { drag.current = { sx: e.clientX, sy: e.clientY, v, moved: false } }
+  const onMove = (e) => {
+    const d = drag.current
+    if (!d) return
+    const r = svgRef.current.getBoundingClientRect()
+    const dx = ((e.clientX - d.sx) / r.width) * d.v.w
+    const dy = ((e.clientY - d.sy) / r.height) * d.v.h
+    if (Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 4) d.moved = true
+    setView({ ...d.v, x: d.v.x - dx, y: d.v.y - dy })
+  }
+  const onUp = () => { setTimeout(() => (drag.current = null), 0) }
+  const pick = (id) => { if (!drag.current?.moved) onSelect(id) }
+
+  const selEdges = new Set(sameFloor.filter((e) => e.from_node === selected || e.to_node === selected).map((e) => e.id))
+
   return (
-    <svg className="schematic" viewBox={`${minX} ${minY} ${maxX - minX} ${maxY - minY}`} preserveAspectRatio="xMidYMid meet">
-      {sameFloor.map((e) => {
-        const a = pos[e.from_node]
-        const b = pos[e.to_node]
-        if (!a || !b) return null
-        return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} className={`edge ${e.vertical !== 'none' ? 'vertical' : ''}`} />
-      })}
-      {nodes.map((n) => {
-        const p = pos[n.id]
-        if (!p) return null
-        const other = links[n.id] ? [...links[n.id]].sort((x, y) => x - y) : []
-        return (
-          <g key={n.id} onClick={() => onSelect(n.id)} className={`snode ${n.type} ${selected === n.id ? 'sel' : ''} ${n.verified ? 'verified' : ''}`}>
-            <circle cx={p[0]} cy={p[1]} r={0.18} />
-            {(() => {
-              const left = labelSide(n.id, pos) === 'left'
-              const x = p[0] + (left ? -0.28 : 0.28)
-              const anchor = left ? 'end' : 'start'
-              return (
-                <>
-                  <text x={x} y={p[1] + 0.08} textAnchor={anchor}>
-                    {n.label.length > 20 ? `${n.label.slice(0, 19)}…` : n.label}
-                  </text>
-                  {other.length > 0 && (
-                    <text x={x} y={p[1] + 0.36} textAnchor={anchor} className="floor-link">
-                      {kindOf(n)} ↕ floor {other.join(', ')}
-                    </text>
-                  )}
-                </>
-              )
-            })()}
-          </g>
-        )
-      })}
-    </svg>
+    <div className="map-stage">
+      {floors.length > 1 && (
+        <div className="floor-panel" role="group" aria-label="Floor">
+          {[...floors].reverse().map((f) => (
+            <button key={f} className={f === floor ? 'active' : ''} onClick={() => onFloor(f)} aria-pressed={f === floor}>
+              {f}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="map-tools">
+        <button className="icon-btn" aria-label="Zoom in" onClick={() => zoom(0.75)}>+</button>
+        <button className="icon-btn" aria-label="Zoom out" onClick={() => zoom(1.33)}>−</button>
+        <button className="icon-btn fit" aria-label="Fit floor" onClick={() => setView(null)}>Fit</button>
+      </div>
+      {!nodes.length ? (
+        <p className="map-empty">Nothing mapped on floor {floor} yet.</p>
+      ) : (
+        <svg ref={svgRef} className="schematic" viewBox={`${v.x} ${v.y} ${v.w} ${v.h}`} preserveAspectRatio="xMidYMid meet"
+          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}>
+          {sameFloor.map((e) => {
+            const a = pos[e.from_node]
+            const b = pos[e.to_node]
+            if (!a || !b) return null
+            return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]}
+              className={`edge ${e.vertical !== 'none' ? 'vertical' : ''} ${selEdges.has(e.id) ? 'active' : ''}`} />
+          })}
+          {nodes.map((n) => {
+            const p = pos[n.id]
+            if (!p) return null
+            const other = links[n.id] ? [...links[n.id]].sort((x, y) => x - y) : []
+            const cls = glyphClass(n)
+            const r = cls === 'minor' ? 0.09 : 0.2
+            return (
+              <g key={n.id} className={`snode ${cls} ${selected === n.id ? 'sel' : ''}`} onClick={() => pick(n.id)}>
+                <title>{`${n.label} (floor ${n.floor})`}</title>
+                <circle cx={p[0]} cy={p[1]} r={0.5} className="hit" />
+                {cls === 'vertical'
+                  ? <rect x={p[0] - r} y={p[1] - r} width={r * 2} height={r * 2} rx={0.06} />
+                  : <circle cx={p[0]} cy={p[1]} r={r} />}
+                {other.length > 0 && (
+                  <text x={p[0]} y={p[1] + 0.075} className="floor-mark" textAnchor="middle">{other.length === 1 ? other[0] : '↕'}</text>
+                )}
+              </g>
+            )
+          })}
+          {Object.entries(labels).map(([id, l]) => (
+            <text key={id} x={l.x} y={l.y} textAnchor={l.anchor} className={`slabel ${id === selected ? 'sel' : ''}`}
+              onClick={() => pick(id)}>
+              {l.text}
+            </text>
+          ))}
+        </svg>
+      )}
+      <ul className="map-legend">
+        <li><i className="place" /> Room</li>
+        <li><i className="key" /> Entrance, exit or restroom</li>
+        <li><i className="vertical" /> Stairs or elevator (number = floor it reaches)</li>
+        <li><i className="minor" /> Waypoint</li>
+      </ul>
+    </div>
   )
 }
 
@@ -238,10 +334,15 @@ export default function MapReview({ building, onChanged }) {
 
   return (
     <>
-      <section className="card">
-        <div className="row spread">
-          <h2>Building map</h2>
-          <div className="row">
+      <section className="map-panel">
+        <header className="map-head">
+          <div>
+            <h2>Building map</h2>
+            <p className="muted">
+              {map.nodes.length} places, {map.edges.length} connections, {map.nodes.filter((n) => n.verified).length} verified
+            </p>
+          </div>
+          <div className="map-actions">
             <button className="ghost" disabled={busy} title="Merge places seen in several videos into one map"
               onClick={async () => {
                 setBusy(true)
@@ -251,7 +352,7 @@ export default function MapReview({ building, onChanged }) {
                     const j = await api.job(job_id)
                     if (j.status === 'done' || j.status === 'error') {
                       setError(j.status === 'error' ? j.error : '')
-                      setNote(j.log.filter((l) => /Same|Aligned|Consolidated/.test(l)).map((l) => l.slice(11)).join('\n'))
+                      setNote(j.log.filter((l) => /Same|Aligned|Consolidated|Floor link|placed/.test(l)).map((l) => l.slice(11)).join('\n'))
                       break
                     }
                     await new Promise((r) => setTimeout(r, 1000))
@@ -269,26 +370,14 @@ export default function MapReview({ building, onChanged }) {
               <input type="file" accept="image/*" hidden onChange={(e) => addPhoto(e.target.files[0])} />
             </label>
             <button className="primary" disabled={!dirty || busy} onClick={save}>
-              <Save size={16} /> Save
+              <Save size={16} /> {dirty ? 'Save changes' : 'Saved'}
             </button>
           </div>
-        </div>
-        <p className="muted">
-          {map.nodes.length} places · {map.edges.length} connections · {map.nodes.filter((n) => n.verified).length} verified
-          {map.processed_with?.model ? ` · labeled by ${map.processed_with.model}` : ''}
-        </p>
-        {error && <div className="banner error" onClick={() => setError('')}>{error}</div>}
+        </header>
+        {error && <p className="notice error" onClick={() => setError('')}>{error}</p>}
         {note && <pre className="log" onClick={() => setNote('')}>{note}</pre>}
-        {floors.length > 1 && (
-          <div className="floor-tabs">
-            {floors.map((f) => (
-              <button key={f} className={f === shownFloor ? 'active' : ''} onClick={() => setFloor(f)}>
-                Floor {f} <small>({map.nodes.filter((n) => n.floor === f).length})</small>
-              </button>
-            ))}
-          </div>
-        )}
-        <Schematic map={map} floor={shownFloor} selected={selected} onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+        <Schematic map={map} floor={shownFloor} floors={floors} onFloor={setFloor} selected={selected}
+          onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
       </section>
 
       {map.suggested_merges.length > 0 && (
@@ -423,9 +512,9 @@ export default function MapReview({ building, onChanged }) {
               {n.frame_id ? <img src={frameUrl(building, n.frame_id)} loading="lazy" alt="" /> : <div className="nophoto" />}
               <span>{n.label}</span>
               <small>
-                {n.type} · F{n.floor}
-                {n.verified ? ' · ✓' : ''}
-                {n.soft ? ' · blurry' : ''}
+                {n.type}, floor {n.floor}
+                {n.verified ? ', verified' : ''}
+                {n.soft ? ', blurry photo' : ''}
               </small>
             </button>
           ))}

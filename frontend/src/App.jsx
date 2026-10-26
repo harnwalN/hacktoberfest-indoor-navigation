@@ -7,10 +7,10 @@ import Navigator from './components/Navigator'
 import Recorder from './components/Recorder'
 
 const TABS = [
-  { id: 'build', label: 'Build', icon: Upload },
+  { id: 'navigate', label: 'Directions', icon: Compass },
   { id: 'review', label: 'Map', icon: MapIcon },
-  { id: 'navigate', label: 'Navigate', icon: Compass },
   { id: 'record', label: 'Record', icon: Video },
+  { id: 'build', label: 'Build', icon: Upload },
 ]
 
 // Hash routing: #/navigate?b=<building>, so a phone link opens straight into navigation.
@@ -87,7 +87,7 @@ export default function App() {
             {!buildings.length && <option value="">No buildings yet</option>}
             {buildings.map((b) => (
               <option key={b.id} value={b.id}>
-                {b.name} ({b.nodes} places)
+                {b.name}
               </option>
             ))}
           </select>
@@ -100,7 +100,7 @@ export default function App() {
         </div>
       )}
 
-      <main className="content">
+      <main className={`content ${tab === 'navigate' ? 'is-nav' : ''}`}>
         {(tab === 'build' || !buildings.length) && (
           <section className="card new-building">
             <h3>New building</h3>
