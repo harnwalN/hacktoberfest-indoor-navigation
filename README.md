@@ -1,15 +1,36 @@
 # Waypoint: indoor navigation from a walkthrough video
 
-Record one walk through a building on a phone and upload it. **Gemma, running locally and offline**, reads the door plaques and signs. Computer vision recovers every turn, glance, and staircase. The result is a navigation graph that can close loops.
+Record walks through a building on a phone and upload them. **Gemma, running locally and offline**, reads door plaques and signs; on-device OCR checks every word it reports. Computer vision (plus the phone gyro, when available) recovers every turn, glance, and staircase. All videos are merged into **one multi-floor navigation map** that closes loops and links floors through shared stairwells and elevators.
 
-Users then pick *Start* and *Destination* on their phone and follow step-by-step photos with arrows. Routing at query time is pure graph math, with **no model calls**.
+Users pick *From* and *To* on their phone and follow step-by-step photos with wayfinding arrows. Routing at query time is pure graph math, with **no model calls**.
 
 ```
-video ─ffmpeg─▶ analysis.mp4 (10 fps) ─optical flow─▶ heading track ─▶ turns / glances / pauses
-       └──────▶ hq.mp4 (15 fps) ─adaptive sharpness─▶ keyframes ─Gemma (local)─▶ signs, rooms, stairs
+video ─ffmpeg─▶ analysis.mp4 (10 fps) ─optical flow / gyro─▶ travel heading ─▶ turns / glances / pauses
+       └──────▶ hq.mp4 (15 fps) ─adaptive sharpness─▶ keyframes ─OCR + Gemma (local)─▶ signs, rooms, stairs
                                                          │
-                       walk nodes ─▶ loop closure (room no. + ORB + Gemma "same place?") ─▶ map.json
+     walk nodes ─▶ loop closure ─▶ floors (start floor, room numbers, stairs) ─▶ link all videos ─▶ map.json
 ```
+
+## AI models
+
+**Used by the app (all run locally, offline after one download):**
+
+| Model | Role |
+|---|---|
+| **Gemma 3 4B** (`gemma3:4b`, Google, open weights, via Ollama) | Default vision-language model. Per keyframe it returns structured JSON: sign text, room numbers, place type, stairs, floor hints and a landmark phrase. It also answers "same place?" and "same stairwell?" when linking walks and floors |
+| **Gemma 3 12B** (`gemma3:12b`, optional) | Higher-quality, ~2.5× slower alternative for overnight pre-processing on machines with 32 GB+ |
+| **Apple Vision text recognizer** (macOS `VNRecognizeTextRequest`, on-device) | Grounds Gemma: only text this OCR actually found may become a sign or room number, which stops small-model hallucinations. Skipped automatically off macOS |
+
+Everything else is classical computer vision with no learned model: Lucas–Kanade optical flow, RANSAC similarity fits, ORB features and homographies (OpenCV), plus graph search (NetworkX).
+
+**Used to design and build it:** the architecture, pipeline, backend, frontend, tests and this README were designed and implemented with **Claude Opus 5.5** (Anthropic, model ID `claude-opus-5-5`) running in **Claude Code**, working with the team below. The team chose the building, recorded and curated the walkthroughs, tested on site and directed the design.
+
+## Contributors
+
+- Evan Schaller
+- Naagaa Prachet Kadaba Pradeep
+- Sudarshan Kotlanka
+- Neelaksh Harnwal
 
 ## Run it
 
@@ -33,7 +54,8 @@ npm run dev
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Open the printed `https://….trycloudflare.com` URL on the phone. Bookmark `#/navigate?b=<building-id>`.
+Open the printed `https://….trycloudflare.com` URL on the phone. Bookmark `#/navigate?b=<building-id>`;
+teammates record new walks at `#/record?b=<building-id>`.
 
 ### Batch pre-processing (no UI)
 ```bash
@@ -44,11 +66,14 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 ```
 
 ### Tests
-`cd backend && uv run pytest`. The tests use synthetic videos with a known camera yaw:
-- 90° turns are measured to within 0.1°.
-- A glance (looking at something and back) is not counted as a turn.
+`cd backend && uv run pytest` (19 tests). They use synthetic videos with a known camera yaw and fixture maps:
+- 90° turns are measured to within 0.1°; a glance (look at something and back) is not a turn.
 - A 4-turn loop closes into a cycle.
-- On a fixture map, routes mirror in reverse, stairs flip up↔down, and "no path" returns HTTP 400.
+- Routes mirror in reverse, stairs flip up↔down, and "no path" returns HTTP 400.
+- Floors from room numbers (121 → 1, 208 → 2), elevator jumps without stairs, one misread number ignored.
+- Walks merge across videos by room number or named sign but never across floors; guessed floors are
+  adopted from linked walks; single staircases on adjacent floors are linked; removing a video keeps
+  places other walks still use.
 
 ## Working as a team
 
@@ -78,15 +103,21 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 | **Motion** | Lucas–Kanade corners plus a RANSAC similarity fit in centred coordinates. Horizontal shift gives **yaw**; expansion gives **forward motion**. The **travel heading** is a running median over frames that move forward and look ahead, so standing and looking around never counts as a turn. If a phone gyro log is attached, it replaces vision yaw, with its sign auto-calibrated against vision |
 | **Events** | *Turn*: a sustained change in travel heading. *Glance*: the camera points more than 35° off the travel direction (usually at a plaque). *Pause*: the camera is nearly still |
 | **Keyframes** | Event-driven (before and after turns, glances, pauses, scene changes, plus a 3 s heartbeat). In each ±0.5 s window, pick the frame with the highest sharpness relative to the video's own rolling median, divided by motion. Blurry-only windows still keep their best frame, flagged `soft`, so no place is ever lost |
-| **Gemma** | Structured JSON per keyframe: sign text, room numbers, label, place type, stairs up or down, floor, and a short landmark phrase. If a sign is visible but unreadable, Gemma is asked again with zoomed left and right crops. All answers are cached on disk |
-| **Mapping** | Turns, pauses, signs, and stair boundaries become nodes. Revisits are detected by room-number text and ORB homography, then verified by Gemma ("same physical spot?"). Confident matches merge automatically; others go to a review queue. Each verified match also constrains heading drift (fit `c0 + k·t`). Edge headings are snapped to the building's dominant axis (Manhattan prior) |
-| **Routing** | `turn = heading_out(next) − heading_in(arrival)`, quantized to straight, slight, turn, or u-turn. Walking an edge backwards uses headings + 180° and stairs up↔down, so one recording works in both directions. Each step shows the photo taken while approaching that point *in your direction of travel*; if a stretch was only walked the other way, the step carries a note |
+| **Gemma + OCR** | On-device OCR lists the text really present; Gemma returns structured JSON (sign text, room numbers, label, place type, stairs, floor, landmark phrase) and may only copy text from that list. Labels built on an unverified number are rebuilt. Without OCR (non-macOS) Gemma re-reads unclear signs with zoomed crops. All answers are cached on disk |
+| **Mapping** | Turns, pauses, signs, and stair boundaries become nodes; consecutive frames of one named place collapse. Revisits are detected by room-number text and ORB homography, verified by Gemma ("same physical spot?"); automatic merges need geometric agreement, others go to a review queue. Each verified match constrains heading drift (fit `c0 + k·t`). Edge headings are snapped to the building's dominant axis (Manhattan prior) |
+| **Floors** | Floors start at 1. Each walk's floor comes from the uploader's start floor, room numbers (first digit = floor), and detected stairs; a room-number floor change without visible stairs inserts a flagged stairs/elevator link. Places on different floors never merge |
+| **One map from n videos** | After every video: same room number or same named sign on the same floor ⇒ same place (even when walked in opposite directions); strong ORB or ORB + Gemma matches across walks; walks with a guessed floor adopt the floor of a known place they share; unanchored walks are rotated into the building frame; the same stairwell or elevator on adjacent floors is linked |
+| **Routing** | `turn = heading_out(next) − heading_in(arrival)`, quantized to straight, slight, turn, or u-turn. Walking an edge backwards uses headings + 180° and stairs up↔down, so one recording works in both directions. Floor changes say "take the stairs up to floor 2"; across a link between two separate walks the step says where to head instead of guessing a turn. Each step shows the photo taken while approaching that point *in your direction of travel* |
+| **App** | Directions: full-bleed photo with a wayfinding sign (bent-arrow pictograms, stair yellow for floor changes) and a route strip. Map: per-floor schematic with an elevator-style floor selector, pan/zoom, merge review and editing. Build: pausable processing queue (run next, resume, survives restarts), per-video start floor, video removal |
 
 ## Recording tips
 - 1080p with stabilization on. Hold the phone upright and point it where you walk. Turn at a steady pace.
 - **Pause about 1 s** at plaques, junctions, and stairs. Glancing at a plaque and back is fine.
 - Walk corridors in both directions when you can, and pass known spots again to close loops.
-- Best accuracy: record from the **Record** tab on the phone, which logs the gyro alongside the video.
+- Best accuracy: record from the **Record** tab on the phone, which logs the gyro alongside the video, and
+  enter the floor the walk starts on.
+- Overlap something already mapped (a room number, named sign or staircase) so the walk links into the map;
+  film staircases from both floors to connect floors.
 
 ## Persistence
 Each building is a portable folder, `backend/data/buildings/<id>/`:
