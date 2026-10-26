@@ -90,6 +90,7 @@ async def upload_video(
     video: UploadFile = File(...),
     sensors: UploadFile | None = File(None),
     model: str | None = Form(None),
+    priority: bool = Form(False),
 ):
     _load(building_id)
     tmp = Path(tempfile.mkstemp(suffix=Path(video.filename or "v.mp4").suffix)[1])
@@ -102,7 +103,9 @@ async def upload_video(
             sensor_data = json.loads(await sensors.read())
         except json.JSONDecodeError:
             raise HTTPException(400, "sensors must be JSON")
-    job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None)
+    job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None, front=priority)
+    if priority:
+        jobs.run_next(job.id)
     return {"job_id": job.id, "video_id": job.video_id}
 
 
@@ -117,7 +120,23 @@ def job_status(job_id: str):
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job (server restarted?)")
-    return job.__dict__
+    return job.public()
+
+
+@api.get("/buildings/{building_id}/queue")
+def job_queue(building_id: str):
+    return [j.public() | {"log": j.log[-1:]} for j in jobs.queue(building_id)]
+
+
+@api.post("/jobs/{job_id}/{action}")
+def job_action(job_id: str, action: str):
+    """action: pause | resume | run-next (move to front; pauses the running job, which resumes after)."""
+    if jobs.get(job_id) is None:
+        raise HTTPException(404, "Unknown job")
+    fn = {"pause": jobs.pause, "resume": jobs.resume, "run-next": jobs.run_next}.get(action)
+    if fn is None:
+        raise HTTPException(400, "action must be pause, resume or run-next")
+    return fn(job_id).public()
 
 
 @api.get("/buildings/{building_id}/videos/{video_id}/debug")

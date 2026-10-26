@@ -200,3 +200,15 @@ input[type='file'] { padding: 7px; }
 .viewfinder { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; aspect-ratio: 9 / 16; max-height: 60vh; margin: 8px auto; }
 .viewfinder video { width: 100%; height: 100%; object-fit: cover; }
 .rec-badge { position: absolute; top: 10px; left: 10px; background: var(--bad); color: #fff; padding: 4px 10px; border-radius: 99px; font-size: 13px; font-weight: 700; }
+
+/* queue */
+.queue { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+.queue li { padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; display: grid; gap: 6px; }
+.queue li.sel { border-color: var(--accent); }
+.queue li.done, .queue li.error { opacity: 0.7; }
+.q-main { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.q-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.q-actions button { padding: 4px 10px; font-size: 13px; }
+.bar.slim { height: 4px; margin: 0; }
+.pill.paused, .pill.queued { color: var(--warn); }

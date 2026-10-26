@@ -90,9 +90,10 @@ export default function Recorder({ building, onUploaded }) {
     try {
       await api.uploadVideo(building, result.file, {
         sensors: result.sensors.samples.length > 20 ? result.sensors : null,
+        priority: true, // phone recordings jump the queue so you can try them right away
         onProgress: (p) => setStatus(`Uploading ${Math.round(p * 100)}%`),
       })
-      setStatus('Uploaded. Processing has started on the laptop.')
+      setStatus('Uploaded. It jumps the queue: processing starts on the laptop now (see Build → Queue).')
       onUploaded?.()
     } catch (e) {
       setStatus(detail(e))

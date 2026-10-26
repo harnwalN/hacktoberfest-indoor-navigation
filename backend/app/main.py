@@ -3,12 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config
+from . import config, jobs
 from .router import api
 
 app = FastAPI(title="Indoor Visual Navigation", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(api)
+
+
+@app.on_event("startup")
+def _recover_queue():
+    jobs.recover()  # re-queue videos interrupted by a restart
 
 config.BUILDINGS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/bfiles", StaticFiles(directory=config.BUILDINGS_DIR), name="bfiles")

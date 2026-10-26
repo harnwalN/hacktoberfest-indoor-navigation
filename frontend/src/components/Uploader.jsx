@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Cpu, RefreshCw, Search, UploadCloud } from 'lucide-react'
 import { api, detail } from '../api'
 import JobProgress from './JobProgress'
+import QueuePanel from './QueuePanel'
 import VideoDebug from './VideoDebug'
 
 export default function Uploader({ building, onDone }) {
@@ -10,6 +11,7 @@ export default function Uploader({ building, onDone }) {
   const [file, setFile] = useState(null)
   const [sensorFile, setSensorFile] = useState(null)
   const [model, setModel] = useState('')
+  const [priority, setPriority] = useState(false)
   const [uploadPct, setUploadPct] = useState(null)
   const [jobId, setJobId] = useState(null)
   const [inspect, setInspect] = useState(null)
@@ -28,7 +30,7 @@ export default function Uploader({ building, onDone }) {
     try {
       const sensors = sensorFile ? JSON.parse(await sensorFile.text()) : null
       setUploadPct(0)
-      const r = await api.uploadVideo(building, file, { sensors, model, onProgress: setUploadPct })
+      const r = await api.uploadVideo(building, file, { sensors, model, priority, onProgress: setUploadPct })
       setJobId(r.job_id)
       setInspect(null)
     } catch (e) {
@@ -75,6 +77,10 @@ export default function Uploader({ building, onDone }) {
             </select>
           </label>
         )}
+        <label className="check">
+          <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
+          Process next (pauses the current video; it resumes afterwards)
+        </label>
         {error && <div className="banner error">{error}</div>}
         <button className="primary" disabled={!file || uploadPct !== null} onClick={upload}>
           <UploadCloud size={18} />
@@ -93,6 +99,8 @@ export default function Uploader({ building, onDone }) {
           </ul>
         </details>
       </section>
+
+      <QueuePanel building={building} selected={jobId} onSelect={setJobId} />
 
       {jobId && (
         <JobProgress
