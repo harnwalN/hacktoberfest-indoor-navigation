@@ -15,7 +15,7 @@ def test_room_floor_convention():
     assert mapper.room_floor(["121"]) == 1
     assert mapper.room_floor(["Room 208"]) == 2
     assert mapper.room_floor(["B112"]) == 1
-    assert mapper.room_floor(["1210"]) == 12
+    assert mapper.room_floor(["8512"]) is None  # 4 digits: phone numbers / codes, not rooms
     assert mapper.room_floor(["EXIT"]) is None
 
 

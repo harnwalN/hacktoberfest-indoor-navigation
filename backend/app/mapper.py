@@ -298,9 +298,9 @@ def room_floor(texts: list[str]) -> int | None:
         return None
     floors = []
     for tok in text_tokens(texts):
-        m = re.fullmatch(r"[A-Z]?(\d{3,4})[A-Z]?", tok)
-        if m:
-            floors.append(int(m.group(1)[:-2]))
+        m = re.fullmatch(r"[A-Z]?(\d{3})[A-Z]?", tok)  # 4+ digits are usually phone/codes, not rooms
+        if m and 1 <= int(m.group(1)[0]) <= config.MAX_FLOOR:
+            floors.append(int(m.group(1)[0]))
     return max(set(floors), key=floors.count) if floors else None
 
 

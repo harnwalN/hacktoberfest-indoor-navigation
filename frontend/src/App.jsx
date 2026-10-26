@@ -44,7 +44,12 @@ export default function App() {
     if (!building && buildings.length) setBuilding(buildings[0].id)
   }, [buildings, building])
   useEffect(() => {
-    window.location.hash = `/${tab}${building ? `?b=${building}` : ''}`
+    // Keep extra parameters (e.g. from/to/step on a shared directions link) while on the same tab.
+    const [path, query] = window.location.hash.replace(/^#\/?/, '').split('?')
+    const params = new URLSearchParams(path === tab ? query || '' : '')
+    if (building) params.set('b', building)
+    const qs = params.toString()
+    window.location.hash = `/${tab}${qs ? `?${qs}` : ''}`
     try {
       if (building) localStorage.setItem('building', building)
     } catch {

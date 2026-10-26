@@ -4,6 +4,26 @@ Record walks through a building on a phone and upload them. **Gemma, running loc
 
 Users pick *From* and *To* on their phone and follow step-by-step photos with wayfinding arrows. Routing at query time is pure graph math, with **no model calls**.
 
+<p align="center">
+  <img src="docs/screenshots/directions-plan.png" alt="Trip planner: choose where you are and where you are going" width="31%">
+  <img src="docs/screenshots/directions-turn.jpg" alt="A direction step: photo of the spot with a turn sign" width="31%">
+  <img src="docs/screenshots/directions-stairs.jpg" alt="A floor change: yellow stairs sign and route strip marking floors 2 and 3" width="31%">
+</p>
+
+<p align="center"><em>Plan a trip, follow photo-and-sign steps, and change floors on the way (floor 1 to Office 362 on floor 3).</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/map.png" alt="Building map with an elevator-style floor selector" width="94%">
+</p>
+
+<p align="center"><em>One map per floor, built from every walkthrough video. Stairs show the floor they reach.</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/build.png" alt="Build tab: upload walks, processing queue and what the pipeline saw" width="94%">
+</p>
+
+<p align="center"><em>Upload or record walks; a pausable queue processes them locally with Gemma.</em></p>
+
 ```
 video ─ffmpeg─▶ analysis.mp4 (10 fps) ─optical flow / gyro─▶ travel heading ─▶ turns / glances / pauses
        └──────▶ hq.mp4 (15 fps) ─adaptive sharpness─▶ keyframes ─OCR + Gemma (local)─▶ signs, rooms, stairs
@@ -27,10 +47,10 @@ Everything else is classical computer vision with no learned model: Lucas–Kana
 
 ## Contributors
 
-- Evan Schaller
-- Naagaa Prachet Kadaba Pradeep
-- Sudarshan Kotlanka
-- Neelaksh Harnwal
+- Neel
+- Evan
+- Prachet
+- Sudarshan
 
 ## Run it
 
@@ -54,8 +74,9 @@ npm run dev
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Open the printed `https://….trycloudflare.com` URL on the phone. Bookmark `#/navigate?b=<building-id>`;
-teammates record new walks at `#/record?b=<building-id>`.
+Open the printed `https://….trycloudflare.com` URL on the phone. Bookmark `#/navigate?b=<building-id>`,
+record new walks at `#/record?b=<building-id>`, or share a route directly with
+`#/navigate?b=<building-id>&from=<place-id>&to=<place-id>`.
 
 ### Batch pre-processing (no UI)
 ```bash
@@ -74,26 +95,6 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 - Walks merge across videos by room number or named sign but never across floors; guessed floors are
   adopted from linked walks; single staircases on adjacent floors are linked; removing a video keeps
   places other walks still use.
-
-## Working as a team
-
-**One machine is the "map server".** It runs Ollama + the backend, processes all videos, and holds
-`backend/data/` (git-ignored). Everyone else points at it, so there is one map and one Gemma.
-
-| Role | What to run |
-|---|---|
-| Map server (Mac, 16 GB+) | full setup above + `cloudflared tunnel --url http://localhost:8000`, share the URL |
-| Frontend dev | `cd frontend && npm install && API_TARGET=https://<tunnel>.trycloudflare.com npm run dev` (no Python/Ollama needed) |
-| Backend / pipeline dev | full setup on your own laptop; copy a building folder to test on real data (below) |
-| Recording / map curation | phone only: tunnel URL → Record, Map, Navigate |
-
-- Get real data locally: zip `backend/data/buildings/<id>/` on the map server (skip `videos/` to keep it
-  small) and unzip into the same path; everything runs offline from that folder.
-- OCR grounding uses the macOS Vision framework. On Linux/Windows it is skipped automatically and Gemma
-  runs ungrounded (expect some invented room numbers), so process final videos on a Mac.
-- Map edits save the whole map: only one person should edit the Map tab at a time.
-- Git: branch per task (`git switch -c feat/...`), open a PR to `master`, never commit `backend/data/` or
-  videos. Run `cd backend && uv run pytest` before pushing backend changes.
 
 ## How it works
 

@@ -76,6 +76,20 @@ export default function Navigator({ building }) {
     api.getMap(building).then(setMap).catch((e) => setError(detail(e)))
   }, [building])
 
+  // Shareable directions: #/navigate?b=<building>&from=<place>&to=<place> opens straight into the route.
+  useEffect(() => {
+    if (!map) return
+    const q = new URLSearchParams(window.location.hash.split('?')[1] || '')
+    const from = q.get('from')
+    const to = q.get('to')
+    if (from && to) {
+      setStart(from)
+      setTarget(to)
+      api.route(building, from, to).then((r) => { setSteps(r.steps); setI(Number(q.get('step') || 0)) })
+        .catch((e) => setError(detail(e)))
+    }
+  }, [map])
+
   const verified = (map?.nodes || []).filter((n) => n.verified)
   const choices = showAll || verified.length < 2 ? map?.nodes || [] : verified
   const floors = new Set((map?.nodes || []).map((n) => n.floor)).size
