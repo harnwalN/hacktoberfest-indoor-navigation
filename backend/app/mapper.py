@@ -12,6 +12,7 @@ Pipeline per walk:
 """
 import math
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -90,6 +91,23 @@ def strong_name_match(a: list[str], b: list[str]) -> bool:
         return False
     s = shared_sign_words(a, b)
     return (len(s) >= 2 or any(len(w) >= 7 for w in s)) and len(s) >= 0.5 * min(len(wa), len(wb))
+
+
+def _letters(texts: list[str]) -> str:
+    return re.sub(r"[^A-Z]", "", " ".join(texts).upper())
+
+
+def fuzzy_name_match(a: list[str], b: list[str], threshold: float = 0.65) -> bool:
+    """OCR reads one sign in pieces from different angles ('MAK SPAC', 'KERSPAGE', 'MAKER SPACE').
+    Compare the letters of the shorter text with the best-matching stretch of the longer one."""
+    la, lb = _letters(a), _letters(b)
+    if min(len(la), len(lb)) < 7 or max(len(la), len(lb)) > 40:
+        return False  # too little to go on, or busy text (posters, wall graphics)
+    short, long_ = sorted((la, lb), key=len)
+    width = len(short) + 3
+    best = max(SequenceMatcher(None, short, long_[i:i + width]).ratio()
+               for i in range(0, max(1, len(long_) - len(short) + 1)))
+    return best >= threshold
 
 
 @lru_cache(maxsize=2048)
@@ -540,8 +558,13 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         frames_seq.append(b.kf.frame_id)
         frames_seq = list(dict.fromkeys(frames_seq))
 
+        length = _walk_length(track, a.kf.t, b.kf.t)
         existing = next((e for e in bundle.edges if {e.from_node, e.to_node} == {a.node_id, b.node_id}), None)
         if existing:
+            if existing.length_m is None or existing.source != "walk":
+                existing.length_m = length
+            else:  # walked twice: average the two measurements
+                existing.length_m = round((existing.length_m + length) / 2, 1)
             if existing.from_node == b.node_id and existing.frames_rev is None:
                 existing.frames_rev = frames_seq  # walked the other way: now we have imagery both ways
             continue
@@ -549,7 +572,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             id=f"e{edge_counter:03d}", from_node=a.node_id, to_node=b.node_id,
             heading_out=h_out, heading_in=h_in, heading_out_raw=round(h_out, 1), heading_in_raw=round(h_in, 1),
             vertical=vertical, frames_fwd=frames_seq, source="walk", video_id=video_id,
-            inferred_floor_change=inferred,
+            inferred_floor_change=inferred, length_m=length,
         ))
         edge_counter += 1
         new_edges += 1
@@ -561,6 +584,18 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     return {"nodes": len(created), "merged": merged, "edges": new_edges, "floor_offset": floors[0] - wnodes[0].rel_floor,
             "floors": sorted(set(floors)),
             "suggested": len(pending_suggestions), "drift_deg_per_min": round(k * 60, 1)}
+
+
+def _walk_length(track: dict, t0: float, t1: float) -> float:
+    """Metres walked between two moments: time spent moving forward x walking speed. Standing still,
+    looking around or opening doors adds nothing."""
+    t = np.array(track["t"])
+    fwd = np.array(track.get("fwd") or [config.FWD_WALKING + 1] * len(t))
+    m = (t >= min(t0, t1)) & (t <= max(t0, t1))
+    if not m.any():
+        return round(abs(t1 - t0) * config.WALK_SPEED_MPS, 1)
+    moving = float((fwd[m] > config.FWD_WALKING * 0.6).sum()) / track["fps"]
+    return round(max(1.0, moving * config.WALK_SPEED_MPS), 1)
 
 
 def _raw_heading_of(node: Node, created: list[tuple[Node, WalkNode]]) -> float:
@@ -576,7 +611,7 @@ def dominant_axis(edges: list[Edge]) -> float:
     if not angles:
         return 0.0
     s = sum(math.sin(4 * a) for a in angles); c = sum(math.cos(4 * a) for a in angles)
-    return (math.degrees(math.atan2(s, c)) / 4) % 90
+    return round((math.degrees(math.atan2(s, c)) / 4) % 90, 3) % 90  # -0.0001 must not become 89.999
 
 
 def snap(h: float, axis: float) -> float:
@@ -597,6 +632,66 @@ def finalize(bundle: MapBundle) -> None:
         if e.heading_in_raw is not None:
             e.heading_in = snap(e.heading_in_raw, axis)
     _dedupe_labels(bundle)
+    solve_positions(bundle)
+
+
+def solve_positions(bundle: MapBundle) -> None:
+    """Metric x/y for every place, from all connections at once (least squares).
+
+    Each connection says "b is length_m away from a along its heading"; stairs/elevators say "same x/y,
+    different floor". Solving everything together averages out errors around loops instead of
+    accumulating them. Separate pieces are placed side by side. Axes follow the main hallway axis.
+    """
+    idx = {n.id: i for i, n in enumerate(bundle.nodes)}
+    if not idx:
+        return
+    axis = bundle.dominant_axis_deg
+    rows: list[tuple[int, int, float, float, float]] = []  # (a, b, dx, dy, weight)
+    for e in bundle.edges:
+        if e.from_node not in idx or e.to_node not in idx:
+            continue
+        if e.vertical in ("stairs_up", "stairs_down", "elevator") and e.source != "walk":
+            rows.append((idx[e.from_node], idx[e.to_node], 0.0, 0.0, 0.5))
+            continue
+        length = e.length_m or config.DEFAULT_EDGE_M
+        # average leaving/arriving directions (vector mean handles 350/10 deg)
+        ha, hb = math.radians(e.heading_out - axis), math.radians(e.heading_in - axis)
+        vx, vy = math.sin(ha) + math.sin(hb), math.cos(ha) + math.cos(hb)
+        norm = math.hypot(vx, vy) or 1.0
+        rows.append((idx[e.from_node], idx[e.to_node], length * vx / norm, length * vy / norm,
+                     1.0 if e.length_m else 0.4))
+    # connected pieces, each anchored at its first place
+    parent = list(range(len(idx)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for a, b, *_ in rows:
+        parent[find(a)] = find(b)
+    pieces: dict[int, list[int]] = {}
+    for i in range(len(idx)):
+        pieces.setdefault(find(i), []).append(i)
+    n = len(idx)
+    A = np.zeros((len(rows) + len(pieces), n))
+    bx, by = np.zeros(A.shape[0]), np.zeros(A.shape[0])
+    for r, (a, b, dx, dy, w) in enumerate(rows):
+        A[r, a], A[r, b] = -w, w
+        bx[r], by[r] = dx * w, dy * w
+    for k, members in enumerate(pieces.values()):
+        A[len(rows) + k, members[0]] = 10.0
+    xs, *_ = np.linalg.lstsq(A, bx, rcond=None)
+    ys, *_ = np.linalg.lstsq(A, by, rcond=None)
+    offset = 0.0
+    for members in sorted(pieces.values(), key=len, reverse=True):
+        mx = min(xs[i] for i in members)
+        for i in members:
+            xs[i] += offset - mx
+        offset = max(xs[i] for i in members) + 15.0
+    for node in bundle.nodes:
+        i = idx[node.id]
+        node.x, node.y = round(float(xs[i]), 1), round(float(ys[i]), 1)
 
 
 def _dedupe_labels(bundle: MapBundle) -> None:
@@ -642,9 +737,106 @@ def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str) -> None:
     finalize(bundle)
 
 
+# ---------------------------------------------------------------- place descriptors
+STOP_WORDS = {"WITH", "THE", "AND", "FROM", "NEAR", "NEXT", "BESIDE", "INTO", "THAT", "THIS", "WALL", "AREA",
+              "LARGE", "SMALL", "WHITE", "GRAY", "GREY", "SIGN", "VIEW", "SPACE"} | GENERIC_WORDS
+
+
+@dataclass
+class PlaceDescriptor:
+    node: Node
+    words: set[str]  # distinctive sign words from its own photo
+    letters: str  # all sign letters, for OCR fragments
+    desc_words: set[str]  # Gemma's landmark phrase
+    context: set[str]  # words from neighbouring places (what surrounds it)
+    hist: object = None  # colour/texture fingerprint of its photo
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in re.split(r"[^A-Z]+", text.upper()) if len(w) >= 4 and w not in STOP_WORDS}
+
+
+@lru_cache(maxsize=2048)
+def _photo_hist(path: str):
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    small = cv2.resize(img, (160, int(160 * img.shape[0] / img.shape[1])))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    h = cv2.calcHist([hsv], [0, 1], None, [24, 16], [0, 180, 0, 256])
+    return cv2.normalize(h, h).flatten()
+
+
+def build_descriptors(bundle: MapBundle, frames: Path) -> dict[str, PlaceDescriptor]:
+    nbrs: dict[str, set[str]] = {}
+    for e in bundle.edges:
+        nbrs.setdefault(e.from_node, set()).add(e.to_node)
+        nbrs.setdefault(e.to_node, set()).add(e.from_node)
+    by_id = {n.id: n for n in bundle.nodes}
+    out = {}
+    for n in bundle.nodes:
+        ctx: set[str] = set()
+        for m in nbrs.get(n.id, ()):
+            if m in by_id:
+                ctx |= sign_words(by_id[m].sign_texts) | _content_words(by_id[m].label)
+        out[n.id] = PlaceDescriptor(
+            node=n, words=sign_words(n.sign_texts), letters=_letters(n.sign_texts),
+            desc_words=_content_words(n.description), context=ctx,
+            hist=_photo_hist(str(frames / n.frame_id)) if n.frame_id else None,
+        )
+    return out
+
+
+def word_weights(descs: dict[str, PlaceDescriptor]) -> dict[str, float]:
+    """Rarity weights: a word seen at many places (posters, wayfinding arrows, 'THE BASEMENT')
+    identifies none of them."""
+    n = max(len(descs), 1)
+    df: dict[str, int] = {}
+    for d in descs.values():
+        for w in d.words:
+            df[w] = df.get(w, 0) + 1
+    return {w: (0.0 if c >= max(3, 0.15 * n) else math.log(n / c) / math.log(n + 1)) for w, c in df.items()}
+
+
+def _word_match(w: str, others: set[str], other_letters: str) -> bool:
+    if w in others or (len(w) >= 4 and w in other_letters):
+        return True
+    return any(SequenceMatcher(None, w, v).ratio() >= 0.8 for v in others)
+
+
+def _weighted_overlap(wa: set[str], wb: set[str], la: str, lb: str, weights: dict[str, float]) -> float:
+    small, big, big_letters = (wa, wb, lb) if len(wa) <= len(wb) else (wb, wa, la)
+    total = sum(weights.get(w, 1.0) for w in small)
+    if total <= 1e-6:
+        return 0.0
+    hit = sum(weights.get(w, 1.0) for w in small if _word_match(w, big, big_letters))
+    return hit / total
+
+
+def place_similarity(a: PlaceDescriptor, b: PlaceDescriptor, frames: Path, weights: dict[str, float]) -> dict:
+    """Combine independent descriptors; each one 0..1. Returns score, per-descriptor values and how
+    many descriptors independently agree."""
+    name = _weighted_overlap(a.words, b.words, a.letters, b.letters, weights) if a.words and b.words else 0.0
+    inliers = 0
+    if a.node.frame_id and b.node.frame_id:
+        inliers, _ = orb_match(frames / a.node.frame_id, frames / b.node.frame_id)
+    hist = float(cv2.compareHist(a.hist, b.hist, cv2.HISTCMP_CORREL)) if a.hist is not None and b.hist is not None else 0.0
+    visual = max(min(inliers / (1.5 * config.ORB_STRONG_INLIERS), 1.0), max(0.0, (hist - 0.5) * 2) * 0.6)
+    desc = (len(a.desc_words & b.desc_words) / max(1, min(len(a.desc_words), len(b.desc_words)))
+            if a.desc_words and b.desc_words else 0.0)
+    context = _weighted_overlap(a.context, b.context, "", "", weights) if a.context and b.context else 0.0
+    agree = {"name": name >= 0.6, "visual": inliers >= config.ORB_WEAK_INLIERS or hist >= 0.85,
+             "description": desc >= 0.5, "surroundings": context >= 0.4}
+    score = 0.4 * name + 0.3 * visual + 0.1 * desc + 0.2 * context
+    return {"score": round(score, 2), "name": round(name, 2), "visual": round(visual, 2), "orb": inliers,
+            "description": round(desc, 2), "surroundings": round(context, 2),
+            "agree": [k for k, v in agree.items() if v]}
+
+
 # ---------------------------------------------------------------- map-wide consolidation
 def _room_ids(node: Node) -> set[str]:
-    return {t for t in text_tokens(node.texts) if re.fullmatch(r"[A-Z]?\d{3,4}[A-Z]?", t)}
+    """Room numbers on this place's own photo (merged places accumulate other photos' numbers)."""
+    return {t for t in text_tokens(node.sign_texts or node.texts) if re.fullmatch(r"[A-Z]?\d{3,4}[A-Z]?", t)}
 
 
 def _directions_at(bundle: MapBundle, node_id: str, video_id: str | None, include: bool) -> list[float]:
@@ -713,19 +905,47 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         merge_nodes(bundle, keep.id, drop.id)
         merged += 1
 
-    # 1. identity: same room number, or the same named sign (MAKER SPACE / QUALCOMM INSTITUTE)
+    # 1. identity from several independent descriptors (sign words weighted by rarity, appearance,
+    #    Gemma's description, surroundings). A word alone never decides: posters and directional signs
+    #    repeat names like THE BASEMENT all over a building.
+    descs = build_descriptors(bundle, frames)
+    weights = word_weights(descs)
     nodes = list(bundle.nodes)
     for i, a in enumerate(nodes):
         for b in nodes[i + 1:]:
             if not (alive(a.id) and alive(b.id)) or not _floors_compatible(a, b):
                 continue
+            if (_is_vertical(a) is None) != (_is_vertical(b) is None):
+                continue  # a staircase is never the same place as the room next to it
             ra, rb = _room_ids(a), _room_ids(b)
             if ra and rb:
                 if ra & rb and len(ra) <= 2 and len(rb) <= 2:
                     merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}")
                 continue  # different room numbers: different places
-            if strong_name_match(a.sign_texts, b.sign_texts) and a.video_id != b.video_id:
-                merge(a, b, f"Same sign {'/'.join(sorted(shared_sign_words(a.sign_texts, b.sign_texts)))}")
+            sim = place_similarity(descs[a.id], descs[b.id], frames, weights)
+            if sim["score"] < 0.35 or not sim["agree"]:
+                continue
+            why = f"{', '.join(sim['agree'])} agree (score {sim['score']})"
+            if sim["score"] >= 0.5 and len(sim["agree"]) >= 2:
+                merge(a, b, f"Same place: {why}")
+                continue
+            verdict = None
+            if use_gemma and a.frame_id and b.frame_id:
+                try:
+                    verdict = gemma.same_place(frames / a.frame_id, frames / b.frame_id, cache)
+                except gemma.GemmaUnavailable:
+                    use_gemma = False
+            # Gemma's visual judgement is an independent descriptor of its own
+            if verdict and verdict.same_place and verdict.confidence >= 0.8 and len(sim["agree"]) >= 1:
+                merge(a, b, f"Same place: {why}; Gemma: {verdict.reason[:120]}")
+            elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place):
+                bundle.suggested_merges.append(SuggestedMerge(
+                    id=f"m{_next_id('m', [x.id for x in bundle.suggested_merges]):03d}", keep=a.id, remove=b.id,
+                    confidence=sim["score"], reason=why + (f"; Gemma: {verdict.reason[:120]}" if verdict else ""),
+                    signals=sim | ({"gemma": verdict.model_dump()} if verdict else {}),
+                ))
+                existing_pairs.add(frozenset((a.id, b.id)))
+                suggested += 1
 
     # 2. appearance across walks
     nodes = list(bundle.nodes)
@@ -808,10 +1028,12 @@ def _adopt_floor(bundle: MapBundle, guessed: Node, sure: Node, log) -> None:
 
 
 def _is_vertical(n: Node) -> str | None:
-    words = " ".join(n.texts).upper() + " " + n.label.upper()
-    if n.type == "elevator" or "ELEVATOR" in words:
+    """Stairs/elevator from what the place IS (type, label), never from text read nearby: posters
+    like 'take the stairs, not the elevator' hang in ordinary hallways."""
+    label = n.label.upper()
+    if n.type == "elevator" or (n.type not in ("room", "restroom", "exit") and "ELEVATOR" in label):
         return "elevator"
-    if n.type == "stairs" or "STAIR" in words:
+    if n.type == "stairs" or (n.type not in ("room", "restroom", "exit") and "STAIR" in label):
         return "stairs"
     return None
 
@@ -885,7 +1107,7 @@ def _add_vertical_edge(bundle: MapBundle, lower: Node, upper: Node, kind: str, i
         id=f"e{_next_id('e', [e.id for e in bundle.edges]):03d}", from_node=lower.id, to_node=upper.id,
         heading_out=h, heading_in=upper.frame_heading if upper.frame_heading is not None else h,
         heading_out_raw=h, heading_in_raw=upper.frame_heading if upper.frame_heading is not None else h,
-        vertical="stairs_up" if kind == "stairs" else "elevator",
+        vertical="stairs_up" if kind == "stairs" else "elevator", length_m=6.0,
         frames_fwd=[f for f in (lower.frame_id, upper.frame_id) if f],
         frames_rev=[f for f in (upper.frame_id, lower.frame_id) if f],
         source="merge", verified=not inferred, inferred_floor_change=inferred,

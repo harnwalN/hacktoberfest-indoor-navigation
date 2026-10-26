@@ -73,10 +73,10 @@ def test_consolidate_merges_same_room_across_walks_but_not_floors(tmp_path):
 def test_guessed_walk_adopts_floor_from_named_sign(tmp_path):
     nodes = [
         Node(id="n001", label="Maker Space", texts=["MAKER SPACE", "QUALCOMM INSTITUTE"],
-             sign_texts=["MAKER SPACE", "QUALCOMM INSTITUTE"], floor=2,
+             sign_texts=["MAKER SPACE", "QUALCOMM INSTITUTE"], description="glass doors with logo", floor=2,
              floor_source="rooms", video_id="vA"),
         Node(id="n002", label="Maker Space Entrance", texts=["MAKERSPACE", "QUALCOMM"],
-             sign_texts=["MAKER SPACE", "QUALCOMM"], floor=1,
+             sign_texts=["MAKER SPACE", "QUALCOMM"], description="glass doors and logo", floor=1,
              floor_source="default", video_id="vB"),
         Node(id="n003", label="Hallway", floor=1, floor_source="default", video_id="vB"),
     ]
@@ -116,3 +116,35 @@ def test_busy_or_partial_text_does_not_snowball():
     assert not mapper.strong_name_match(wall, wall)  # wall graphic visible from everywhere
     assert not mapper.strong_name_match(["MAKERS"], ["MAKER SPACE", "QUALCOMM INSTITUTE"])
     assert mapper.strong_name_match(["MAKER SPACE"], ["MAKER SPACE BY QUALCOMM INSTITUTE"])
+
+
+def test_fuzzy_sign_fragments():
+    assert mapper.fuzzy_name_match(["MAK", "SPAC"], ["MAKER", "SPACE", "BY QUALCOMM INSTITUTE"])
+    assert mapper.fuzzy_name_match(["KERSPAGE"], ["MAKERSPACEL"])
+    assert mapper.fuzzy_name_match(["HAKE", "SPAG"], ["MAKER SPACE"])
+    assert not mapper.fuzzy_name_match(["DESIGN", "LAB"], ["MAKER", "SPACE"])
+    assert not mapper.fuzzy_name_match(["LOBBY", "201"], ["MEETING ROOM"])
+    assert not mapper.fuzzy_name_match(["EVENTS"], ["152 The Basement"])  # too short to judge
+
+
+def _desc(label, signs, desc="", ctx=()):
+    n = Node(id=label, label=label, sign_texts=list(signs), description=desc)
+    return mapper.PlaceDescriptor(node=n, words=mapper.sign_words(n.sign_texts), letters=mapper._letters(n.sign_texts),
+                                  desc_words=mapper._content_words(desc), context=set(ctx))
+
+
+def test_common_word_alone_does_not_identify_a_place(tmp_path):
+    # THE BASEMENT appears on posters all over the building: rare words matter, common ones do not
+    places = {f"p{i}": _desc(f"p{i}", ["THE BASEMENT", f"ROOM{i}X"]) for i in range(8)}
+    w = mapper.word_weights(places)
+    assert w["BASEMENT"] == 0.0
+    sim = mapper.place_similarity(places["p1"], places["p2"], tmp_path, w)
+    assert "name" not in sim["agree"] and sim["score"] < 0.35
+
+
+def test_name_plus_surroundings_identifies(tmp_path):
+    a = _desc("a", ["MAKER SPACE", "QUALCOMM INSTITUTE"], "glass doors", ctx={"STAIRCASE", "OFFICE208"})
+    b = _desc("b", ["MAK", "SPAC", "QUALCOMM"], "glass doors with logo", ctx={"OFFICE208"})
+    w = mapper.word_weights({"a": a, "b": b, "c": _desc("c", ["LOBBY"]), "d": _desc("d", ["EXIT"])})
+    sim = mapper.place_similarity(a, b, tmp_path, w)
+    assert {"name", "description", "surroundings"} <= set(sim["agree"]) and sim["score"] >= 0.6

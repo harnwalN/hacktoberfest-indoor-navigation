@@ -63,5 +63,9 @@ ORB_WEAK_INLIERS = int(os.getenv("ORB_WEAK_INLIERS", 20))
 AUTO_MERGE_CONFIDENCE = _f("AUTO_MERGE_CONFIDENCE", 0.8)
 MAX_FLOOR = int(os.getenv("MAX_FLOOR", 9))  # room-number floors above this are treated as misreads
 DEFAULT_FLOOR = int(os.getenv("DEFAULT_FLOOR", 1))  # ground floor number when nothing says otherwise
+WALK_SPEED_MPS = _f("WALK_SPEED_MPS", 1.25)  # typical indoor walking pace while filming
+DEFAULT_EDGE_M = _f("DEFAULT_EDGE_M", 6.0)  # length used when a connection has no measurement
+STAIRS_COST_M = _f("STAIRS_COST_M", 15.0)  # routing cost of one flight (time/effort, in metres of walking)
+TURN_COST_M = _f("TURN_COST_M", 2.0)  # small penalty per place passed, prefers simpler routes
 ROOM_NUMBER_FLOORS = os.getenv("ROOM_NUMBER_FLOORS", "1") != "0"  # 121 -> floor 1, 208 -> floor 2
 SNAP_TOLERANCE_DEG = _f("SNAP_TOLERANCE_DEG", 20.0)

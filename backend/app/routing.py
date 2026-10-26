@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import networkx as nx
 
+from . import config
 from .mapper import flip_vertical, wrap180
 from .schemas import Edge, MapBundle, Node, RouteResponse, Step
 from .store import frame_url
@@ -53,13 +54,21 @@ def traverse(edge: Edge, u: str) -> Traversal:
                      flip_vertical(edge.vertical), edge.frames_rev)
 
 
+def _cost(e: Edge) -> float:
+    """Walking metres, plus effort for stairs and a small per-place penalty (prefers simpler routes)."""
+    cost = (e.length_m or config.DEFAULT_EDGE_M) + config.TURN_COST_M
+    if e.vertical in ("stairs_up", "stairs_down"):
+        cost += config.STAIRS_COST_M
+    return cost
+
+
 def build_graph(bundle: MapBundle) -> nx.Graph:
     g = nx.Graph()
     for n in bundle.nodes:
         g.add_node(n.id)
     for e in bundle.edges:
         if e.from_node in g and e.to_node in g:
-            g.add_edge(e.from_node, e.to_node, edge=e)
+            g.add_edge(e.from_node, e.to_node, edge=e, cost=_cost(e))
     return g
 
 
@@ -83,7 +92,7 @@ def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:
         if nid not in nodes:
             raise KeyError(nid)
     g = build_graph(bundle)
-    path = nx.shortest_path(g, start, target)  # raises nx.NetworkXNoPath
+    path = nx.shortest_path(g, start, target, weight="cost")  # shortest walk; raises nx.NetworkXNoPath
     bid = bundle.building_id
 
     if len(path) == 1:

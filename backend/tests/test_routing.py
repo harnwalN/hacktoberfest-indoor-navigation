@@ -76,3 +76,29 @@ def test_quantize():
     assert routing.quantize_turn(95) == "turn_right"
     assert routing.quantize_turn(-170) == "u_turn"
     assert routing.quantize_turn(350) == "go_straight"
+
+
+def test_shortest_walk_beats_fewest_places():
+    nodes = [Node(id=x, label=x) for x in "ABCDE"]
+    edges = [
+        Edge(id="long", from_node="A", to_node="E", heading_out=0, heading_in=0, length_m=120),
+        Edge(id="e1", from_node="A", to_node="B", heading_out=0, heading_in=0, length_m=10),
+        Edge(id="e2", from_node="B", to_node="C", heading_out=0, heading_in=0, length_m=10),
+        Edge(id="e3", from_node="C", to_node="D", heading_out=0, heading_in=0, length_m=10),
+        Edge(id="e4", from_node="D", to_node="E", heading_out=0, heading_in=0, length_m=10),
+    ]
+    r = routing.route(MapBundle(building_id="t", nodes=nodes, edges=edges), "A", "E")
+    assert r.node_path == ["A", "B", "C", "D", "E"]  # 40 m through 3 places, not 120 m direct
+
+
+def test_positions_are_metric():
+    from app import mapper
+    nodes = [Node(id=x, label=x) for x in "ABCD"]
+    sq = [("A", "B", 90, 10), ("B", "C", 0, 20), ("C", "D", 270, 10), ("D", "A", 180, 20)]
+    edges = [Edge(id=f"e{i}", from_node=a, to_node=b, heading_out=h, heading_in=h, heading_out_raw=h,
+                  heading_in_raw=h, length_m=L) for i, (a, b, h, L) in enumerate(sq)]
+    m = MapBundle(building_id="t", nodes=nodes, edges=edges)
+    mapper.finalize(m)
+    p = {n.id: (n.x, n.y) for n in m.nodes}
+    dist = lambda a, b: ((p[a][0] - p[b][0]) ** 2 + (p[a][1] - p[b][1]) ** 2) ** 0.5
+    assert abs(dist("A", "B") - 10) < 0.5 and abs(dist("B", "C") - 20) < 0.5 and abs(dist("A", "C") - 22.4) < 0.5

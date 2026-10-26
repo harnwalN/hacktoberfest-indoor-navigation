@@ -339,3 +339,11 @@ input[type='file'] { padding: 8px; }
 html, body { overflow-x: hidden; }
 .content > *, .trip-fields, .trip-field, .map-panel, .map-stage, .sign-copy { min-width: 0; }
 .trip-field select { max-width: 100%; text-overflow: ellipsis; }
+
+/* 2D / 3D map */
+.view-switch { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--plaster-2); }
+.view-switch button { min-height: 34px; padding: 4px 14px; border: 0; border-radius: 999px; background: transparent; font: 700 0.95rem var(--display); }
+.view-switch button.active { background: var(--route); color: var(--route-ink); }
+.map3d { width: 100%; height: min(66vh, 600px); cursor: grab; }
+.map3d canvas { display: block; }
+.map3d-hint { margin: 0; padding: 10px 14px 12px; font-size: 0.85rem; color: var(--muted); border-top: 1px solid var(--line); }

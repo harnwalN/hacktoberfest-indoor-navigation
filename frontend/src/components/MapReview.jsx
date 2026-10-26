@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, GitMerge, ImagePlus, Link2, Plus, Save, Trash2, X } from 'lucide-react'
 import { api, detail, frameUrl } from '../api'
+import Map3D from './Map3D'
 
 const TYPES = ['room', 'intersection', 'hallway', 'entrance', 'stairs', 'elevator', 'exit', 'restroom', 'landmark']
 const VERTICALS = ['none', 'stairs_up', 'stairs_down', 'elevator', 'ramp_up', 'ramp_down']
@@ -10,8 +11,8 @@ const ARROWS = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖']
 // Dead-reckoning schematic of ONE floor: walk that floor's graph breadth-first, placing each neighbour
 // one unit along the travel heading. Not to scale (no distances), but loops and branches read clearly.
 // Connections to other floors (stairs/elevators) are drawn as "↕ floor N" badges instead of lines.
-const STEP = 1.8 // spacing between connected places
-const MIN_GAP = 1.4 // places never closer than this
+const STEP = 2.1 // spacing between connected places
+const MIN_GAP = 1.7 // places never closer than this
 
 // Dead-reckoning seed (one step along each travel heading), then a relaxation pass that keeps
 // corridors near their direction while pushing places apart. Not to scale: the graph has no distances.
@@ -42,7 +43,8 @@ function layout(nodes, edges, axis) {
       }
     }
     const inPiece = new Set(piece)
-    for (let it = 0; it < 240; it++) {
+    const pieceEdges = dirs.filter(([a, b]) => inPiece.has(a) && inPiece.has(b))
+    for (let it = 0; it < 320; it++) {
       for (const [a, b, dx, dy] of dirs) {
         if (!inPiece.has(a) || !pos[b]) continue
         const tx = pos[a][0] + STEP * dx - pos[b][0]
@@ -64,10 +66,65 @@ function layout(nodes, edges, axis) {
           q[0] += dx * push; q[1] += dy * push
         }
       }
+      // Keep places off corridors they are not on, so lines stop running through dots and labels.
+      for (const id of piece) {
+        const p = pos[id]
+        for (const [a, b] of pieceEdges) {
+          if (a === id || b === id) continue
+          const [ax, ay] = pos[a]
+          const [bx, by] = pos[b]
+          const ex = bx - ax
+          const ey = by - ay
+          const len2 = ex * ex + ey * ey || 1
+          const t = Math.max(0, Math.min(1, ((p[0] - ax) * ex + (p[1] - ay) * ey) / len2))
+          const cx = ax + t * ex
+          const cy = ay + t * ey
+          let dx = p[0] - cx
+          let dy = p[1] - cy
+          let d = Math.hypot(dx, dy)
+          if (d >= 0.9 || t <= 0.02 || t >= 0.98) continue
+          if (d < 1e-3) { dx = -ey; dy = ex; d = Math.hypot(dx, dy) }
+          const push = ((0.9 - d) / d) * 0.35
+          p[0] += dx * push; p[1] += dy * push
+          pos[a][0] -= dx * push * 0.3; pos[a][1] -= dy * push * 0.3
+          pos[b][0] -= dx * push * 0.3; pos[b][1] -= dy * push * 0.3
+        }
+      }
     }
     const minX = Math.min(...piece.map((id) => pos[id][0]))
     for (const id of piece) pos[id][0] += offsetX - minX
     offsetX = Math.max(...piece.map((id) => pos[id][0])) + 4
+  }
+  return pos
+}
+
+// Measured layout: places at their solved positions in metres (1 map unit ~ 3.2 m), nudged apart only
+// as far as needed to keep dots and labels readable.
+const UNITS_PER_M = 1 / 3.2
+
+function metricLayout(nodes) {
+  const home = Object.fromEntries(nodes.map((n) => [n.id, [n.x * UNITS_PER_M, -n.y * UNITS_PER_M]]))
+  const pos = Object.fromEntries(Object.entries(home).map(([k, v]) => [k, [...v]]))
+  const ids = Object.keys(pos)
+  for (let it = 0; it < 160; it++) {
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const p = pos[ids[i]]
+        const q = pos[ids[j]]
+        let dx = q[0] - p[0]
+        let dy = q[1] - p[1]
+        let d = Math.hypot(dx, dy)
+        if (d >= 1.3) continue
+        if (d < 1e-3) { dx = 0.6; dy = 0.8; d = 1 }
+        const push = ((1.3 - d) / d) * 0.5
+        p[0] -= dx * push; p[1] -= dy * push
+        q[0] += dx * push; q[1] += dy * push
+      }
+    }
+    for (const id of ids) {
+      pos[id][0] += (home[id][0] - pos[id][0]) * 0.05
+      pos[id][1] += (home[id][1] - pos[id][1]) * 0.05
+    }
   }
   return pos
 }
@@ -94,7 +151,8 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
     if (a === floor) (links[e.from_node] ||= new Set()).add(b)
     if (b === floor) (links[e.to_node] ||= new Set()).add(a)
   }
-  const pos = useMemo(() => layout(nodes, sameFloor, map.dominant_axis_deg || 0), [map, floor])
+  const measured = nodes.length > 0 && nodes.every((n) => n.x != null && n.y != null)
+  const pos = useMemo(() => (measured ? metricLayout(nodes) : layout(nodes, sameFloor, map.dominant_axis_deg || 0)), [map, floor])
   const [view, setView] = useState(null)
   const drag = useRef(null)
   const svgRef = useRef(null)
@@ -120,17 +178,18 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
       if (!p) continue
       const text = n.label.length > 22 ? `${n.label.slice(0, 21)}…` : n.label
       const w = labelW(text)
-      for (const side of ['right', 'left', 'below']) {
+      for (const side of ['right', 'left', 'below', 'above']) {
         const x = side === 'right' ? p[0] + 0.32 : side === 'left' ? p[0] - 0.32 - w : p[0] - w / 2
-        const y = side === 'below' ? p[1] + 0.32 : p[1] - LABEL_H / 2
+        const y = side === 'below' ? p[1] + 0.32 : side === 'above' ? p[1] - 0.32 - LABEL_H : p[1] - LABEL_H / 2
         const box = [x, y, x + w, y + LABEL_H]
         const hit = placed.some((q) => box[0] < q[2] && box[2] > q[0] && box[1] < q[3] && box[3] > q[1])
-          || nodes.some((m) => m.id !== n.id && pos[m.id] && pos[m.id][0] > box[0] - 0.15 && pos[m.id][0] < box[2] + 0.15
-            && pos[m.id][1] > box[1] - 0.15 && pos[m.id][1] < box[3] + 0.15)
+          || nodes.some((m) => m.id !== n.id && !isMinor(m) && pos[m.id] && pos[m.id][0] > box[0] - 0.05
+            && pos[m.id][0] < box[2] + 0.05 && pos[m.id][1] > box[1] - 0.05 && pos[m.id][1] < box[3] + 0.05)
         if (!hit) {
           placed.push(box)
-          out[n.id] = { text, x: side === 'left' ? x + w : side === 'below' ? p[0] : x, y: y + LABEL_H * 0.72,
-                        anchor: side === 'left' ? 'end' : side === 'below' ? 'middle' : 'start' }
+          const centred = side === 'below' || side === 'above'
+          out[n.id] = { text, x: side === 'left' ? x + w : centred ? p[0] : x, y: y + LABEL_H * 0.72,
+                        anchor: side === 'left' ? 'end' : centred ? 'middle' : 'start' }
           break
         }
       }
@@ -230,6 +289,7 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
         <li><i className="key" /> Entrance, exit or restroom</li>
         <li><i className="vertical" /> Stairs or elevator (number = floor it reaches)</li>
         <li><i className="minor" /> Waypoint</li>
+        {measured && <li>Distances estimated from walking time in the videos</li>}
       </ul>
     </div>
   )
@@ -256,8 +316,12 @@ export default function MapReview({ building, onChanged }) {
   const [newEdge, setNewEdge] = useState({ from_node: '', to_node: '', heading_out: 0, vertical: 'none' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const [floor, setFloor] = useState(null)
+  const [floor, setFloor] = useState(() => {
+    const f = new URLSearchParams(window.location.hash.split('?')[1] || '').get('floor')
+    return f == null ? null : Number(f)
+  })
   const [note, setNote] = useState('')
+  const [view3d, setView3d] = useState(() => new URLSearchParams(window.location.hash.split('?')[1] || '').get('view') === '3d')
 
   const load = () => api.getMap(building).then((m) => { setMap(m); setDirty(false) }).catch((e) => setError(detail(e)))
   useEffect(() => {
@@ -343,6 +407,10 @@ export default function MapReview({ building, onChanged }) {
             </p>
           </div>
           <div className="map-actions">
+            <div className="view-switch" role="group" aria-label="Map view">
+              <button className={!view3d ? 'active' : ''} aria-pressed={!view3d} onClick={() => setView3d(false)}>2D</button>
+              <button className={view3d ? 'active' : ''} aria-pressed={view3d} onClick={() => setView3d(true)}>3D</button>
+            </div>
             <button className="ghost" disabled={busy} title="Merge places seen in several videos into one map"
               onClick={async () => {
                 setBusy(true)
@@ -376,8 +444,15 @@ export default function MapReview({ building, onChanged }) {
         </header>
         {error && <p className="notice error" onClick={() => setError('')}>{error}</p>}
         {note && <pre className="log" onClick={() => setNote('')}>{note}</pre>}
-        <Schematic map={map} floor={shownFloor} floors={floors} onFloor={setFloor} selected={selected}
-          onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+        {view3d ? (
+          <div className="map-stage">
+            <Map3D map={map} selected={selected} onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+            <p className="map3d-hint">Drag to orbit, scroll to zoom, right-drag to pan. Click a place to edit it below.</p>
+          </div>
+        ) : (
+          <Schematic map={map} floor={shownFloor} floors={floors} onFloor={setFloor} selected={selected}
+            onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+        )}
       </section>
 
       {map.suggested_merges.length > 0 && (

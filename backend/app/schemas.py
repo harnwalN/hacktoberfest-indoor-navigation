@@ -78,6 +78,8 @@ class Node(BaseModel):
     soft: bool = False
     video_id: str | None = None
     t: float | None = None
+    x: float | None = None  # metres east of the map origin (solved from all connections)
+    y: float | None = None  # metres north
 
 
 class Edge(BaseModel):
@@ -90,6 +92,7 @@ class Edge(BaseModel):
     heading_out_raw: float | None = None
     heading_in_raw: float | None = None
     vertical: Vertical = "none"
+    length_m: float | None = None  # walking distance estimated from video time x walking speed
     frames_fwd: list[str] = []  # ordered photos walking from -> to: [departure ... approach]
     frames_rev: list[str] | None = None  # ordered photos walking to -> from, if ever walked
     source: Literal["walk", "merge", "manual"] = "walk"
