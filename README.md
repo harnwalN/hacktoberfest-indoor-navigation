@@ -50,6 +50,26 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 - A 4-turn loop closes into a cycle.
 - On a fixture map, routes mirror in reverse, stairs flip up↔down, and "no path" returns HTTP 400.
 
+## Working as a team
+
+**One machine is the "map server".** It runs Ollama + the backend, processes all videos, and holds
+`backend/data/` (git-ignored). Everyone else points at it, so there is one map and one Gemma.
+
+| Role | What to run |
+|---|---|
+| Map server (Mac, 16 GB+) | full setup above + `cloudflared tunnel --url http://localhost:8000`, share the URL |
+| Frontend dev | `cd frontend && npm install && API_TARGET=https://<tunnel>.trycloudflare.com npm run dev` (no Python/Ollama needed) |
+| Backend / pipeline dev | full setup on your own laptop; copy a building folder to test on real data (below) |
+| Recording / map curation | phone only: tunnel URL → Record, Map, Navigate |
+
+- Get real data locally: zip `backend/data/buildings/<id>/` on the map server (skip `videos/` to keep it
+  small) and unzip into the same path; everything runs offline from that folder.
+- OCR grounding uses the macOS Vision framework. On Linux/Windows it is skipped automatically and Gemma
+  runs ungrounded (expect some invented room numbers), so process final videos on a Mac.
+- Map edits save the whole map: only one person should edit the Map tab at a time.
+- Git: branch per task (`git switch -c feat/...`), open a PR to `master`, never commit `backend/data/` or
+  videos. Run `cd backend && uv run pytest` before pushing backend changes.
+
 ## How it works
 
 | Stage | What happens |
