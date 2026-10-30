@@ -5,7 +5,11 @@ Runs fully offline once the model is pulled. Every answer is cached on disk keye
 """
 import hashlib
 import io
+import json
+import logging
+import os
 import re
+import tempfile
 import threading
 from pathlib import Path
 
@@ -14,7 +18,8 @@ from PIL import Image
 
 from . import config, ocr
 from .schemas import FrameAnalysis, GemmaFrame, SamePlace
-from .store import read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 PROMPT_VERSION = "v4"
 
@@ -140,19 +145,102 @@ def _parse(text: str, model_cls):
     return model_cls.model_validate_json(text)
 
 
+CACHE_FILE = "gemma_cache.jsonl"
+
+
 class GemmaCache:
+    """Append-only JSONL cache: one {"k": key, "v": value} object per line.
+
+    Each put appends one line and flushes, so writes are O(1) instead of rewriting the whole
+    file. On load, unreadable lines (e.g. a truncated last line after a crash) are skipped and
+    the last line wins for duplicate keys. A legacy gemma_cache.json next to the file is
+    migrated once, then renamed to gemma_cache.json.bak. Use cache_for() to get the shared
+    per-building instance rather than constructing this directly.
+    """
+
     def __init__(self, path: Path):
+        path = Path(path)
+        if path.suffix == ".json":  # tolerate callers passing the legacy filename
+            path = path.with_suffix(".jsonl")
         self.path = path
         self.lock = threading.Lock()
-        self.data: dict = read_json(path, {}) or {}
+        self.data: dict = {}
+        self._needs_newline = False  # file ends mid-line: start the next append on a fresh line
+        with self.lock:
+            self._migrate_legacy()
+            self._load()
+
+    def _migrate_legacy(self) -> None:
+        legacy = self.path.with_suffix(".json")
+        if self.path.exists() or not legacy.exists():
+            return
+        try:
+            with open(legacy, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError) as exc:
+            log.warning("gemma cache: cannot read legacy %s (%s); starting empty", legacy, exc)
+            return
+        if not isinstance(old, dict):
+            log.warning("gemma cache: legacy %s is not a JSON object; starting empty", legacy)
+            return
+        self._write_all(old)
+        try:
+            os.replace(legacy, legacy.with_name(legacy.name + ".bak"))
+        except OSError as exc:  # harmless: the JSONL exists now, so migration won't rerun
+            log.warning("gemma cache: could not rename legacy %s (%s)", legacy, exc)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        with open(self.path, "rb") as f:
+            raw = f.read()
+        lines = bad = 0
+        for line in raw.split(b"\n"):
+            if not line.strip():
+                continue
+            lines += 1
+            try:
+                rec = json.loads(line)
+                self.data[rec["k"]] = rec["v"]
+            except (ValueError, KeyError, TypeError):
+                bad += 1
+        if bad:
+            log.warning("gemma cache: skipped %d unreadable line(s) in %s", bad, self.path)
+        self._needs_newline = bool(raw) and not raw.endswith(b"\n")
+        wasted = lines - len(self.data)  # unreadable lines + superseded duplicates
+        if wasted > max(100, len(self.data)):
+            self._write_all(self.data)  # compact
+
+    def _write_all(self, data: dict) -> None:
+        """Atomically replace the JSONL file with one line per entry."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for k, v in data.items():
+                    f.write(json.dumps({"k": k, "v": v}) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        self._needs_newline = False
 
     def get(self, key: str):
         return self.data.get(key)
 
-    def put(self, key: str, value: dict) -> None:
+    def put(self, key: str, value) -> None:
+        line = json.dumps({"k": key, "v": value}) + "\n"  # serialize first: fail before mutating
         with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                if self._needs_newline:
+                    f.write("\n")
+                    self._needs_newline = False
+                f.write(line)
+                f.flush()
             self.data[key] = value
-            write_json_atomic(self.path, self.data)
 
 
 def _chat(model: str, prompt: str, images: list[bytes], schema_cls):
@@ -258,5 +346,15 @@ def same_stairwell(path_a: Path, path_b: Path, cache: GemmaCache) -> SamePlace:
     return result
 
 
+_caches: dict[Path, GemmaCache] = {}
+_caches_lock = threading.Lock()
+
+
 def cache_for(building_path: Path) -> GemmaCache:
-    return GemmaCache(building_path / "gemma_cache.json")
+    """Shared GemmaCache per building, so the pipeline and manual requests see the same data."""
+    path = (Path(building_path) / CACHE_FILE).resolve()
+    with _caches_lock:
+        cache = _caches.get(path)
+        if cache is None:
+            cache = _caches[path] = GemmaCache(path)
+        return cache
