@@ -399,7 +399,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     pending_suggestions: list[tuple[Match, WalkNode]] = []
     # Floors: start floor and room numbers first; still-unknown floors inherit from the first known place
     # this walk passes (or default to 0 for the very first walk).
-    floors = assign_floors(wnodes, start_floor)
+    floors = assign_floors(wnodes, start_floor, keyframes=keyframes)
     has_rooms = any(room_floor(wn.texts) is not None for wn in wnodes)
     known_source = "user" if start_floor is not None else ("rooms" if has_rooms else None)
     inherit: int | None = None

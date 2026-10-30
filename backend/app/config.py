@@ -73,4 +73,8 @@ DEFAULT_EDGE_M = _f("DEFAULT_EDGE_M", 6.0)  # length used when a connection has 
 STAIRS_COST_M = _f("STAIRS_COST_M", 15.0)  # routing cost of one flight (time/effort, in metres of walking)
 TURN_COST_M = _f("TURN_COST_M", 2.0)  # small penalty per place passed, prefers simpler routes
 ROOM_NUMBER_FLOORS = os.getenv("ROOM_NUMBER_FLOORS", "1") != "0"  # 121 -> floor 1, 208 -> floor 2
+FLOOR_SIGNS = os.getenv("FLOOR_SIGNS", "1") != "0"  # 'LEVEL 3', '2ND FLOOR' and Gemma's floor_hint as evidence
+# Evidence weight of one floor sign; one room number weighs 1 and a floor needs 2 to be confirmed, so the
+# default lets one clear floor sign stand alone while a single room number needs a second agreeing one.
+FLOOR_SIGN_WEIGHT = _f("FLOOR_SIGN_WEIGHT", 2.0)
 SNAP_TOLERANCE_DEG = _f("SNAP_TOLERANCE_DEG", 20.0)

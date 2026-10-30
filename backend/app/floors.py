@@ -12,39 +12,195 @@ from .schemas import Edge, MapBundle, Node
 
 if TYPE_CHECKING:  # annotation only; a runtime import would be circular
     from .mapper import WalkNode
+    from .schemas import FrameAnalysis, Keyframe
+
+_HYPHENATED = re.compile(r"[A-Z0-9]*\d\s*[-–]\s*\d[A-Z0-9]*")  # 2-105, 858-534-1234: not a plain room number
 
 
 def room_floor(texts: list[str]) -> int | None:
-    """Floor implied by room numbers, using the 'first digit(s) = floor' convention (121 -> 1, 1210 -> 12)."""
+    """Floor implied by room numbers, using the 'first digit(s) = floor' convention (121 -> 1, 1210 -> 12).
+
+    Only safe readings count: basement rooms (B112) and hyphenated numbers (2-105) give no evidence, and a
+    4-digit number only counts when its first two digits are a plausible floor (10..MAX_FLOOR), since
+    4-digit numbers are usually phone extensions or codes.
+    """
     if not config.ROOM_NUMBER_FLOORS:
         return None
     floors = []
-    for tok in text_tokens(texts):
-        m = re.fullmatch(r"[A-Z]?(\d{3})[A-Z]?", tok)  # 4+ digits are usually phone/codes, not rooms
-        if m and 1 <= int(m.group(1)[0]) <= config.MAX_FLOOR:
-            floors.append(int(m.group(1)[0]))
+    for tok in text_tokens([_HYPHENATED.sub(" ", t.upper()) for t in texts]):
+        if (m := re.fullmatch(r"([A-Z]?)(\d{3})[A-Z]?", tok)):
+            f = int(m.group(2)[0])
+        elif (m := re.fullmatch(r"([A-Z]?)(\d{4})[A-Z]?", tok)) and m.group(2)[0] != "0":
+            f = int(m.group(2)[:2])
+        else:
+            continue
+        if m.group(1) == "B":
+            continue  # basement: not the ground floor, and floors below 1 are not modelled
+        if 1 <= f <= config.MAX_FLOOR:
+            floors.append(f)
     return max(set(floors), key=floors.count) if floors else None
 
 
-def assign_floors(wnodes: list[WalkNode], start_floor: int | None) -> list[int | None]:  # noqa: C901
+# ---------------------------------------------------------------- floor signs
+_ORDINALS = {"FIRST": 1, "SECOND": 2, "THIRD": 3, "FOURTH": 4, "FIFTH": 5, "SIXTH": 6, "SEVENTH": 7,
+             "EIGHTH": 8, "NINTH": 9}
+_FLOOR_WORD = r"(?:FLOOR|FLR|FL|LEVEL|LVL)"
+_SIGN_PATTERNS = [
+    re.compile(rf"\b(\d{{1,2}})\s*(?:ST|ND|RD|TH)\.?[\s-]+{_FLOOR_WORD}\b"),  # 3RD FLOOR
+    re.compile(rf"\b{_FLOOR_WORD}\.?\s*(\d{{1,2}})\b(?!\s*[-–]\s*\d)"),  # FLOOR 2, LEVEL 2 (not 'FLOOR 1-3')
+    re.compile(rf"\b({'|'.join(_ORDINALS)})[\s-]+{_FLOOR_WORD}\b"),  # SECOND FLOOR
+]
+# Levels below or beside the numbered floors ('LOWER LEVEL 1', 'PARKING LEVEL 2') are not floor N.
+_NOT_A_FLOOR = re.compile(r"\b(?:LOWER|SUB|BASEMENT|UNDERGROUND|PARKING|GARAGE|MEZZANINE)\b")
+_CONFIRM = 2.0  # evidence weight that settles a floor: two room numbers, or one floor sign
+_ROOM_WEIGHT = 1.0
+
+
+def _floors_in(text: str) -> set[int]:
+    s = text.upper()
+    if _NOT_A_FLOOR.search(s):
+        return set()
+    out = {_ORDINALS[m.group(1)] if m.group(1) in _ORDINALS else int(m.group(1))
+           for p in _SIGN_PATTERNS for m in p.finditer(s)}
+    if (m := re.fullmatch(r"\s*L\s?(\d{1,2})\s*", s)):  # a lone 'L3' sign; inside other text it is a code
+        out.add(int(m.group(1)))
+    return out
+
+
+def sign_floor(texts: list[str]) -> int | None:
+    """Floor stated by sign text ('3RD FLOOR', 'FLOOR 2', 'LEVEL 2', a lone 'L3'). None if no text states
+    a floor, or if texts name several floors (a directory or elevator panel)."""
+    found: set[int] = set()
+    for t in texts:
+        found |= _floors_in(t)
+    if len(found) != 1:
+        return None
+    f = found.pop()
+    return f if 1 <= f <= config.MAX_FLOOR else None
+
+
+def _hint_floor(hint: str) -> int | None:
+    """Parse Gemma's free-text floor_hint ('2', '2nd', 'Level 2', 'second floor'); basements give None."""
+    s = (hint or "").upper().strip()
+    if (m := re.fullmatch(r"(\d{1,2})(?:ST|ND|RD|TH)?", s)):
+        f = int(m.group(1))
+    elif s in _ORDINALS:
+        f = _ORDINALS[s]
+    else:
+        return sign_floor([s]) if s else None
+    return f if 1 <= f <= config.MAX_FLOOR else None
+
+
+def _frame_readings(a: FrameAnalysis | None) -> list[tuple[int, float]]:
+    """(floor, weight) readings of one frame's floor signs.
+
+    Strong (FLOOR_SIGN_WEIGHT): a floor in the OCR-grounded sign texts, or a floor_hint that an OCR line
+    actually reads as that floor. Weak (like one room number): floor words anywhere in the OCR (may be a
+    poster), or a floor_hint/sign that OCR could not check (no OCR on this machine). A grounded floor_hint
+    with no OCR line stating it is dropped: gemma's grounding is a substring test ('2' passes on '125').
+    """
+    if a is None or not config.FLOOR_SIGNS:
+        return []
+    strong = config.FLOOR_SIGN_WEIGHT if a.grounded else _ROOM_WEIGHT
+    out = []
+    if (f := sign_floor(a.texts)) is not None:
+        out.append((f, strong))
+    elif (f := sign_floor(a.ocr)) is not None:
+        out.append((f, _ROOM_WEIGHT))
+    if (h := _hint_floor(a.floor_hint)) is not None:
+        if not a.grounded:
+            out.append((h, _ROOM_WEIGHT))
+        elif any(_hint_floor(line) == h for line in a.ocr):
+            out.append((h, strong))
+    return out
+
+
+def _combine(readings: list[tuple[int, float]]) -> tuple[int, float] | None:
+    """One (offset, weight) per walk node: the strongest readings, if they agree."""
+    if not readings:
+        return None
+    top = max(w for _, w in readings)
+    offs = {o for o, w in readings if w == top}
+    return (offs.pop(), top) if len(offs) == 1 else None
+
+
+def _node_sign(wn: WalkNode) -> tuple[int, float] | None:
+    readings = [(f - wn.rel_floor, w) for f, w in _frame_readings(wn.analysis)]
+    if config.FLOOR_SIGNS and (f := sign_floor(wn.extra_texts)) is not None:  # absorbed neighbour frames
+        readings.append((f - wn.rel_floor, config.FLOOR_SIGN_WEIGHT if wn.analysis.grounded else _ROOM_WEIGHT))
+    return _combine(readings)
+
+
+_STAIRS = {"on_stairs_up": "up", "on_stairs_down": "down"}
+
+
+def _signs_from_keyframes(wnodes: list[WalkNode], keyframes: list[Keyframe]) -> list[tuple[int, float] | None]:
+    """Floor signs from every keyframe, not only the ones that became walk nodes (a 'LEVEL 2' plaque in a
+    plain corridor frame is not a node of its own). Each reading is converted to a floor offset with the
+    frame's own stair count (same counting as walk_nodes) and attached to the nearest walk node."""
+    per_node: list[list[tuple[int, float]]] = [[] for _ in wnodes]
+    rel, prev = 0, "none"
+
+    def gap(wn: WalkNode, t: float) -> float:
+        return 0.0 if wn.t_arrive <= t <= wn.t_depart else min(abs(t - wn.t_arrive), abs(t - wn.t_depart))
+
+    for k in sorted(keyframes, key=lambda k: k.t):
+        state = _STAIRS.get(k.analysis.stairs if k.analysis else "none", "none")
+        if prev != "none" and state == "none":
+            rel += 1 if prev == "up" else -1
+        prev = state
+        if state != "none" or not wnodes:
+            continue  # mid-flight it is unclear which floor a landing sign belongs to
+        if not (readings := _frame_readings(k.analysis)):
+            continue
+        i = min(range(len(wnodes)), key=lambda i: (wnodes[i].rel_floor != rel, gap(wnodes[i], k.t)))
+        per_node[i] += [(f - rel, w) for f, w in readings]
+    return [_combine(r) for r in per_node]
+
+
+def _confirmed(ev: list[tuple[int, int, float]], k: int) -> bool:
+    """Evidence point k is believed if, among the previous point, itself and the next two, its offset has
+    weight >= _CONFIRM and outweighs every other offset. So one misread room number (leading, trailing or
+    in the middle) never sets a floor, while two agreeing numbers or one clear floor sign do."""
+    support: dict[int, float] = {}
+    for _, o, w in ev[max(k - 1, 0):k + 3]:
+        support[o] = support.get(o, 0.0) + w
+    off = ev[k][1]
+    return support[off] >= _CONFIRM and all(support[off] > s for o, s in support.items() if o != off)
+
+
+def assign_floors(wnodes: list[WalkNode], start_floor: int | None,
+                  keyframes: list[Keyframe] | None = None) -> list[int | None]:
     """Absolute floor per walk node, or None when unknown.
 
     Relative floor changes come from detected stairs (rel_floor). The absolute offset comes from the
-    uploader's start floor and/or room-number evidence; a persistent change in room-number floors that
-    stairs do not explain (e.g. an elevator ride, missed stairs) starts a new floor segment.
+    uploader's start floor, room numbers and floor signs (Gemma's floor_hint, 'LEVEL 3' / '2ND FLOOR' text;
+    read from all `keyframes` when given, else from the walk nodes). Evidence only counts once confirmed
+    (see _confirmed). Without a start floor, the first confirmed floor also covers the nodes before it; a
+    later confirmed change that stairs do not explain (an elevator ride, missed stairs) starts a new floor
+    segment.
     """
-    ev = [(i, f - wn.rel_floor) for i, wn in enumerate(wnodes) if (f := room_floor(wn.texts)) is not None]
+    signs = _signs_from_keyframes(wnodes, keyframes) if keyframes is not None else [_node_sign(w) for w in wnodes]
+    ev: list[tuple[int, int, float]] = []  # (walk node index, floor offset, weight)
+    for i, (wn, sign) in enumerate(zip(wnodes, signs)):
+        if sign is not None:
+            ev.append((i, *sign))
+        if (f := room_floor(wn.texts)) is not None:
+            ev.append((i, f - wn.rel_floor, _ROOM_WEIGHT))
+    changes: list[tuple[int, int]] = []
+    cur = start_floor
+    for k, (i, off, _) in enumerate(ev):
+        if off != cur and _confirmed(ev, k):
+            changes.append((i, off))
+            cur = off
+    o = start_floor if start_floor is not None else (changes[0][1] if changes else None)
     offsets: list[int | None] = []
-    cur = start_floor if start_floor is not None else (ev[0][1] if ev else None)
-    j = 0
+    c = 0
     for i in range(len(wnodes)):
-        while j < len(ev) and ev[j][0] == i:
-            off = ev[j][1]
-            confirmed = j + 1 >= len(ev) or ev[j + 1][1] == off  # one misread number is not a floor change
-            if off != cur and confirmed and not (cur == start_floor and j == 0 and len(ev) == 1):
-                cur = off
-            j += 1
-        offsets.append(cur)
+        while c < len(changes) and changes[c][0] <= i:
+            o = changes[c][1]
+            c += 1
+        offsets.append(o)
     return [wn.rel_floor + o if o is not None else None for wn, o in zip(wnodes, offsets)]
 
 

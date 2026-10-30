@@ -14,7 +14,7 @@ def _wn(t, rooms=(), rel_floor=0):
 def test_room_floor_convention():
     assert mapper.room_floor(["121"]) == 1
     assert mapper.room_floor(["Room 208"]) == 2
-    assert mapper.room_floor(["B112"]) == 1
+    assert mapper.room_floor(["B112"]) is None  # basement, not the ground floor (was 1 before B14 fix)
     assert mapper.room_floor(["8512"]) is None  # 4 digits: phone numbers / codes, not rooms
     assert mapper.room_floor(["EXIT"]) is None
 
@@ -31,8 +31,9 @@ def test_single_misread_is_not_a_floor_change():
 
 
 def test_stairs_shift_relative_floor():
-    walk = [_wn(0, ["121"]), _wn(10, rel_floor=1), _wn(20, rel_floor=1)]
-    assert mapper.assign_floors(walk, None) == [1, 2, 2]
+    # two agreeing room numbers: a single one is no longer enough to fix the floor (B5)
+    walk = [_wn(0, ["121"]), _wn(5, ["123"]), _wn(10, rel_floor=1), _wn(20, rel_floor=1)]
+    assert mapper.assign_floors(walk, None) == [1, 1, 2, 2]
 
 
 def test_start_floor_used_without_evidence():
