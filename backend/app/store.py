@@ -2,7 +2,7 @@
 
 data/buildings/<id>/
     map.json            the navigable graph (nodes, edges, merges)
-    gemma_cache.json    Gemma answers keyed by image hash + prompt version
+    gemma_cache.jsonl   Gemma answers, one JSON line per answer (append-only; a legacy gemma_cache.json is migrated to .bak)
     frames/*.jpg        keyframes shown to users
     videos/<vid>/       normalized videos, track.json, walk.json (pipeline outputs)
 """

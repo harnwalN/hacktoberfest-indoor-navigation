@@ -87,14 +87,52 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 ```
 
 ### Tests
-`cd backend && uv run pytest` (19 tests). They use synthetic videos with a known camera yaw and fixture maps:
+Run from `backend/` after `uv sync` (which also installs pytest):
+```bash
+cd backend && uv run pytest
+# or, with the venv active:  python -m pytest
+```
+**ffmpeg must be installed** (`brew install ffmpeg`). The tests that run the real normalize step
+(`test_pipeline.py`, `test_jobs_pipeline.py`, `test_motion.py`) need it. Other tests do not run it.
+
+They use synthetic videos with a known camera yaw and fixture maps:
 - 90° turns are measured to within 0.1°; a glance (look at something and back) is not a turn.
 - A 4-turn loop closes into a cycle.
 - Routes mirror in reverse, stairs flip up↔down, and "no path" returns HTTP 400.
 - Floors from room numbers (121 → 1, 208 → 2), elevator jumps without stairs, one misread number ignored.
-- Walks merge across videos by room number or named sign but never across floors; guessed floors are
+- Walks merge across videos by room number or named sign but never across two known floors; guessed floors are
   adopted from linked walks; single staircases on adjacent floors are linked; removing a video keeps
   places other walks still use.
+- Uploads over the size limits get 413; `/bfiles` serves frames only; `PUT /map` ignores server-owned fields;
+  an out-of-range `start_floor` gets 422; the Gemma cache migrates from the old JSON file and survives a torn last line.
+
+## Configuration
+Every setting has a default and can be overridden with an environment variable, for example
+`MAX_UPLOAD_MB=4096 uv run uvicorn app.main:app --port 8000`. The full list is in `backend/app/config.py`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MAX_UPLOAD_MB` | 2048 | Largest walk video, in MiB. Bigger uploads get HTTP 413 |
+| `MAX_SENSOR_BYTES` | 52428800 (50 MiB) | Largest `sensors.json` sent with a video. Bigger gets 413 |
+| `MAX_IMAGE_BYTES` | 26214400 (25 MiB) | Largest manually added photo. Bigger gets 413 |
+| `MAX_FLOOR` | 9 | Highest floor number. `start_floor` must be 1 to this value |
+| `FLOOR_SIGNS` | 1 | Set to `0` to ignore floor signs and Gemma's floor hints |
+| `FLOOR_SIGN_WEIGHT` | 2.0 | Evidence weight of one OCR-confirmed floor sign. A room number weighs 1, and a floor needs 2 |
+| `STAIR_LANDING_GAP_S` | 9.0 | Longest gap (seconds) between two same-direction flights that can still be one climb with a landing between. **Untuned guess: tune on real walks** |
+| `STAIR_LANDING_MAX_S` | 15.0 | Longer gap (seconds) allowed only when every frame between is a stairwell. **Untuned guess: tune on real walks** |
+
+Set both `STAIR_LANDING_*` values to `0` to count every flight as a floor change.
+
+**Limits and API behaviour**
+- Uploads over a limit get HTTP 413, and the partial file is deleted. A request whose declared size is more than
+  the video limit + the sensor limit + 1 MiB is refused before the body is read.
+- `/bfiles/<building>/frames/<file>` serves keyframe photos only. The map, the Gemma cache and the videos are
+  not downloadable.
+- `start_floor` (on upload, or with `PATCH /api/buildings/<id>/videos/<video>`) must be 1 to `MAX_FLOOR`. Other
+  values get HTTP 422.
+- `PUT /api/buildings/<id>/map` takes only `nodes` and `edges`, and both are required (a body missing either gets
+  422). Videos, processing status and suggested merges come from the server.
+- Merging two places on different known floors, by hand or by accepting a suggestion, returns HTTP 400.
 
 ## How it works
 
@@ -106,10 +144,18 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 | **Keyframes** | Event-driven (before and after turns, glances, pauses, scene changes, plus a 3 s heartbeat). In each ±0.5 s window, pick the frame with the highest sharpness relative to the video's own rolling median, divided by motion. Blurry-only windows still keep their best frame, flagged `soft`, so no place is ever lost |
 | **Gemma + OCR** | On-device OCR lists the text really present; Gemma returns structured JSON (sign text, room numbers, label, place type, stairs, floor, landmark phrase) and may only copy text from that list. Labels built on an unverified number are rebuilt. Without OCR (non-macOS) Gemma re-reads unclear signs with zoomed crops. All answers are cached on disk |
 | **Mapping** | Turns, pauses, signs, and stair boundaries become nodes; consecutive frames of one named place collapse. Revisits are detected by room-number text and ORB homography, verified by Gemma ("same physical spot?"); automatic merges need geometric agreement, others go to a review queue. Each verified match constrains heading drift (fit `c0 + k·t`). Edge headings are snapped to the building's dominant axis (Manhattan prior) |
-| **Floors** | Floors start at 1. Each walk's floor comes from the uploader's start floor, room numbers (first digit = floor), and detected stairs; a room-number floor change without visible stairs inserts a flagged stairs/elevator link. Places on different floors never merge |
+| **Floors** | Floors start at 1. A walk's floor comes from its start floor, confirmed room numbers and floor signs, and detected stairs; a floor change without visible stairs inserts a flagged stairs/elevator link. Places on two different known floors never merge. Details below |
 | **One map from n videos** | After every video: same room number or same named sign on the same floor ⇒ same place (even when walked in opposite directions); strong ORB or ORB + Gemma matches across walks; walks with a guessed floor adopt the floor of a known place they share; unanchored walks are rotated into the building frame; the same stairwell or elevator on adjacent floors is linked |
 | **Routing** | `turn = heading_out(next) − heading_in(arrival)`, quantized to straight, slight, turn, or u-turn. Walking an edge backwards uses headings + 180° and stairs up↔down, so one recording works in both directions. Floor changes say "take the stairs up to floor 2"; across a link between two separate walks the step says where to head instead of guessing a turn. Each step shows the photo taken while approaching that point *in your direction of travel* |
 | **App** | Directions: full-bleed photo with a wayfinding sign (bent-arrow pictograms, stair yellow for floor changes) and a route strip. Map: per-floor schematic with an elevator-style floor selector, pan/zoom, merge review and editing. Build: pausable processing queue (run next, resume, survives restarts), per-video start floor, video removal |
+
+## How floors work
+- **Confirmed evidence only.** A walk gets a floor from two room numbers that agree, or from one floor sign that OCR confirmed (`LEVEL 2`, `2ND FLOOR`). One reading is not enough. Without OCR (non-macOS) a floor sign counts as a weak reading, so it needs a second one.
+- **Ignored readings.** Basement rooms (`B112`), hyphenated numbers (`2-105`), and 4-digit numbers (usually phone extensions) are not floor evidence. A sign that names several floors (a directory) is ignored too.
+- **Stairs.** A staircase with a landing counts one floor per storey, not one per flight. Stairs link two floors only from a real climb or from a place typed as stairs. Gemma's "different stairwell" answer is respected. One exception: a single staircase on each of two adjacent floors is linked as a guess, flagged "check" in the log, and Gemma can still veto it.
+- **Unknown start floor.** A walk with no start floor takes its floor from confirmed evidence, or from a match to a known place. A room-number or named-sign match sets the floor at once. A single look-alike place (for example, identical elevator lobbies) does not: two different places on the same floor are needed.
+- **Merging.** Places on two different known floors cannot merge. The API returns 400 with the reason. A guessed floor never blocks a merge; the guessed place takes the known floor.
+- **Layout.** Stairs and elevators sit at the same x/y on every floor they connect, so floors stack directly above each other on the map.
 
 ## Recording tips
 - 1080p with stabilization on. Hold the phone upright and point it where you walk. Turn at a steady pace.
@@ -117,14 +163,21 @@ uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma 
 - Walk corridors in both directions when you can, and pass known spots again to close loops.
 - Best accuracy: record from the **Record** tab on the phone, which logs the gyro alongside the video, and
   enter the floor the walk starts on.
-- Overlap something already mapped (a room number, named sign or staircase) so the walk links into the map;
-  film staircases from both floors to connect floors.
+- Overlap something already mapped (a room number, named sign or staircase) so the walk links into the map.
+- Film staircases from both floors and **climb them**, so the climb is recorded and the floors link.
+- After arriving on a new floor, point the camera at a room number or floor sign within a few seconds.
+  That is what corrects the stair count.
+- Known limits: elevators with no visible sign may not be detected as a floor change; a climb of several
+  storeys with no sign on arrival counts as one floor; basements are not modelled.
 
 ## Persistence
 Each building is a portable folder, `backend/data/buildings/<id>/`:
 - `map.json`: the graph
 - `frames/`: photos users see
-- `gemma_cache.json`
+- `gemma_cache.jsonl`: Gemma answers, one JSON line per answer. Each new answer is appended. The file is only
+  rewritten to remove duplicates when it is loaded. An old `gemma_cache.json` is converted the first time the cache is used, and kept as `gemma_cache.json.bak`
 - `videos/<vid>/`: normalized video, track, walk
+
+Only `frames/` is served over HTTP (`/bfiles/<id>/frames/<file>`). The rest stays on disk.
 
 Copy the folder to the demo machine and everything works offline.
