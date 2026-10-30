@@ -12,7 +12,8 @@ video, through app.jobs exactly as an upload. The scorecard is printed and saved
 eval/results/<timestamp>-<scenario>-<mode>.json (+ .log with every job log line), and compared with the
 previous result of the same scenario and mode.
 
-Exit code: 0 ok, 1 a hard safety metric failed (wrong merge or invented room number), 2 setup/pipeline error.
+Exit code: 0 ok, 1 a hard safety metric failed (wrong merge, far merge or invented room number), 2 setup/pipeline
+error (including a refused --data-dir).
 """
 from __future__ import annotations
 
@@ -39,10 +40,14 @@ class PipelineError(RuntimeError):
     pass
 
 
+class SetupError(RuntimeError):
+    """Bad arguments or environment: nothing was run (exit code 2)."""
+
+
 def safe_data_dir(path: Path) -> Path:
     path = Path(path).resolve()
     if path == FORBIDDEN or FORBIDDEN in path.parents:
-        raise SystemExit(f"refusing to use {path}: evaluation never writes into backend/data")
+        raise SetupError(f"refusing to use {path}: evaluation never writes into backend/data")
     return path
 
 
@@ -319,7 +324,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true", help="print every pipeline log line")
     args = p.parse_args(argv)
 
-    root = safe_data_dir(args.data_dir) if args.data_dir else Path(tempfile.mkdtemp(prefix="waypoint-eval-"))
+    try:
+        root = safe_data_dir(args.data_dir) if args.data_dir else Path(tempfile.mkdtemp(prefix="waypoint-eval-"))
+    except SetupError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    try:
+        return _main(args, root)
+    finally:
+        # a temp dir goes unless --keep asked for it and something was ingested (setup errors leave it empty)
+        ingested = root.is_dir() and any(root.iterdir())
+        if not args.data_dir and not (args.keep and ingested):
+            shutil.rmtree(root, ignore_errors=True)
+        elif ingested:
+            print(f"data dir kept: {root}")
+
+
+def _main(args: argparse.Namespace, root: Path) -> int:
     os.environ.setdefault("DATA_DIR", str(root))  # before app.config is first imported
     from app import config, gemma
 
@@ -357,29 +378,23 @@ def main(argv: list[str] | None = None) -> int:
     git = _git()
     code = 0
     summary = []
-    try:
-        for truth_path in targets:
-            try:
-                res = run_scenario(truth_path, mode, model, root, args.verbose, args.reuse_cache)
-            except PipelineError as exc:
-                print(f"PIPELINE ERROR in {truth_path.parent.name}: {exc}")
-                code = 2
-                continue
-            res["git"] = git
-            res["stamp"] = stamp
-            out = None if args.no_save else save(res, stamp)
-            prev = previous_result(res["scenario"], mode, model, out)
-            print_scorecard(res, prev)
-            if out:
-                print(f"saved {out.relative_to(BACKEND_DIR) if out.is_relative_to(BACKEND_DIR) else out}")
-            summary.append(res)
-            if res["hard_fail"] and code == 0:
-                code = 1
-    finally:
-        if not args.data_dir and not args.keep:
-            shutil.rmtree(root, ignore_errors=True)
-        elif summary:
-            print(f"data dir kept: {root}")
+    for truth_path in targets:
+        try:
+            res = run_scenario(truth_path, mode, model, root, args.verbose, args.reuse_cache)
+        except PipelineError as exc:
+            print(f"PIPELINE ERROR in {truth_path.parent.name}: {exc}")
+            code = 2
+            continue
+        res["git"] = git
+        res["stamp"] = stamp
+        out = None if args.no_save else save(res, stamp)
+        prev = previous_result(res["scenario"], mode, model, out)
+        print_scorecard(res, prev)
+        if out:
+            print(f"saved {out.relative_to(BACKEND_DIR) if out.is_relative_to(BACKEND_DIR) else out}")
+        summary.append(res)
+        if res["hard_fail"] and code == 0:
+            code = 1
     if len(summary) > 1:
         print("\nscenario            rooms  invent  wrongM  mergeR  floors  stairs  routes   wall")
         for r in summary:

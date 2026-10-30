@@ -37,7 +37,7 @@ Flags: `--data-dir DIR` (ingest there and keep it), `--keep` (keep the temp dir)
 Output: a scorecard per scenario (the saved JSON also holds the final map, per-walk observations and motion
 events, so `eval.score` can re-score it later), compared with the previous result of the same scenario, mode and model
 (`improved` / `REGRESSED`), plus a summary table. Exit code **0** ok, **1** a hard safety metric failed, **2**
-setup or pipeline error, so `python -m eval.run all --oracle` (fast) or a live run can gate a push.
+setup or pipeline error (including a refused `--data-dir`; a temp data dir is removed on every error path), so `python -m eval.run all --oracle` (fast) or a live run can gate a push.
 
 **Two baselines.** `--oracle` answers every Gemma question (frame analysis, same place, same stairwell) from
 the ground truth, so it scores the map logic alone. A live run that is worse than the oracle run points at
@@ -57,7 +57,7 @@ perception (Gemma/OCR); an error that is already in the oracle run is in mapping
 | `floor_accuracy` | visited places whose map place(s) are on the right floor |
 | `stair_links` | `stair_links` pairs joined by a stairs/elevator edge (at the places or a neighbour) |
 | `route_success` | `routes` that the app can route, with the expected number of floor changes |
-| `far_merges` | map places whose observations (any walk node, incl. starts and corridor spots) were > 5 m apart or on two floors, from the truth `path`s - not gated yet |
+| `far_merges` **[gate]** | map places whose observations (any walk node, incl. starts and corridor spots) were > 5 m apart or on two floors, from the truth `path`s (not scored without paths) |
 | `extra_places` | map places matching no visit (walk start/end, hallway points, duplicates) - informational |
 | `turns_detected`, `turn_error_deg`, `spurious_turns` | detected turn events vs true changes of walking direction |
 

@@ -130,7 +130,7 @@ def test_far_merge_flags_one_place_seen_at_two_distant_spots():
     assert res["metrics"]["far_merges"] == 1
     (far,) = res["details"]["far_merges"]
     assert far["node"] == "n2" and far["distance_m"] == 14.0
-    assert "far_merges" not in res["hard_fail"]
+    assert res["hard_fail"] == ["far_merges"]  # a gate: one place 5+ m wide is a bad merge
     assert score(_truth(), _bundle(nodes, []), obs)["metrics"]["far_merges"] is None  # no paths: not scored
 
 
@@ -140,9 +140,24 @@ def test_truth_rejects_unknown_place_ids():
 
 
 def test_refuses_backend_data_dir(tmp_path):
-    with pytest.raises(SystemExit):
+    with pytest.raises(eval_run.SetupError):
         eval_run.safe_data_dir(eval_run.BACKEND_DIR / "data" / "x")
     assert eval_run.safe_data_dir(tmp_path) == tmp_path.resolve()
+    assert eval_run.main(["tiny", "--oracle", "--data-dir", str(eval_run.BACKEND_DIR / "data" / "x")]) == 2
+
+
+def test_setup_errors_exit_2_without_leaking_temp_dirs(tmp_path, monkeypatch):
+    made = []
+
+    def mkdtemp(prefix=""):
+        made.append(tmp_path / f"{prefix}{len(made)}")
+        made[-1].mkdir()
+        return str(made[-1])
+    monkeypatch.setattr(eval_run.tempfile, "mkdtemp", mkdtemp)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))  # main() only sets it when unset
+    assert eval_run.main(["no_such_scenario", "--oracle", "--no-save"]) == 2
+    assert eval_run.main(["no_such_scenario", "--oracle", "--no-save", "--keep"]) == 2  # nothing to keep
+    assert len(made) == 2 and not any(d.exists() for d in made)
 
 
 # ---------------------------------------------------------------- tiny end-to-end run (oracle)

@@ -153,6 +153,7 @@ class WalkNode:
     node_id: str | None = None  # map node this walk node became / merged into
     vertical: str | None = None  # "stairs" / "elevator" access point (see _walk_vertical), whatever Gemma called it
     extra_texts: list[str] = field(default_factory=list)
+    glances: int = 0  # glance events (looks at the side) this node is made of
 
     @property
     def texts(self) -> list[str]:
@@ -243,11 +244,9 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
         a = k.analysis or FrameAnalysis()
         wn = WalkNode(kf=k, t_arrive=k.t_arrive if k.t_arrive is not None else k.t,
                       t_depart=k.t_depart if k.t_depart is not None else k.t, analysis=a,
-                      vertical=_walk_vertical(a, boundary[i]))
+                      vertical=_walk_vertical(a, boundary[i]), glances=int(k.kind == "glance"))
         prev = nodes[-1] if nodes else None
-        if prev and not _crosses_stairs(kfs, states, prev, wn) and not _keep_apart(prev, wn) and (
-                wn.t_arrive - prev.t_depart < config.NODE_MIN_GAP_SEC
-                or (wn.t_arrive - prev.t_depart < config.SAME_PLACE_WINDOW_SEC and _same_spot(prev, wn))):
+        if prev and _absorbs(kfs, states, prev, wn):
             _absorb(prev, wn)
             continue
         nodes.append(wn)
@@ -259,6 +258,29 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
             nodes[j].rel_floor = floor
             j += 1
     return nodes
+
+
+def _absorbs(kfs, states, prev: WalkNode, wn: WalkNode) -> bool:
+    """Whether walk node `wn` is just more of `prev` (one place) rather than a place of its own.
+
+    Close in time is not enough on its own: walking past doors, the next plaque is in view a second after
+    the last glance. Different room numbers are always two places, and two separate glances (look left at
+    one door, then right at another) are two places unless they show the same place (_same_spot)."""
+    if _crosses_stairs(kfs, states, prev, wn) or _keep_apart(prev, wn):
+        return False
+    if _rooms_conflict(_walk_rooms(prev), _walk_rooms(wn)):
+        return False
+    gap = wn.t_arrive - prev.t_depart
+    same_spot = gap < config.SAME_PLACE_WINDOW_SEC and _same_spot(prev, wn)
+    if prev.glances and wn.glances:
+        return same_spot
+    return gap < config.NODE_MIN_GAP_SEC or same_spot
+
+
+def _walk_rooms(wn: WalkNode) -> set[str]:
+    """Room numbers a walk node states: its own frame's plaques plus those of the frames it absorbed (which
+    _absorb keeps consistent, so absorbed text never links two rooms)."""
+    return room_ids(wn.texts)
 
 
 def _norm_label(s: str) -> str:
@@ -295,18 +317,33 @@ def _crosses_stairs(kfs, states, a: WalkNode, b: WalkNode) -> bool:
 
 
 def _absorb(keep: WalkNode, other: WalkNode) -> None:
-    """Merge two walk nodes that are too close in time into one."""
+    """Merge two walk nodes that are too close in time into one (callers check _absorbs first).
+
+    A place that already states room numbers takes no other room's plaque from the frames it absorbs (a frame
+    showing this door and the next one): otherwise that number would make the next door "the same spot" too
+    and chain two rooms into one node."""
     def rank(w: WalkNode):
-        return (0 if _has_sign(w.analysis) else 1, KIND_PRIORITY.get(w.kf.kind, 9))
+        # a frame of the place itself (the glance at the door) describes it better than a corridor view of
+        # its plaque: a turn that also glanced at Room 105 is Room 105, a corner merely in view of it is not
+        corridor = w.analysis.place_type in ("hallway", "intersection")
+        return (0 if _has_sign(w.analysis) else 1, int(corridor), KIND_PRIORITY.get(w.kf.kind, 9))
+    mine = _walk_rooms(keep)
+
+    def own(texts: list[str]) -> list[str]:
+        return [t for t in texts if not mine or room_ids([t]) <= mine]
+
+    # rank before the frame swap below: the glance's "Room 101" must win over the start's "Hallway with ROOM 101"
+    takes_analysis = rank(other) < rank(keep) and (not mine or room_ids(wayfinding_texts(other.analysis)) <= mine)
     if KIND_PRIORITY.get(other.kf.kind, 9) < KIND_PRIORITY.get(keep.kf.kind, 9):
         keep.kf, keep.depart_frame = other.kf, other.depart_frame or keep.depart_frame
-    if rank(other) < rank(keep):
-        keep.extra_texts += wayfinding_texts(keep.analysis)
+    if takes_analysis:
+        keep.extra_texts += wayfinding_texts(keep.analysis) + own(other.extra_texts)
         keep.analysis = other.analysis
     else:
-        keep.extra_texts += other.texts
+        keep.extra_texts += own(other.texts)
     keep.t_arrive, keep.t_depart = min(keep.t_arrive, other.t_arrive), max(keep.t_depart, other.t_depart)
     keep.vertical = keep.vertical or other.vertical  # stair-ness survives even when the other frame's analysis wins
+    keep.glances += other.glances
 
 
 # ---------------------------------------------------------------- labels
@@ -922,6 +959,12 @@ def _room_ids(node: Node) -> set[str]:
     return room_ids(node.sign_texts or node.texts)
 
 
+def _corridor_view(node: Node) -> bool:
+    """A hallway spot or junction (not a door, stairwell or exit): any room number on its photo is a plaque in
+    view, not the place where the walker stood."""
+    return node.type in ("hallway", "intersection") and not node.vertical
+
+
 def _rooms_conflict(ra: set[str], rb: set[str]) -> bool:
     """Both places state room numbers and none is shared: different rooms, whatever the pictures say."""
     return bool(ra and rb and not ra & rb)
@@ -1076,7 +1119,9 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                 continue  # a staircase is never the same place as the room next to it
             ra, rb = _room_ids(a), _room_ids(b)
             if ra and rb:
-                if ra & rb and len(ra) <= 2 and len(rb) <= 2:
+                # a corridor spot that merely has the plaque in view (down the hall, from the corner) is not
+                # that room: the same plaque seen from both ends of a hallway would make one place of both
+                if ra & rb and len(ra) <= 2 and len(rb) <= 2 and not (_corridor_view(a) or _corridor_view(b)):
                     merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}", 1.0,
                           {"rooms": sorted(ra & rb)}, strong=True)
                 continue  # different room numbers: different places

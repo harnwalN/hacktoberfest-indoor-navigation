@@ -4,7 +4,7 @@ Inputs: a Truth (eval/truth.py), the final MapBundle, and observations: per trut
 that video with the map place each one ended up in (eval/trace.py). Truth visits are matched to walk nodes by
 time; map places are matched to truth places through those visits, and also by the room numbers they claim.
 
-Hard safety metrics (a non-zero exit in eval.run): wrong merges and invented room numbers.
+Hard safety metrics (a non-zero exit in eval.run): wrong merges, far merges and invented room numbers.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ METRICS = {
     "stair_links": (True, False),
     "route_success": (True, False),
     "extra_places": (False, False),
-    "far_merges": (False, False),
+    "far_merges": (False, True),
     "turns_detected": (True, False),
     "turn_error_deg": (False, False),
     "spurious_turns": (False, False),
