@@ -23,11 +23,11 @@ import numpy as np
 from . import config, gemma
 from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep working)
     _RANK, _add_vertical_edge, _adopt_floor, _connected, _floor_rank, _floors_compatible, _is_vertical,
-    _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, room_floor, set_walk_floor,
-    stair_rel_floors, stair_states,
+    _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, mark_climbs, room_floor,
+    set_walk_floor, stair_rel_floors, stair_states,
 )
 from .matching import _next_id, place_tokens, room_ids
-from .motion import focal_px, median_heading
+from .motion import detect_climbs, focal_px, median_heading
 from .schemas import (
     FLIP_VERTICAL, Edge, FrameAnalysis, Keyframe, MapBundle, Node, SuggestedMerge,
 )
@@ -431,6 +431,8 @@ def _fit_correction(abs_c: list[tuple[float, float]], rel_c: list[tuple[float, f
 # ---------------------------------------------------------------- integrate one walk
 def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], track: dict,
                    frames: Path, cache, use_gemma: bool, log=print, start_floor: int | None = None) -> dict:
+    # Stair climbs measured from camera motion, where Gemma's stairs hints back them up (floors.mark_climbs).
+    keyframes = mark_climbs(keyframes, detect_climbs(track), log=log)
     wnodes = walk_nodes(keyframes)
     if not wnodes:
         return {"nodes": 0, "merged": 0}

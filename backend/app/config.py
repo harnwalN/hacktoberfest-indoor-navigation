@@ -96,3 +96,29 @@ SNAP_TOLERANCE_DEG = _f("SNAP_TOLERANCE_DEG", 20.0)
 # switchback stairwells vs short corridors between separate staircases).
 STAIR_LANDING_GAP_S = _f("STAIR_LANDING_GAP_S", 9.0)  # about 3 heartbeats (3 s each), so a landing with up to two keyframes joins; tune on real walk.json
 STAIR_LANDING_MAX_S = _f("STAIR_LANDING_MAX_S", 15.0)
+
+# --- Stair climbs from camera motion (motion.detect_climbs, floors.mark_climbs) ---
+# Gemma often calls every frame of a flight "stairs ahead" and never "on the stairs", so the climb is also
+# measured from the vertical image motion. A motion climb only counts when Gemma saw stairs near it (stairs
+# ahead, or a stairwell) within CLIMB_HINT_SEC before it or during it, so a flat walk never changes floor from
+# motion alone. All defaults were set on synthetic renders (eval/walk.py), not on phone footage: keep them
+# conservative and re-check them on real walks (track.json 'pitch' + walk.json Gemma stairs labels).
+CLIMB_DETECT = os.getenv("CLIMB_DETECT", "1") != "0"  # 0 = stairs from Gemma's on_stairs labels only
+# Flow: the scene keeps sliding vertically (camera rising/falling), relative to level walking, at least this
+# fast (deg/s, running median over CLIMB_WINDOW_SEC). Measured on eval renders: climb ~4.3 deg/s; level walks
+# stay <= 1.2, except ~1.5 s bursts up to ~4 when looking up at a sign (cut by CLIMB_MIN_SEC + the Gemma gate).
+CLIMB_FLOW_DEG_S = _f("CLIMB_FLOW_DEG_S", 2.5)
+CLIMB_WINDOW_SEC = _f("CLIMB_WINDOW_SEC", 3.0)
+# Tilt: the camera tilts by CLIMB_TILT_DEG within CLIMB_TILT_STEP_SEC, holds it away from the walker's level
+# before and after for most of the stretch, and tilts back (looking down a flight while descending). Eval
+# renders: descent ~24 deg; level walks <= 3, except short looks at high signs (~21 deg, < CLIMB_MIN_SEC).
+CLIMB_TILT_DEG = _f("CLIMB_TILT_DEG", 15.0)
+CLIMB_TILT_STEP_SEC = _f("CLIMB_TILT_STEP_SEC", 1.5)
+CLIMB_MIN_SEC = _f("CLIMB_MIN_SEC", 4.0)  # shorter = a few steps or a look at the floor, not a storey
+CLIMB_MAX_SEC = _f("CLIMB_MAX_SEC", 60.0)  # longer = not one climb (drift, a long look down)
+CLIMB_MERGE_GAP_SEC = _f("CLIMB_MERGE_GAP_SEC", 2.0)  # flow dips this short (a landing) do not split a climb
+CLIMB_HINT_SEC = _f("CLIMB_HINT_SEC", 5.0)  # Gemma's stairs hint may come this long before the climb starts
+# A floor sign read in the last seconds before a climb (from motion or Gemma's on_stairs frames) is usually the
+# stairwell sign of the floor the stairs lead to ('LEVEL 2' seen from the bottom of the flight): it is not floor
+# evidence for either floor (floors._approach). Room numbers there still count. 0 = off.
+CLIMB_SIGN_APPROACH_SEC = _f("CLIMB_SIGN_APPROACH_SEC", 5.0)
