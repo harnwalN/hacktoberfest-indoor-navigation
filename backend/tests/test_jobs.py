@@ -164,7 +164,7 @@ def test_video_missing_from_map_at_mapping_cancels(env, monkeypatch):
     bid = env
     _add_video(bid, "vx", status="queued")
     job = _video_job(bid, "vx")
-    real_analyze = jobs._analyze
+    real_analyze = jobs._analyze_walk
 
     def dropping_analyze(j, keyframes, model):
         with store.lock_for(bid):  # walk vanishes from the map before the mapping stage
@@ -173,7 +173,7 @@ def test_video_missing_from_map_at_mapping_cancels(env, monkeypatch):
             store.save_map(bundle)
         return real_analyze(j, keyframes, model)
 
-    monkeypatch.setattr(jobs, "_analyze", dropping_analyze)
+    monkeypatch.setattr(jobs, "_analyze_walk", dropping_analyze)
     job.status = "running"
     jobs._run(job)  # used to raise StopIteration out of next(...) -> "error"
     assert job.status == "cancelled", job.log

@@ -36,11 +36,10 @@ def test_floor_grounded_adversarial(hint, lines, kept):
     assert ocr.floor_grounded(hint, lines) is kept
 
 
-@pytest.mark.xfail(strict=True, reason="digit runs are glued across tokens inside one line: '1 21' grounds '121'")
-def test_digits_not_glued_within_a_line():
+def test_digits_not_glued_within_a_line():  # was a strict xfail: '1 21' grounded '121'
     assert ocr.grounded("121", ["1 21"]) is False
+    assert ocr.grounded("121", ["1-21"]) is False
 
 
-@pytest.mark.xfail(strict=True, reason="'-1' (basement) is read as floor 1: sign lost in _tokens")
-def test_negative_floor_not_confused_with_floor_one():
+def test_negative_floor_not_confused_with_floor_one():  # was a strict xfail: sign lost in _tokens
     assert ocr.floor_grounded("-1", ["1ST FLOOR"]) is False

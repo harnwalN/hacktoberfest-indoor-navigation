@@ -103,7 +103,7 @@ def test_ground_drops_partial_number_matches():
 
 
 def test_prompt_version_bumped():
-    assert gemma.PROMPT_VERSION == "v5"
+    assert gemma.PROMPT_VERSION == "v6"
 
 
 # ---------------------------------------------------------------- R3 call options / R2 _chat errors

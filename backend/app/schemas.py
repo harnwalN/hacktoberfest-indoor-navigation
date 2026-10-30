@@ -1,7 +1,7 @@
 """Pydantic models shared by the pipeline, the API and (by convention) the frontend."""
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from . import config
 
@@ -22,10 +22,11 @@ FLIP_VERTICAL: dict[str, str] = {
 
 # ---------- Gemma output ----------
 class GemmaFrame(BaseModel):
-    """Structured JSON Gemma returns for one keyframe (this exact schema is sent to the model)."""
-    has_sign: bool = False
+    """Structured JSON Gemma returns for one keyframe (this exact schema is sent to the model).
+    Evidence (texts, room_numbers) comes before the has_sign verdict: small models judge better that way."""
     texts: list[str] = []
     room_numbers: list[str] = []
+    has_sign: bool = False
     suggested_label: str = ""
     place_type: PlaceType = "hallway"
     stairs: Literal["none", "ahead_up", "ahead_down", "on_stairs_up", "on_stairs_down"] = "none"
@@ -37,10 +38,13 @@ class FrameAnalysis(GemmaFrame):
     """Gemma's answer after OCR grounding, plus the OCR evidence."""
     ocr: list[str] = []
     grounded: bool = False
+    _model_used: str | None = PrivateAttr(default=None)  # Gemma model the answer came from (not serialized)
 
 
 class SamePlace(BaseModel):
     # Evidence first: generating these before the verdict makes small models far more reliable.
+    image1_sign_text: list[str] = []  # each image's signs read on its own, so the model does not mix them up
+    image2_sign_text: list[str] = []
     shared_details: list[str] = []
     conflicting_details: list[str] = []
     same_place: bool

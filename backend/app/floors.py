@@ -425,8 +425,8 @@ def _link_floors(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log) -
                     elif use_gemma and a.frame_id and b.frame_id:
                         try:
                             v = gemma.same_stairwell(frames / a.frame_id, frames / b.frame_id, cache)
-                        except gemma.GemmaUnavailable:
-                            use_gemma, v = False, None
+                        except gemma.GemmaUnavailable:  # in a job session further calls only read the cache
+                            use_gemma, v = gemma.session_active(), None
                         if v is not None and v.same_place:
                             score, why = v.confidence, f"Gemma: {v.reason}"
                         elif v is not None and v.confidence >= VETO_LINK:

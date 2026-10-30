@@ -26,7 +26,7 @@ from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep w
     _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, room_floor, set_walk_floor,
     stair_rel_floors, stair_states,
 )
-from .matching import _next_id, text_tokens
+from .matching import _next_id, room_ids, text_tokens
 from .motion import focal_px, median_heading
 from .schemas import (
     FLIP_VERTICAL, Edge, FrameAnalysis, Keyframe, MapBundle, Node, SuggestedMerge,
@@ -345,11 +345,14 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
     this walk created itself: their Node.floor is not set until the walk is done, so the floor filter
     above cannot see them, and a walk that climbed stairs must not loop-close onto its own earlier floor."""
     w_tokens = text_tokens(wn.texts)
+    w_rooms = room_ids(wayfinding_texts(wn.analysis))  # this frame's own plaque numbers, as Node.sign_texts
     w_path = frames / wn.kf.frame_id
     cands = []
     for node in bundle.nodes:
         if node.id in exclude or not node.frame_id:
             continue
+        if _rooms_conflict(w_rooms, _room_ids(node)):
+            continue  # different room numbers: different places, however alike the pictures are
         if w_floor is not None and node.floor_source != "default" and node.floor != w_floor:
             continue  # similar corridors on different floors are never the same place
         if walk_levels is not None and node.id in walk_levels and walk_levels[node.id] != w_level:
@@ -373,10 +376,19 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
                 verdict = gemma.same_place(frames / node.frame_id, w_path, cache)
                 signals["gemma"] = verdict.model_dump()
             except gemma.GemmaUnavailable as exc:
-                log(f"Gemma same-place check unavailable: {exc}")
-                use_gemma = False
+                if not isinstance(exc, gemma.NotCached):
+                    log(f"Gemma same-place check unavailable: {exc}")
+                use_gemma = gemma.session_active()  # in a job session further calls only read the cache
+        # Different door-plaque numbers read by OCR are never the same place, however strong the geometry
+        # (identical walls and doors match hundreds of features). Without a verdict, ask OCR directly.
+        if gemma.ocr_conflict(verdict if verdict is not None
+                              else gemma.plaque_conflict(frames / node.frame_id, w_path)):
+            continue
         overwhelming = inliers >= 3 * config.ORB_STRONG_INLIERS  # geometry alone is conclusive
-        if verdict is not None and not overwhelming:
+        # A Gemma "different place" never vetoes a strong geometric match: small models (gemma3:4b) call the
+        # same plaque seen 25 px apart "different" and flip with prompt wording, so geometry decides there.
+        gemma_binding = verdict is not None and (verdict.same_place or inliers < config.ORB_STRONG_INLIERS)
+        if gemma_binding and not overwhelming:
             if not verdict.same_place and verdict.confidence >= 0.7:
                 continue
             conf = verdict.confidence if verdict.same_place else 0.3
@@ -905,8 +917,14 @@ def place_similarity(a: PlaceDescriptor, b: PlaceDescriptor, frames: Path, weigh
 
 # ---------------------------------------------------------------- map-wide consolidation
 def _room_ids(node: Node) -> set[str]:
-    """Room numbers on this place's own photo (merged places accumulate other photos' numbers)."""
-    return {t for t in text_tokens(node.sign_texts or node.texts) if re.fullmatch(r"[A-Z]?\d{3,4}[A-Z]?", t)}
+    """Room numbers on this place's own photo (merged places accumulate other photos' numbers); directional
+    signs ('ROOMS 120-130 ->') do not count."""
+    return room_ids(node.sign_texts or node.texts)
+
+
+def _rooms_conflict(ra: set[str], rb: set[str]) -> bool:
+    """Both places state room numbers and none is shared: different rooms, whatever the pictures say."""
+    return bool(ra and rb and not ra & rb)
 
 
 def _directions_at(bundle: MapBundle, node_id: str, video_id: str | None, include: bool) -> list[float]:
@@ -995,6 +1013,14 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         merged += 1
 
     def merge(a: Node, b: Node, why: str, confidence: float, signals: dict, strong: bool) -> None:
+        # Last gate for every automatic merge: different room numbers (on the places' own signs, or read by
+        # OCR on their photos) are different places, whatever matched.
+        conflict = _rooms_conflict(_room_ids(a), _room_ids(b)) or (
+            bool(a.frame_id and b.frame_id)
+            and gemma.ocr_conflict(gemma.plaque_conflict(frames / a.frame_id, frames / b.frame_id)))
+        if conflict:
+            log(f"Not merging '{b.label}' into '{a.label}' ({why}): different room numbers")
+            return
         guessed = [n for n in (a, b) if n.floor_source == "default"]
         if len(guessed) == 1 and guessed[0].video_id:  # would place a guessed walk: vote, decide later
             g = guessed[0]
@@ -1066,7 +1092,7 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                 try:
                     verdict = gemma.same_place(frames / a.frame_id, frames / b.frame_id, cache)
                 except gemma.GemmaUnavailable:
-                    use_gemma = False
+                    use_gemma = gemma.session_active()  # in a job session further calls only read the cache
             # Gemma's visual judgement is an independent descriptor of its own
             if verdict and verdict.same_place and verdict.confidence >= 0.8 and len(sim["agree"]) >= 1:
                 merge(a, b, f"Same place: {why}; Gemma: {verdict.reason[:120]}", sim["score"],
@@ -1088,6 +1114,8 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
             if (not (alive(a.id) and alive(b.id)) or not _floors_compatible(a, b) or a.video_id == b.video_id
                     or not a.frame_id or not b.frame_id):
                 continue
+            if _rooms_conflict(_room_ids(a), _room_ids(b)):
+                continue  # different room numbers: different places (as in step 1), whatever the geometry
             inliers, _ = orb_match(frames / a.frame_id, frames / b.frame_id)
             if inliers < config.ORB_WEAK_INLIERS:
                 continue
@@ -1096,19 +1124,25 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                 try:
                     verdict = gemma.same_place(frames / a.frame_id, frames / b.frame_id, cache)
                 except gemma.GemmaUnavailable:
-                    use_gemma = False
+                    use_gemma = gemma.session_active()  # in a job session further calls only read the cache
+            if gemma.ocr_conflict(verdict):
+                continue  # different plaque numbers read by OCR: never merged, never suggested
             strong = inliers >= 1.5 * config.ORB_STRONG_INLIERS
             if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE):
                 why = f"{inliers} matching features" + (f"; Gemma: {verdict.reason}" if verdict else "")
                 merge(a, b, f"Same place across walks ({why})",
                       round(verdict.confidence if verdict else min(1.0, inliers / (2 * config.ORB_STRONG_INLIERS)), 2),
                       {"orb_inliers": inliers, **({"gemma": verdict.model_dump()} if verdict else {})}, strong=False)
-            elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place
-                                                                        and verdict.confidence >= 0.7):
+            elif frozenset((a.id, b.id)) not in existing_pairs and not (
+                    verdict and not verdict.same_place and verdict.confidence >= 0.7
+                    and inliers < config.ORB_STRONG_INLIERS):
+                # the model never vetoes a strong geometric match (different OCR plaque numbers do, above)
+                agree = verdict is not None and verdict.same_place
                 bundle.suggested_merges.append(SuggestedMerge(
                     id=f"m{_next_id('m', [s.id for s in bundle.suggested_merges]):03d}", keep=a.id, remove=b.id,
-                    confidence=round(verdict.confidence if verdict else inliers / (2 * config.ORB_STRONG_INLIERS), 2),
-                    reason=(f"Gemma: {verdict.reason}" if verdict else f"{inliers} matching image features"),
+                    confidence=round(verdict.confidence if agree else inliers / (2 * config.ORB_STRONG_INLIERS), 2),
+                    reason=(f"Gemma: {verdict.reason}" if agree else f"{inliers} matching image features"
+                            + (f"; Gemma disagreed: {verdict.reason}" if verdict else "")),
                     signals={"orb_inliers": inliers, **({"gemma": verdict.model_dump()} if verdict else {})},
                 ))
                 existing_pairs.add(frozenset((a.id, b.id)))

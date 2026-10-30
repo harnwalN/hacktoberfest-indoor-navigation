@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from .schemas import (
     RouteResponse, VideoUpdate,
 )
 
+log = logging.getLogger(__name__)
 api = APIRouter(prefix="/api")
 
 
@@ -288,10 +290,14 @@ async def manual_frame(building_id: str, image: UploadFile = File(...), label: s
     n = len([p for p in frames.glob("manual_*")])
     frame_id = f"manual_{n:04d}{ext}"
     (frames / frame_id).write_bytes(data)
+    warning = None
     try:
         a = gemma.analyze_frame(frames / frame_id, gemma.cache_for(store.building_dir(building_id)))
-    except gemma.GemmaUnavailable:
-        a = FrameAnalysis()
+    except gemma.GemmaUnavailable as exc:
+        a, warning = FrameAnalysis(), f"Gemma unavailable, photo not analysed: {exc}"
+    except Exception as exc:  # unreadable image, OCR failure, bug: keep the photo, label it by hand
+        log.exception("manual frame %s: analysis failed", frame_id)
+        a, warning = FrameAnalysis(), f"Photo could not be analysed ({type(exc).__name__}); label it by hand"
     with store.lock_for(building_id):
         bundle = store.load_map(building_id)
         node = Node(
@@ -302,7 +308,7 @@ async def manual_frame(building_id: str, image: UploadFile = File(...), label: s
         bundle.nodes.append(node)
         mapper.finalize(bundle)
         store.save_map(bundle)
-    return {"node": node, "analysis": a}
+    return {"node": node, "analysis": a, **({"warning": warning} if warning else {})}
 
 
 # ---------- navigation ----------

@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -284,19 +285,32 @@ def recover() -> None:
             _enqueue(job, (lambda j, s, sn: lambda: _process_video(j, s, sn, None))(job, src, sensors))
 
 
+@dataclass
+class GemmaRun:
+    ok: bool  # Gemma answers exist for this walk (walk.json "gemma")
+    model: str | None = None  # model the answers came from (walk.json "model", bundle.processed_with)
+    online: bool = False  # Ollama answered; False = answers came from the cache only
+
+
 def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
+    return _analyze_walk(job, keyframes, model).ok
+
+
+def _analyze_walk(job: Job, keyframes: list[Keyframe], model: str | None) -> GemmaRun:
     bdir = store.building_dir(job.building_id)
     cache = gemma.cache_for(bdir)
     frames = store.frames_dir(job.building_id)
+    online = True
     try:
         chosen = model or gemma.resolve_model()
         gemma.ensure_model(chosen)  # a missing model fails here once, not on every frame
         job.say(f"Gemma model: {chosen} (local, via Ollama)")
     except gemma.GemmaUnavailable as exc:
-        job.say(f"WARNING Gemma unavailable, mapping from motion only: {exc}")
-        return False
+        online, chosen = False, model
+        job.say(f"WARNING Gemma unavailable, using cached answers only: {exc}")
     # Circuit breaker: after GEMMA_BREAKER_FAILS GemmaUnavailable in a row (Ollama down, model unloaded,
     # broken output), stop calling Gemma for the rest of this walk instead of timing out on every frame.
+    # Frames whose answer is cached still get it (cache only, Ollama is never contacted for them).
     breaker = {"streak": 0, "open": False}
     breaker_lock = threading.Lock()
     skipped = object()
@@ -304,11 +318,13 @@ def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
     def one(kf: Keyframe):
         if job.pause_requested:
             return kf, JobPaused(), 0.0
-        if breaker["open"]:
-            return kf, skipped, 0.0
+        path = frames / kf.frame_id
+        if not online or breaker["open"]:
+            res = gemma.cached_analysis(path, cache, chosen)
+            return kf, (skipped if res is None else res), 0.0
         t0 = time.time()
         try:
-            res = gemma.analyze_frame(frames / kf.frame_id, cache, model)
+            res = gemma.analyze_frame(path, cache, chosen)
         except gemma.GemmaUnavailable as exc:
             with breaker_lock:
                 breaker["streak"] += 1
@@ -321,6 +337,7 @@ def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
         return kf, res, time.time() - t0
 
     ok = n_skipped = 0
+    used: Counter = Counter()
     announced = False
     # A few requests in flight keeps the GPU busy (~25% faster with OLLAMA_NUM_PARALLEL>1).
     with ThreadPoolExecutor(max_workers=config.GEMMA_CONCURRENCY) as pool:
@@ -336,24 +353,28 @@ def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
                 if breaker["open"] and not announced:
                     announced = True
                     job.say(f"WARNING Gemma failed {config.GEMMA_BREAKER_FAILS} frames in a row; "
-                            "not calling it again for this walk")
+                            "not calling it again for this walk (cached answers are still used)")
                 continue
             if isinstance(res, Exception):
                 job.say(f"WARNING Skipping {kf.frame_id}: {type(res).__name__}: {res}")
                 continue
             kf.analysis = a = res
             ok += 1
+            if (m := getattr(res, "_model_used", None)):
+                used[m] += 1
             if a.has_sign or a.place_type != "hallway" or a.stairs != "none":
                 job.say(f"{kf.frame_id} [{kf.kind}] -> {a.place_type}: {a.suggested_label!r} "
                         f"texts={a.texts} stairs={a.stairs} ({dt:.1f}s)")
     job.checkpoint()
     if n_skipped:
-        job.say(f"Skipped Gemma on {n_skipped} frame(s) after repeated failures")
+        job.say(f"Skipped Gemma on {n_skipped} frame(s): not cached, and Gemma unavailable or failing")
+    online = online and not breaker["open"]
     if keyframes and not ok:
         job.say("WARNING Gemma analysed no frames, mapping from motion only")
-        return False
-    job.say(f"Gemma analysed {ok}/{len(keyframes)} frames")
-    return True
+        return GemmaRun(False, None, online)
+    model_used = used.most_common(1)[0][0] if used else chosen
+    job.say(f"Gemma analysed {ok}/{len(keyframes)} frames" + (f" with {model_used}" if model_used else ""))
+    return GemmaRun(True, model_used, online)
 
 
 def _frames_ok(keyframes: list[Keyframe]) -> int:
@@ -381,21 +402,23 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     job.enter("keyframes")
     keyframes = select_keyframes(hq_path, track, events, duration, vid, store.frames_dir(bid), log=job.say)
 
-    use_gemma = _analyze(job, keyframes, model)
+    run = _analyze_walk(job, keyframes, model)
+    use_gemma = run.ok
     store.write_json_atomic(vdir / "walk.json", {
         "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
-        "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes),
+        "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes), "model": run.model,
     }, mkdir=False)
 
     job.enter("mapping"); job.say("Building graph and closing loops")
-    with store.lock_for(bid):
+    # same-place / same-stairwell checks use this walk's model; if Ollama was down they answer from the cache
+    with store.lock_for(bid), gemma.session(run.model or model, offline=not run.online):
         bundle = store.load_map(bid)
         info = _video_info(job, bundle, vid)
         result = mapper.integrate_walk(bundle, vid, keyframes, track, store.frames_dir(bid),
                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
                                        start_floor=info.start_floor)
-        if use_gemma:
-            bundle.processed_with = {"model": model or gemma.resolve_model(), "prompt": gemma.PROMPT_VERSION}
+        if use_gemma and run.model:
+            bundle.processed_with = {"model": run.model, "prompt": gemma.PROMPT_VERSION}
         v = _video_info(job, bundle, vid)
         v.duration, v.keyframes, v.status = round(duration, 1), len(keyframes), "done"
         v.floor_offset = result.get("floor_offset") or 0
@@ -416,10 +439,13 @@ def _rebuild(job: Job) -> None:
     # only finished walks: queued/paused ones will be integrated when their own job runs
     videos = [v for v in store.load_map(bid).videos
               if v.status == "done" and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
+    default_model = (store.load_map(bid).processed_with or {}).get("model")
     walks = []
     for i, v in enumerate(videos):
         job.say(f"Reprocessing {v.filename} ({i + 1}/{len(videos)})")
         vdir = store.video_dir(bid, v.id)
+        # Re-analyse with the model the walk was processed with, so its cached answers are reused.
+        stored = _stored_model(vdir) or default_model
         try:
             sensors = store.read_json(vdir / "sensors.json")
             job.enter("motion", i / len(videos))
@@ -429,10 +455,11 @@ def _rebuild(job: Job) -> None:
             job.enter("keyframes", i / len(videos))
             keyframes = select_keyframes(vdir / "hq.mp4", track, events, v.duration or track["t"][-1], v.id,
                                          store.frames_dir(bid), log=job.say)
-            use_gemma = _analyze(job, keyframes, None)
+            run = _analyze_walk(job, keyframes, stored)
             store.write_json_atomic(vdir / "walk.json", {
                 "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
-                "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes),
+                "events": events, "gemma": run.ok, "gemma_frames_ok": _frames_ok(keyframes),
+                "model": run.model or stored,
             }, mkdir=False)
         except JobPaused:
             raise
@@ -442,26 +469,31 @@ def _rebuild(job: Job) -> None:
             job.say(f"{v.filename} was deleted, skipping it")
             _purge_files(bid, v.id)  # keyframes written after the delete
             continue
-        walks.append((v, keyframes, track, use_gemma))
+        walks.append((v, keyframes, track, run, run.model or stored))
 
     job.enter("mapping")
-    with store.lock_for(bid):
+    models = [m for *_, m in walks if m]
+    online = any(w[3].online for w in walks) if walks else _gemma_ok()
+    with store.lock_for(bid), gemma.session(default_model or (models[-1] if models else None), lookup=models,
+                                            offline=not online):
         bundle = store.load_map(bid)
         bundle.nodes, bundle.edges, bundle.suggested_merges = [], [], []
-        for v, keyframes, track, use_gemma in walks:
+        for v, keyframes, track, run, wmodel in walks:
             info = next((x for x in bundle.videos if x.id == v.id), None)
             if info is None:  # deleted while it was being re-analyzed
                 job.say(f"{v.filename} was deleted, skipping it")
                 _purge_files(bid, v.id)
                 continue
-            res = mapper.integrate_walk(bundle, v.id, keyframes, track, store.frames_dir(bid),
-                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
-                                        start_floor=info.start_floor)
+            with gemma.session(wmodel):  # this walk's own same-place checks: its own model
+                res = mapper.integrate_walk(bundle, v.id, keyframes, track, store.frames_dir(bid),
+                                            gemma.cache_for(store.building_dir(bid)), run.ok, log=job.say,
+                                            start_floor=info.start_floor)
             info.floor_offset = res.get("floor_offset") or 0
             job.say(f"{v.filename}: {res}")
         job.say("Linking all walks into one building map")
+        # use_gemma=True even offline: inside the session, cached answers are used and misses are instant
         job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
-                                        _gemma_ok(), log=job.say)
+                                        True, log=job.say)
         store.save_map(bundle)
 
 
@@ -475,11 +507,22 @@ def _consolidate(job: Job) -> None:
     bid = job.building_id
     job.enter("mapping")
     job.say("Linking all walks into one building map")
+    online = _gemma_ok()
     with store.lock_for(bid):
         bundle = store.load_map(bid)
-        job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
-                                        _gemma_ok(), log=job.say)
+        models = [m for v in bundle.videos if (m := _stored_model(store.video_dir(bid, v.id)))]
+        with gemma.session((bundle.processed_with or {}).get("model"), lookup=models, offline=not online):
+            job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
+                                            True, log=job.say)
         store.save_map(bundle)
+
+
+def _stored_model(vdir: Path) -> str | None:
+    """Model a walk was processed with (walk.json), if recorded."""
+    try:
+        return (store.read_json(vdir / "walk.json") or {}).get("model")
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _gemma_ok() -> bool:
