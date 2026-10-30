@@ -290,34 +290,75 @@ def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
     frames = store.frames_dir(job.building_id)
     try:
         chosen = model or gemma.resolve_model()
+        gemma.ensure_model(chosen)  # a missing model fails here once, not on every frame
         job.say(f"Gemma model: {chosen} (local, via Ollama)")
     except gemma.GemmaUnavailable as exc:
         job.say(f"WARNING Gemma unavailable, mapping from motion only: {exc}")
         return False
+    # Circuit breaker: after GEMMA_BREAKER_FAILS GemmaUnavailable in a row (Ollama down, model unloaded,
+    # broken output), stop calling Gemma for the rest of this walk instead of timing out on every frame.
+    breaker = {"streak": 0, "open": False}
+    breaker_lock = threading.Lock()
+    skipped = object()
+
     def one(kf: Keyframe):
         if job.pause_requested:
             return kf, JobPaused(), 0.0
+        if breaker["open"]:
+            return kf, skipped, 0.0
         t0 = time.time()
         try:
-            return kf, gemma.analyze_frame(frames / kf.frame_id, cache, model), time.time() - t0
+            res = gemma.analyze_frame(frames / kf.frame_id, cache, model)
         except gemma.GemmaUnavailable as exc:
+            with breaker_lock:
+                breaker["streak"] += 1
+                breaker["open"] = breaker["open"] or breaker["streak"] >= config.GEMMA_BREAKER_FAILS
             return kf, exc, 0.0
+        except Exception as exc:  # e.g. an unreadable frame: skip just this one
+            return kf, exc, 0.0
+        with breaker_lock:
+            breaker["streak"] = 0
+        return kf, res, time.time() - t0
 
+    ok = n_skipped = 0
+    announced = False
     # A few requests in flight keeps the GPU busy (~25% faster with OLLAMA_NUM_PARALLEL>1).
     with ThreadPoolExecutor(max_workers=config.GEMMA_CONCURRENCY) as pool:
         for i, (kf, res, dt) in enumerate(pool.map(one, keyframes)):
             job.enter("gemma", (i + 1) / max(len(keyframes), 1))
             if isinstance(res, JobPaused):
                 continue
-            if isinstance(res, Exception):
+            if res is skipped:
+                n_skipped += 1
+                continue
+            if isinstance(res, gemma.GemmaUnavailable):
                 job.say(f"WARNING Gemma failed on {kf.frame_id}: {res}")
+                if breaker["open"] and not announced:
+                    announced = True
+                    job.say(f"WARNING Gemma failed {config.GEMMA_BREAKER_FAILS} frames in a row; "
+                            "not calling it again for this walk")
+                continue
+            if isinstance(res, Exception):
+                job.say(f"WARNING Skipping {kf.frame_id}: {type(res).__name__}: {res}")
                 continue
             kf.analysis = a = res
+            ok += 1
             if a.has_sign or a.place_type != "hallway" or a.stairs != "none":
                 job.say(f"{kf.frame_id} [{kf.kind}] -> {a.place_type}: {a.suggested_label!r} "
                         f"texts={a.texts} stairs={a.stairs} ({dt:.1f}s)")
     job.checkpoint()
+    if n_skipped:
+        job.say(f"Skipped Gemma on {n_skipped} frame(s) after repeated failures")
+    if keyframes and not ok:
+        job.say("WARNING Gemma analysed no frames, mapping from motion only")
+        return False
+    job.say(f"Gemma analysed {ok}/{len(keyframes)} frames")
     return True
+
+
+def _frames_ok(keyframes: list[Keyframe]) -> int:
+    """Keyframes Gemma analysed successfully (recorded in walk.json as gemma_frames_ok)."""
+    return sum(k.analysis is not None for k in keyframes)
 
 
 def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None) -> None:
@@ -343,7 +384,7 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     use_gemma = _analyze(job, keyframes, model)
     store.write_json_atomic(vdir / "walk.json", {
         "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
-        "events": events, "gemma": use_gemma,
+        "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes),
     }, mkdir=False)
 
     job.enter("mapping"); job.say("Building graph and closing loops")
@@ -391,7 +432,7 @@ def _rebuild(job: Job) -> None:
             use_gemma = _analyze(job, keyframes, None)
             store.write_json_atomic(vdir / "walk.json", {
                 "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
-                "events": events, "gemma": use_gemma,
+                "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes),
             }, mkdir=False)
         except JobPaused:
             raise

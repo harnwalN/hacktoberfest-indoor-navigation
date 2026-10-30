@@ -1,5 +1,6 @@
 """Central configuration. Every value can be overridden with an environment variable."""
 import os
+import re
 from pathlib import Path
 
 
@@ -24,8 +25,16 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma3:4b")
 GEMMA_FALLBACK_MODEL = os.getenv("GEMMA_FALLBACK_MODEL", "gemma3:12b")
 GEMMA_IMAGE_MAX = int(os.getenv("GEMMA_IMAGE_MAX", 896))  # Gemma 3 vision encoder native size
-GEMMA_TIMEOUT_SEC = _f("GEMMA_TIMEOUT_SEC", 300)
+GEMMA_TIMEOUT_SEC = _f("GEMMA_TIMEOUT_SEC", 300)  # one chat request (model load + image + answer)
+GEMMA_LIST_TIMEOUT_SEC = _f("GEMMA_LIST_TIMEOUT_SEC", 3)  # list/show/health: fail fast when Ollama is down
 GEMMA_CONCURRENCY = int(os.getenv("GEMMA_CONCURRENCY", 3))  # pair with OLLAMA_NUM_PARALLEL>=3
+# How long Ollama keeps the model loaded after a request: a duration ("30m", "1h") or seconds ("-1" = forever).
+_keep_alive = os.getenv("GEMMA_KEEP_ALIVE", "30m").strip()
+GEMMA_KEEP_ALIVE: str | float = float(_keep_alive) if re.fullmatch(r"-?\d+(\.\d+)?", _keep_alive) else _keep_alive
+GEMMA_NUM_CTX = int(os.getenv("GEMMA_NUM_CTX", 4096))  # fixed so every request reuses the loaded model
+GEMMA_NUM_PREDICT_ANALYZE = int(os.getenv("GEMMA_NUM_PREDICT_ANALYZE", 512))  # answer token cap, frame analysis
+GEMMA_NUM_PREDICT_COMPARE = int(os.getenv("GEMMA_NUM_PREDICT_COMPARE", 320))  # same place / same stairwell
+GEMMA_BREAKER_FAILS = int(os.getenv("GEMMA_BREAKER_FAILS", 3))  # consecutive failures that stop Gemma for a walk
 
 # On-device OCR (macOS Vision) grounds Gemma's sign text so it cannot invent room numbers.
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") != "0"

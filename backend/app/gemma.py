@@ -13,6 +13,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import httpx
 import ollama
 from PIL import Image
 
@@ -21,7 +22,7 @@ from .schemas import FrameAnalysis, GemmaFrame, SamePlace
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"  # v5: exact-token OCR grounding
 
 ANALYZE_PROMPT = """You are helping map the inside of a building from a walkthrough video.
 The image is the camera view, looking in the walking direction.
@@ -84,14 +85,27 @@ _model_lock = threading.Lock()
 _resolved_model: str | None = None
 
 
-def _client() -> ollama.Client:
-    return ollama.Client(host=config.OLLAMA_HOST, timeout=config.GEMMA_TIMEOUT_SEC)
+def _client(timeout: float | None = None) -> ollama.Client:
+    """Module-level factory (tests replace it). Default timeout is the long chat one."""
+    return ollama.Client(host=config.OLLAMA_HOST, timeout=timeout or config.GEMMA_TIMEOUT_SEC)
 
 
 def available_models() -> list[str]:
     try:
-        return [m.model for m in _client().list().models]
+        return [m.model for m in _client(timeout=config.GEMMA_LIST_TIMEOUT_SEC).list().models]
     except Exception as exc:  # connection refused, etc.
+        raise GemmaUnavailable(f"Ollama not reachable at {config.OLLAMA_HOST}: {exc}") from exc
+
+
+def ensure_model(model: str) -> None:
+    """Fail fast if `model` is not pulled (or Ollama is down), instead of failing on every frame."""
+    try:
+        _client(timeout=config.GEMMA_LIST_TIMEOUT_SEC).show(model)
+    except ollama.ResponseError as exc:
+        if exc.status_code == 404:
+            raise GemmaUnavailable(f"Model {model!r} is not pulled in Ollama. Run: ollama pull {model}") from exc
+        raise GemmaUnavailable(f"Ollama cannot use model {model!r}: {exc}") from exc
+    except Exception as exc:
         raise GemmaUnavailable(f"Ollama not reachable at {config.OLLAMA_HOST}: {exc}") from exc
 
 
@@ -243,30 +257,52 @@ class GemmaCache:
             self.data[key] = value
 
 
-def _chat(model: str, prompt: str, images: list[bytes], schema_cls):
-    last_exc = None
+# Worth one retry: dropped/reset connections, timeouts (httpx.TransportError), Ollama not answering.
+_TRANSIENT = (ConnectionError, TimeoutError, httpx.TransportError)
+
+
+def _chat(model: str, prompt: str, images: list[bytes], schema_cls, num_predict: int):
+    """One structured answer. At most 2 attempts: a transient error (connection reset, timeout, HTTP 5xx) or
+    unparseable JSON is retried once; anything else (404 model not found, other 4xx, truncated output)
+    raises GemmaUnavailable immediately."""
+    last_exc: Exception | None = None
     for _ in range(2):
         try:
             resp = _client().chat(
                 model=model,
                 messages=[{"role": "user", "content": prompt, "images": images}],
                 format=schema_cls.model_json_schema(),
-                options={"temperature": 0},
+                options={"temperature": 0, "num_ctx": config.GEMMA_NUM_CTX, "num_predict": num_predict},
+                keep_alive=config.GEMMA_KEEP_ALIVE,
             )
-            return _parse(resp.message.content, schema_cls)
-        except (ollama.ResponseError, ValueError) as exc:
+        except ollama.ResponseError as exc:
+            if exc.status_code == 404:
+                raise GemmaUnavailable(f"Model {model!r} not found in Ollama. Run: ollama pull {model}") from exc
+            if exc.status_code < 500:  # bad request etc.: retrying gives the same answer
+                raise GemmaUnavailable(f"Ollama rejected the request ({exc.status_code}): {exc.error}") from exc
             last_exc = exc
+            continue
+        except _TRANSIENT as exc:
+            last_exc = exc
+            continue
         except Exception as exc:
-            raise GemmaUnavailable(str(exc)) from exc
-    raise GemmaUnavailable(f"Gemma returned unusable output: {last_exc}")
+            raise GemmaUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        try:
+            return _parse(resp.message.content or "", schema_cls)
+        except ValueError as exc:  # invalid JSON or schema mismatch (pydantic ValidationError is a ValueError)
+            if getattr(resp, "done_reason", None) == "length":
+                raise GemmaUnavailable(
+                    f"Gemma output truncated at num_predict={num_predict} tokens (raise GEMMA_NUM_PREDICT_*)") from exc
+            last_exc = exc
+    raise GemmaUnavailable(f"Gemma failed after a retry: {type(last_exc).__name__}: {last_exc}")
 
 
-def _strip_ungrounded_numbers(text: str, tokens: set[str]) -> tuple[str, bool]:
-    """Remove number-bearing words that OCR never saw. Returns (cleaned, changed)."""
+def _strip_ungrounded_numbers(text: str, lines: list[str]) -> tuple[str, bool]:
+    """Remove number-bearing words that OCR never read as whole tokens. Returns (cleaned, changed)."""
     words, changed = [], False
     for w in text.split():
         core = re.sub(r"[^A-Za-z0-9]", "", w).upper()
-        if any(ch.isdigit() for ch in core) and core not in tokens:
+        if any(ch.isdigit() for ch in core) and not ocr.grounded(core, lines):
             changed = True
             continue
         words.append(w)
@@ -274,14 +310,13 @@ def _strip_ungrounded_numbers(text: str, tokens: set[str]) -> tuple[str, bool]:
 
 
 def _ground(result: FrameAnalysis, lines: list[str]) -> FrameAnalysis:
-    tokens = ocr.ocr_tokens(lines)
     result.texts = [t for t in result.texts if ocr.grounded(t, lines)]
     result.room_numbers = [r for r in result.room_numbers if ocr.grounded(r, lines)]
     result.has_sign = bool(result.texts or result.room_numbers)
-    if result.floor_hint and not ocr.grounded(result.floor_hint, lines):
-        result.floor_hint = ""
-    result.description, _ = _strip_ungrounded_numbers(result.description, tokens)
-    label, changed = _strip_ungrounded_numbers(result.suggested_label, tokens)
+    if result.floor_hint and not ocr.floor_grounded(result.floor_hint, lines):
+        result.floor_hint = ""  # only a line like 'LEVEL 2' / '2ND FLOOR' confirms it, never a room number
+    result.description, _ = _strip_ungrounded_numbers(result.description, lines)
+    label, changed = _strip_ungrounded_numbers(result.suggested_label, lines)
     if changed:  # the label was built on an invented number: rebuild it from what is real
         if result.room_numbers:
             label = f"Room {result.room_numbers[0]}"
@@ -304,13 +339,14 @@ def analyze_frame(path: Path, cache: GemmaCache, model: str | None = None) -> Fr
     if use_ocr:
         lines = ocr.read_text(path)
         listing = "\n".join(f"- {l}" for l in lines) if lines else "(none)"
-        raw = _chat(model, ANALYZE_PROMPT + OCR_NOTE.format(lines=listing), views[:1], GemmaFrame)
+        raw = _chat(model, ANALYZE_PROMPT + OCR_NOTE.format(lines=listing), views[:1], GemmaFrame,
+                    config.GEMMA_NUM_PREDICT_ANALYZE)
         result = _ground(FrameAnalysis(**raw.model_dump(), ocr=lines), lines)
     else:
-        raw = _chat(model, ANALYZE_PROMPT, views[:1], GemmaFrame)
+        raw = _chat(model, ANALYZE_PROMPT, views[:1], GemmaFrame, config.GEMMA_NUM_PREDICT_ANALYZE)
         if (raw.has_sign and not raw.texts) or (raw.place_type == "room" and not raw.room_numbers):
             # A sign is visible but unreadable at 896px: re-ask with zoomed side crops.
-            zoomed = _chat(model, ANALYZE_PROMPT + ZOOM_NOTE, views, GemmaFrame)
+            zoomed = _chat(model, ANALYZE_PROMPT + ZOOM_NOTE, views, GemmaFrame, config.GEMMA_NUM_PREDICT_ANALYZE)
             if zoomed.texts or zoomed.room_numbers:
                 raw = zoomed
         result = FrameAnalysis(**raw.model_dump())
@@ -327,7 +363,7 @@ def same_place(path_a: Path, path_b: Path, cache: GemmaCache) -> SamePlace:
     if (hit := cache.get(key)) is not None:
         return SamePlace.model_validate(hit)
     imgs = [_encode(Image.open(path_a)), _encode(Image.open(path_b))]
-    result = _chat(model, SAME_PLACE_PROMPT, imgs, SamePlace)
+    result = _chat(model, SAME_PLACE_PROMPT, imgs, SamePlace, config.GEMMA_NUM_PREDICT_COMPARE)
     result.confidence = max(0.0, min(1.0, float(result.confidence)))
     cache.put(key, result.model_dump())
     return result
@@ -340,7 +376,7 @@ def same_stairwell(path_a: Path, path_b: Path, cache: GemmaCache) -> SamePlace:
     if (hit := cache.get(key)) is not None:
         return SamePlace.model_validate(hit)
     imgs = [_encode(Image.open(path_a)), _encode(Image.open(path_b))]
-    result = _chat(model, SAME_STAIRWELL_PROMPT, imgs, SamePlace)
+    result = _chat(model, SAME_STAIRWELL_PROMPT, imgs, SamePlace, config.GEMMA_NUM_PREDICT_COMPARE)
     result.confidence = max(0.0, min(1.0, float(result.confidence)))
     cache.put(key, result.model_dump())
     return result
