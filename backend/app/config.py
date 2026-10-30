@@ -78,3 +78,12 @@ FLOOR_SIGNS = os.getenv("FLOOR_SIGNS", "1") != "0"  # 'LEVEL 3', '2ND FLOOR' and
 # default lets one clear floor sign stand alone while a single room number needs a second agreeing one.
 FLOOR_SIGN_WEIGHT = _f("FLOOR_SIGN_WEIGHT", 2.0)
 SNAP_TOLERANCE_DEG = _f("SNAP_TOLERANCE_DEG", 20.0)
+# Stair landings: two flights in the same direction count as ONE floor change when only a landing lies
+# between them (no room numbers, floor signs or doors). Gap = time from the last on-stairs keyframe of one
+# flight to the first of the next, so it includes up to one keyframe interval on each side of the landing.
+# Up to STAIR_LANDING_GAP_S any landing-like frames qualify; up to STAIR_LANDING_MAX_S only if every frame
+# between is a stairwell (place_type stairs, or the next flight ahead). Set both to 0 to count every flight.
+# Both defaults come from synthetic walks only: TUNE THEM against real walk.json files (landing durations of
+# switchback stairwells vs short corridors between separate staircases).
+STAIR_LANDING_GAP_S = _f("STAIR_LANDING_GAP_S", 9.0)  # about 3 heartbeats (3 s each), so a landing with up to two keyframes joins; tune on real walk.json
+STAIR_LANDING_MAX_S = _f("STAIR_LANDING_MAX_S", 15.0)

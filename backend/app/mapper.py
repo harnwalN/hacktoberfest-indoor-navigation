@@ -23,7 +23,7 @@ import numpy as np
 from . import config, gemma
 from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep working)
     _RANK, _add_vertical_edge, _adopt_floor, _connected, _floor_rank, _floors_compatible, _is_vertical,
-    _link_floors, assign_floors, room_floor, set_walk_floor,
+    _link_floors, assign_floors, room_floor, set_walk_floor, stair_rel_floors, stair_states,
 )
 from .matching import _next_id, text_tokens
 from .motion import focal_px, median_heading
@@ -220,7 +220,9 @@ def _walk_vertical(a: FrameAnalysis, boundary: bool) -> str | None:
 
 def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
     kfs = sorted(keyframes, key=lambda k: k.t)
-    states = [_stairs_state(k.analysis) for k in kfs]
+    # Landings between two same-direction flights count as mid-flight (floors.stair_states, B6): the landing
+    # is not a node or a floor boundary; its photos still appear along the stairs edge.
+    states = stair_states(kfs)
     worthy = [_worthy(k) for k in kfs]
     boundary = [False] * len(kfs)
     # Stair boundaries: last frame before climbing and first frame after.
@@ -249,11 +251,9 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
             continue
         nodes.append(wn)
 
-    # Relative floor per walk node: count completed flights.
-    floor, j = 0, 0
-    for i, k in enumerate(kfs):
-        if i > 0 and states[i - 1] != "none" and states[i] == "none":
-            floor += 1 if states[i - 1] == "up" else -1
+    # Relative floor per walk node: count completed climbs (a flight, or flights joined by landings).
+    j = 0
+    for k, floor in zip(kfs, stair_rel_floors(states)):
         while j < len(nodes) and nodes[j].kf.t <= k.t:
             nodes[j].rel_floor = floor
             j += 1

@@ -2,6 +2,7 @@
 and stairs/elevator links between adjacent floors that no single walk climbed."""
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +15,7 @@ if TYPE_CHECKING:  # annotation only; a runtime import would be circular
     from .mapper import WalkNode
     from .schemas import FrameAnalysis, Keyframe
 
+_log = logging.getLogger(__name__)
 _HYPHENATED = re.compile(r"[A-Z0-9]*\d\s*[-–]\s*\d[A-Z0-9]*")  # 2-105, 858-534-1234: not a plain room number
 
 
@@ -132,6 +134,63 @@ def _node_sign(wn: WalkNode) -> tuple[int, float] | None:
 
 
 _STAIRS = {"on_stairs_up": "up", "on_stairs_down": "down"}
+_NOT_A_LANDING = {"room", "restroom", "exit", "entrance", "elevator"}  # a door: the walker is on a floor
+
+
+def _landing_like(a: FrameAnalysis | None) -> bool:
+    """A frame between two flights that may be a mid-flight landing: nothing says 'this is a floor'."""
+    if a is None:
+        return True
+    return not (a.room_numbers or a.place_type in _NOT_A_LANDING or _frame_readings(a))
+
+
+def _in_stairwell(a: FrameAnalysis | None, direction: str) -> bool:
+    return a is not None and (a.place_type == "stairs" or a.stairs == f"ahead_{direction}")
+
+
+def stair_states(kfs: list[Keyframe]) -> list[str]:
+    """'up' / 'down' / 'none' per keyframe (kfs sorted by time), with stair landings filled in.
+
+    Gemma marks each keyframe on_stairs_up/down or not; a switchback staircase has a landing frame (state
+    'none') between its two flights, which used to count as two floors per storey (B6). Two runs in the same
+    direction are one climb when the frames between are landing-like and the gap is short (see
+    config.STAIR_LANDING_GAP_S / STAIR_LANDING_MAX_S); those frames get the run's direction, so they are
+    mid-flight: no walk node, no floor boundary, no floor-sign reading. Runs in opposite directions are never
+    merged. Known limit: a walker climbing several storeys without leaving the stairwell, past floor landings
+    showing no room number, door or floor sign, is counted as one floor; room/sign evidence after the climb
+    still corrects the floors (assign_floors).
+    """
+    raw = [_STAIRS.get(k.analysis.stairs if k.analysis else "none", "none") for k in kfs]
+    runs: list[tuple[int, int]] = []  # (first, last) index of consecutive frames on stairs in one direction
+    for i, s in enumerate(raw):
+        if s == "none":
+            continue
+        if runs and runs[-1][1] == i - 1 and raw[i - 1] == s:
+            runs[-1] = (runs[-1][0], i)
+        else:
+            runs.append((i, i))
+    out = list(raw)
+    for (_, a1), (b0, _) in zip(runs, runs[1:]):
+        d = raw[a1]
+        between = kfs[a1 + 1:b0]
+        if raw[b0] != d or not between or not all(_landing_like(k.analysis) for k in between):
+            continue
+        gap = kfs[b0].t - kfs[a1].t
+        if gap <= config.STAIR_LANDING_GAP_S or (
+                gap <= config.STAIR_LANDING_MAX_S and all(_in_stairwell(k.analysis, d) for k in between)):
+            out[a1 + 1:b0] = [d] * len(between)
+    return out
+
+
+def stair_rel_floors(states: list[str]) -> list[int]:
+    """Relative floor at each keyframe: +1/-1 when a run of up/down frames ends (a direction flip with no
+    frame between ends the first run too)."""
+    rel, out = 0, []
+    for i, s in enumerate(states):
+        if i and states[i - 1] != "none" and s != states[i - 1]:
+            rel += 1 if states[i - 1] == "up" else -1
+        out.append(rel)
+    return out
 
 
 def _signs_from_keyframes(wnodes: list[WalkNode], keyframes: list[Keyframe]) -> list[tuple[int, float] | None]:
@@ -139,16 +198,13 @@ def _signs_from_keyframes(wnodes: list[WalkNode], keyframes: list[Keyframe]) -> 
     plain corridor frame is not a node of its own). Each reading is converted to a floor offset with the
     frame's own stair count (same counting as walk_nodes) and attached to the nearest walk node."""
     per_node: list[list[tuple[int, float]]] = [[] for _ in wnodes]
-    rel, prev = 0, "none"
+    kfs = sorted(keyframes, key=lambda k: k.t)
+    states = stair_states(kfs)
 
     def gap(wn: WalkNode, t: float) -> float:
         return 0.0 if wn.t_arrive <= t <= wn.t_depart else min(abs(t - wn.t_arrive), abs(t - wn.t_depart))
 
-    for k in sorted(keyframes, key=lambda k: k.t):
-        state = _STAIRS.get(k.analysis.stairs if k.analysis else "none", "none")
-        if prev != "none" and state == "none":
-            rel += 1 if prev == "up" else -1
-        prev = state
+    for k, state, rel in zip(kfs, states, stair_rel_floors(states)):
         if state != "none" or not wnodes:
             continue  # mid-flight it is unclear which floor a landing sign belongs to
         if not (readings := _frame_readings(k.analysis)):
@@ -170,7 +226,7 @@ def _confirmed(ev: list[tuple[int, int, float]], k: int) -> bool:
 
 
 def assign_floors(wnodes: list[WalkNode], start_floor: int | None,
-                  keyframes: list[Keyframe] | None = None) -> list[int | None]:
+                  keyframes: list[Keyframe] | None = None, log=None) -> list[int | None]:
     """Absolute floor per walk node, or None when unknown.
 
     Relative floor changes come from detected stairs (rel_floor). The absolute offset comes from the
@@ -179,7 +235,13 @@ def assign_floors(wnodes: list[WalkNode], start_floor: int | None,
     (see _confirmed). Without a start floor, the first confirmed floor also covers the nodes before it; a
     later confirmed change that stairs do not explain (an elevator ride, missed stairs) starts a new floor
     segment.
+
+    When stairs were crossed since the last evidence and the confirmed evidence disagrees with the counted
+    flights (counted +2, rooms say +1; or Gemma saw stairs and rooms say same floor), the evidence wins from
+    the last stair crossing on, so the top of the flight is not left on a floor that does not exist, and the
+    disagreement is reported to `log` (default: this module's logger, as a warning).
     """
+    warn = log or _log.warning
     signs = _signs_from_keyframes(wnodes, keyframes) if keyframes is not None else [_node_sign(w) for w in wnodes]
     ev: list[tuple[int, int, float]] = []  # (walk node index, floor offset, weight)
     for i, (wn, sign) in enumerate(zip(wnodes, signs)):
@@ -188,11 +250,21 @@ def assign_floors(wnodes: list[WalkNode], start_floor: int | None,
         if (f := room_floor(wn.texts)) is not None:
             ev.append((i, f - wn.rel_floor, _ROOM_WEIGHT))
     changes: list[tuple[int, int]] = []
-    cur = start_floor
+    cur, last = start_floor, 0  # last: walk node of the latest evidence agreeing with the current offset
     for k, (i, off, _) in enumerate(ev):
-        if off != cur and _confirmed(ev, k):
-            changes.append((i, off))
-            cur = off
+        if off == cur:
+            last = i
+            continue
+        if not _confirmed(ev, k):
+            continue
+        at = i
+        if cur is not None and (counted := wnodes[i].rel_floor - wnodes[last].rel_floor):
+            while at - 1 > last and wnodes[at - 1].rel_floor == wnodes[i].rel_floor:
+                at -= 1  # back to the first node after the last stair crossing
+            warn(f"Stairs between t={wnodes[last].kf.t:.0f}s and t={wnodes[i].kf.t:.0f}s counted {counted:+d} "
+                 f"floor(s), but room numbers/floor signs say {counted + off - cur:+d}: using the room/sign floors")
+        changes.append((at, off))
+        cur, last = off, i
     o = start_floor if start_floor is not None else (changes[0][1] if changes else None)
     offsets: list[int | None] = []
     c = 0
