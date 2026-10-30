@@ -1,7 +1,7 @@
 """Pydantic models shared by the pipeline, the API and (by convention) the frontend."""
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Vertical = Literal["none", "stairs_up", "stairs_down", "elevator", "ramp_up", "ramp_down"]
 PlaceType = Literal[
@@ -134,6 +134,14 @@ class MapBundle(BaseModel):
 
 
 # ---------- API payloads ----------
+class MapEdit(BaseModel):
+    """PUT /buildings/{id}/map body. nodes and edges are required (no defaults) so a partial body is a 422
+    instead of silently wiping the map; any other MapBundle fields the editor sends along are ignored."""
+    model_config = ConfigDict(extra="ignore")
+    nodes: list[Node]
+    edges: list[Edge]
+
+
 class CreateBuilding(BaseModel):
     name: str
 

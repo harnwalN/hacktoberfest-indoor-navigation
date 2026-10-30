@@ -12,8 +12,8 @@ from PIL import Image
 
 from . import config, gemma, jobs, mapper, routing, store
 from .schemas import (
-    CreateBuilding, FrameAnalysis, ManualMerge, MapBundle, MergeDecision, Node, RouteRequest, RouteResponse,
-    VideoUpdate,
+    CreateBuilding, FrameAnalysis, ManualMerge, MapBundle, MapEdit, MergeDecision, Node, RouteRequest,
+    RouteResponse, VideoUpdate,
 )
 
 api = APIRouter(prefix="/api")
@@ -89,13 +89,23 @@ def get_map(building_id: str) -> MapBundle:
 
 
 @api.put("/buildings/{building_id}/map")
-def save_map(building_id: str, bundle: MapBundle):
-    _load(building_id)
-    bundle.building_id = building_id
-    ids = {n.id for n in bundle.nodes}
-    bundle.edges = [e for e in bundle.edges if e.from_node in ids and e.to_node in ids and e.from_node != e.to_node]
-    mapper.finalize(bundle)
-    store.save_map(bundle)
+def save_map(building_id: str, body: MapEdit):
+    """Save the editor's places and connections.
+
+    Only `nodes` and `edges` are taken from the request, and both are required (a body missing either is a
+    422, so a partial body cannot wipe the map; an explicit empty list is allowed). Everything else (videos,
+    processed_with, name, suggested merges) is owned by the server and read from disk, so a stale editor copy cannot reset
+    walk statuses or persist bad video ids. Load + apply + save happen under the building lock, so the
+    save serializes with background jobs instead of overwriting their video/merge bookkeeping.
+    """
+    with store.lock_for(building_id):
+        bundle = _load(building_id)
+        bundle.nodes = body.nodes
+        ids = {n.id for n in bundle.nodes}
+        bundle.edges = [e for e in body.edges if e.from_node in ids and e.to_node in ids and e.from_node != e.to_node]
+        bundle.suggested_merges = [s for s in bundle.suggested_merges if s.keep in ids and s.remove in ids]
+        mapper.finalize(bundle)
+        store.save_map(bundle)  # re-takes the same RLock: fine
     return {"status": "ok", "map": bundle}
 
 
