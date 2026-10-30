@@ -13,6 +13,12 @@
 # Machine-specific and potentially private; rebuild with `uv run python -m app.cli ingest`.
 backend/data/
 
+# Evaluation harness: rendered walk videos + sidecars, scorecards and Gemma answer caches are generated.
+# Scenario specs (spec.py) and ground truth (truth.json) stay tracked.
+backend/eval/scenarios/*/media/
+backend/eval/results/
+backend/eval/.cache/
+
 # Python
 backend/.venv/
 __pycache__/
