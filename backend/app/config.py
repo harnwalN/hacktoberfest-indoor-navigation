@@ -12,6 +12,11 @@ DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data"))
 BUILDINGS_DIR = DATA_DIR / "buildings"
 STATIC_DIR = BACKEND_DIR / "static"
 
+# --- Upload limits (requests over these get HTTP 413) ---
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 2048))  # one walk video
+MAX_SENSOR_BYTES = int(os.getenv("MAX_SENSOR_BYTES", 50 * 1024 * 1024))  # sensors.json recorded with a video
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", 25 * 1024 * 1024))  # one manually added photo
+
 # --- Gemma (local, via Ollama) ---
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 # 4b reads plaques well and is ~2.5x faster on a 16 GB M-series Mac; pass model=gemma3:12b per upload

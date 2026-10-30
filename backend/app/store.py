@@ -41,6 +41,9 @@ def frames_dir(building_id: str) -> Path:
 
 
 def video_dir(building_id: str, video_id: str) -> Path:
+    # Generated ids are "v" + HHMMSS + 4 hex chars; plain alphanumerics keep "..", separators and glob chars out.
+    if not re.fullmatch(r"[A-Za-z0-9]{1,64}", video_id or ""):
+        raise ValueError(f"invalid video id: {video_id!r}")
     return building_dir(building_id) / "videos" / video_id
 
 

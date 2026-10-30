@@ -1,4 +1,6 @@
+import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -6,8 +8,9 @@ from pathlib import Path
 
 import networkx as nx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from PIL import Image
 
-from . import gemma, jobs, mapper, routing, store
+from . import config, gemma, jobs, mapper, routing, store
 from .schemas import (
     CreateBuilding, FrameAnalysis, ManualMerge, MapBundle, MergeDecision, Node, RouteRequest, RouteResponse,
     VideoUpdate,
@@ -21,6 +24,45 @@ def _load(building_id: str) -> MapBundle:
         return store.load_map(building_id)
     except (FileNotFoundError, ValueError):
         raise HTTPException(404, f"Unknown building '{building_id}'")
+
+
+_CHUNK = 1 << 20
+
+
+async def _copy_capped(upload: UploadFile, f, limit: int, what: str) -> None:
+    """Stream an upload into an open file, refusing with 413 once it exceeds `limit` bytes."""
+    total = 0
+    while chunk := await upload.read(_CHUNK):
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(413, f"{what} is too large (limit {limit} bytes)")
+        f.write(chunk)
+
+
+async def _read_capped(upload: UploadFile, limit: int, what: str) -> bytes:
+    buf = io.BytesIO()
+    await _copy_capped(upload, buf, limit, what)
+    return buf.getvalue()
+
+
+# PIL format -> extension of the stored frame (the client's filename is never trusted).
+_IMAGE_EXT = {"JPEG": ".jpg", "MPO": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif", "BMP": ".bmp"}
+_BAD_IMAGE = "image must be a valid JPEG, PNG, WebP, GIF or BMP file"
+
+
+def _image_ext(data: bytes) -> str:
+    """File extension for an uploaded image; 400 if it is not a decodable image of an allowed format."""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            fmt = im.format
+            im.verify()
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()  # verify() misses truncated pixel data for some formats
+    except Exception:  # PIL raises many types: UnidentifiedImageError, OSError, SyntaxError, DecompressionBombError
+        raise HTTPException(400, _BAD_IMAGE)
+    if fmt not in _IMAGE_EXT:
+        raise HTTPException(400, _BAD_IMAGE)
+    return _IMAGE_EXT[fmt]
 
 
 @api.get("/health")
@@ -95,18 +137,23 @@ async def upload_video(
     start_floor: int | None = Form(None),
 ):
     _load(building_id)
-    tmp = Path(tempfile.mkstemp(suffix=Path(video.filename or "v.mp4").suffix)[1])
-    with open(tmp, "wb") as f:
-        while chunk := await video.read(1 << 20):
-            f.write(chunk)
-    sensor_data = None
-    if sensors is not None:
-        try:
-            sensor_data = json.loads(await sensors.read())
-        except json.JSONDecodeError:
-            raise HTTPException(400, "sensors must be JSON")
-    job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None, front=priority,
-                           start_floor=start_floor)
+    fd, tmp_name = tempfile.mkstemp(suffix=Path(video.filename or "v.mp4").suffix)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            await _copy_capped(video, f, config.MAX_UPLOAD_MB * 1024 * 1024, "video")
+        sensor_data = None
+        if sensors is not None:
+            raw = await _read_capped(sensors, config.MAX_SENSOR_BYTES, "sensors")
+            try:
+                sensor_data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise HTTPException(400, "sensors must be JSON")
+        job = jobs.submit_video(building_id, tmp, video.filename or "video.mp4", sensor_data, model or None,
+                               front=priority, start_floor=start_floor)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # on success submit_video has moved it; this only drops partial/rejected uploads
+        raise
     if priority:
         jobs.run_next(job.id)
     return {"job_id": job.id, "video_id": job.video_id}
@@ -136,6 +183,10 @@ def delete_video(building_id: str, video_id: str):
     """Remove a video: cancels its processing, drops its places/connections, frames and files.
     Places that other videos also pass through are kept."""
     _load(building_id)
+    try:
+        store.video_dir(building_id, video_id)  # reject unsafe ids before anything is modified
+    except ValueError:
+        raise HTTPException(404, "Unknown video")
     try:
         return jobs.delete_video(building_id, video_id)
     except KeyError:
@@ -183,7 +234,10 @@ def job_action(job_id: str, action: str):
 def video_debug(building_id: str, video_id: str):
     """Motion track + events + keyframes with Gemma output: the 'what did the AI see' view."""
     _load(building_id)
-    vdir = store.video_dir(building_id, video_id)
+    try:
+        vdir = store.video_dir(building_id, video_id)
+    except ValueError:
+        raise HTTPException(404, "Unknown video")
     track = store.read_json(vdir / "track.json")
     walk = store.read_json(vdir / "walk.json")
     if track is None:
@@ -205,9 +259,11 @@ async def manual_frame(building_id: str, image: UploadFile = File(...), label: s
     bundle = _load(building_id)
     frames = store.frames_dir(building_id)
     frames.mkdir(parents=True, exist_ok=True)
+    data = await _read_capped(image, config.MAX_IMAGE_BYTES, "image")
+    ext = _image_ext(data)
     n = len([p for p in frames.glob("manual_*")])
-    frame_id = f"manual_{n:04d}{Path(image.filename or 'x.jpg').suffix.lower() or '.jpg'}"
-    (frames / frame_id).write_bytes(await image.read())
+    frame_id = f"manual_{n:04d}{ext}"
+    (frames / frame_id).write_bytes(data)
     try:
         a = gemma.analyze_frame(frames / frame_id, gemma.cache_for(store.building_dir(building_id)))
     except gemma.GemmaUnavailable:
