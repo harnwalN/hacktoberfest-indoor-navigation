@@ -4,6 +4,12 @@ import re
 PLAQUE_PREFIX = r"(?:ROOM|RM|OFFICE|OFC|LAB|STE|SUITE)"
 ROOM_ID = r"[A-Z]?\d{3,4}[A-Z]?"
 _GLUED_PREFIX = re.compile(rf"{PLAQUE_PREFIX}({ROOM_ID})")  # ROOM118 / RM118A (after punctuation is dropped)
+PHONE = re.compile(r"(?:\+?\d[\s().\-]*){7,}")  # 7+ digits with only separators between: 555 0147
+
+
+def phone_like(text: str) -> bool:
+    """'Call 555 0147', '(858) 534-1234': seven or more digits in one number."""
+    return bool(PHONE.search(text))
 
 
 def text_tokens(texts: list[str]) -> set[str]:
@@ -70,6 +76,13 @@ def room_ids(texts: list[str]) -> set[str]:
     """Room numbers (3-4 digits, optional letter prefix/suffix) a place's own sign texts state. Directional
     signs ('ROOMS 120-130 ->') say nothing about which room this is."""
     return {t for t in text_tokens([x for x in texts if not directional(x)]) if re.fullmatch(ROOM_ID, t)}
+
+
+def place_tokens(texts: list[str]) -> set[str]:
+    """Tokens that identify this place (text-hit evidence for 'same place'): text_tokens of its own signs only.
+    A directional sign ('ROOMS 120-130 ->' -> '120130') is shown at many hallway spots, and a phone number
+    ('555-0147' -> '5550147', '555 0147' -> '555') on every flyer: neither says where you are."""
+    return text_tokens([PHONE.sub(" ", t) for t in texts if not directional(t)])
 
 
 def _next_id(prefix: str, existing: list[str]) -> int:

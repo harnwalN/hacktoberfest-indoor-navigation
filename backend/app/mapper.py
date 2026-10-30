@@ -26,7 +26,7 @@ from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep w
     _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, room_floor, set_walk_floor,
     stair_rel_floors, stair_states,
 )
-from .matching import _next_id, room_ids, text_tokens
+from .matching import _next_id, place_tokens, room_ids
 from .motion import focal_px, median_heading
 from .schemas import (
     FLIP_VERTICAL, Edge, FrameAnalysis, Keyframe, MapBundle, Node, SuggestedMerge,
@@ -279,7 +279,7 @@ def _same_spot(a: WalkNode, b: WalkNode) -> bool:
     """Consecutive frames describing the same place (e.g. three frames of the same entrance)."""
     if b.kf.kind == "turn_start" and a.kf.kind == "turn_start":
         return False  # two real junctions
-    ra, rb = text_tokens(a.texts), text_tokens(b.texts)
+    ra, rb = place_tokens(a.texts), place_tokens(b.texts)
     if ra and rb:
         return bool(ra & rb)  # room numbers decide
     if strong_name_match(wayfinding_texts(a.analysis), wayfinding_texts(b.analysis)):
@@ -344,7 +344,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
     """Best known place this walk node may be. `walk_levels` (node id -> floor within this walk) covers places
     this walk created itself: their Node.floor is not set until the walk is done, so the floor filter
     above cannot see them, and a walk that climbed stairs must not loop-close onto its own earlier floor."""
-    w_tokens = text_tokens(wn.texts)
+    w_tokens = place_tokens(wn.texts)
     w_rooms = room_ids(wayfinding_texts(wn.analysis))  # this frame's own plaque numbers, as Node.sign_texts
     w_path = frames / wn.kf.frame_id
     cands = []
@@ -359,7 +359,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
             continue  # this walk's own place, on another floor of the same walk
         if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < 15:
             continue  # same walk, a few seconds ago: that's just the previous stretch of hallway
-        text_hit = bool(w_tokens & text_tokens(node.texts))
+        text_hit = bool(w_tokens & place_tokens(node.texts))
         inliers, rel_yaw = orb_match(frames / node.frame_id, w_path)
         if text_hit or inliers >= config.ORB_WEAK_INLIERS:
             cands.append((text_hit, inliers, rel_yaw, node))

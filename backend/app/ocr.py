@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from . import config
-from .matching import directional
+from .matching import directional, phone_like
 
 try:
     import objc
@@ -237,18 +237,12 @@ def floor_from_lines(ocr_lines: list[str]) -> str:
 
 
 # ---------------------------------------------------------------- which text is a wayfinding sign
-_PHONE = re.compile(r"(?:\+?\d[\s().\-]*){7,}")  # 7+ digits with only separators between: 555 0147
 _PLAQUE_PREFIX = r"(?:ROOM|RM|OFFICE|OFC|LAB|STE|SUITE)"
 _ROOM_NO = r"[A-Z]?\d{1,4}[A-Z]?"
 _PLAQUE = [
     re.compile(rf"(?:{_PLAQUE_PREFIX}\s*)?{_ROOM_NO}"),  # 121, 121A, ROOM 121, RM118, LAB 214
     re.compile(rf"{_ROOM_NO}(?:\s+[A-Z&']+){{1,3}}"),  # 214 CHEMISTRY LAB
 ]
-
-
-def phone_like(text: str) -> bool:
-    """'Call 555 0147', '(858) 534-1234': seven or more digits in one number."""
-    return bool(_PHONE.search(text))
 
 
 def long_sentence(text: str) -> bool:

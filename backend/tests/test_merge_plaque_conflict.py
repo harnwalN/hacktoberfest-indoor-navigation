@@ -272,3 +272,29 @@ def test_cached_old_answer_tidied_on_read(fake, tmp_path):
     r = gemma.analyze_frame(p, cache, "m")
     assert r.room_numbers == ["118"] and r.place_type == "room"
     assert gemma.cached_analysis(p, cache, "m").room_numbers == ["118"]
+
+
+# ---------------------------------------------------------------- text hits come from the place's own signs only
+@pytest.mark.parametrize("sign", ["120-130", "ROOMS 120-130 →", "ROOMS 120 TO 130", "ROOM 121 →"])
+def test_directional_sign_is_no_text_hit(monkeypatch, tmp_path, sign):
+    """Two hallway spots showing the same directional sign are not 'same room number' at weak ORB."""
+    assert not matching.place_tokens([sign])
+    m = fm(monkeypatch, tmp_path, W, None, node_texts=[sign], walk_texts=[sign], use_gemma=False)
+    assert m is None or not m.auto
+
+
+@pytest.mark.parametrize("text", ["555-0147", "Call 555 0147", "(858) 534-1234", "555.0147"])
+def test_phone_number_is_no_token(monkeypatch, tmp_path, text):
+    assert not matching.place_tokens([text])
+    m = fm(monkeypatch, tmp_path, W, None, node_texts=[text], walk_texts=[text], use_gemma=False)
+    assert m is None or not m.signals["text"]
+
+
+def test_phone_number_next_to_plaque_keeps_room():
+    assert matching.place_tokens(["ROOM 118", "Call 555-0147"]) == {"118"}
+
+
+@pytest.mark.parametrize("a,b", [("ROOM 121", "ROOM 121"), ("RM 118", "ROOM-118"), ("RM118", "Room 118")])
+def test_same_real_plaque_still_text_hit(monkeypatch, tmp_path, a, b):
+    m = fm(monkeypatch, tmp_path, W, None, node_texts=[a, "ROOMS 120-130 →"], walk_texts=[b], use_gemma=False)
+    assert m is not None and m.auto and m.signals["text"]
