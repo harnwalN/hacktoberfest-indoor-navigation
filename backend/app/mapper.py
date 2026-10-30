@@ -339,7 +339,11 @@ class Match:
 
 
 def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma: bool,
-                exclude: set[str], walk_times: dict[str, float], log, w_floor: int | None = None) -> Match | None:
+                exclude: set[str], walk_times: dict[str, float], log, w_floor: int | None = None,
+                walk_levels: dict[str, int] | None = None, w_level: int | None = None) -> Match | None:
+    """Best known place this walk node may be. `walk_levels` (node id -> floor within this walk) covers places
+    this walk created itself: their Node.floor is not set until the walk is done, so the floor filter
+    above cannot see them, and a walk that climbed stairs must not loop-close onto its own earlier floor."""
     w_tokens = text_tokens(wn.texts)
     w_path = frames / wn.kf.frame_id
     cands = []
@@ -348,6 +352,8 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
             continue
         if w_floor is not None and node.floor_source != "default" and node.floor != w_floor:
             continue  # similar corridors on different floors are never the same place
+        if walk_levels is not None and node.id in walk_levels and walk_levels[node.id] != w_level:
+            continue  # this walk's own place, on another floor of the same walk
         if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < 15:
             continue  # same walk, a few seconds ago: that's just the previous stretch of hallway
         text_hit = bool(w_tokens & text_tokens(node.texts))
@@ -428,7 +434,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     pending_suggestions: list[tuple[Match, WalkNode]] = []
     # Floors: start floor and room numbers first; still-unknown floors inherit from the first known place
     # this walk passes (or default to 0 for the very first walk).
-    floors = assign_floors(wnodes, start_floor, keyframes=keyframes)
+    floors = assign_floors(wnodes, start_floor, keyframes=keyframes, log=log)
     has_rooms = any(room_floor(wn.texts) is not None for wn in wnodes)
     known_source = "user" if start_floor is not None else ("rooms" if has_rooms else None)
     inherit: int | None = None
@@ -440,10 +446,16 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     created: list[tuple[Node, WalkNode]] = []
     merged = 0
     recent: list[str] = []
+    # Floor of each place this walk created, within the walk: the assigned floor when known (assign_floors
+    # gives a floor to every node or to none), else the stair count. Evidence may overrule the stair count
+    # (Gemma saw a flight, rooms say same floor), so the assigned floor wins when there is one.
+    walk_levels: dict[str, int] = {}
 
     for i, wn in enumerate(wnodes):
         w_floor = floors[i] if floors[i] is not None else (wn.rel_floor + inherit if inherit is not None else None)
-        match = _find_match(wn, bundle, frames, cache, use_gemma, set(recent[-2:]), walk_times, log, w_floor)
+        w_level = floors[i] if floors[i] is not None else wn.rel_floor
+        match = _find_match(wn, bundle, frames, cache, use_gemma, set(recent[-2:]), walk_times, log, w_floor,
+                            walk_levels, w_level)
         if (match and match.auto and w_floor is None and match.node.floor_source != "default"
                 and not match.signals.get("text")):
             off = match.node.floor - wn.rel_floor
@@ -491,6 +503,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             created.append((node, wn))
             wn.node_id = node.id
             walk_times[node.id] = wn.kf.t
+            walk_levels[node.id] = w_level
             if match and not any(m is match for m, *_ in tentative):
                 pending_suggestions.append((match, wn))
         recent.append(wn.node_id)
@@ -568,6 +581,17 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             if inferred:
                 log(f"Floor {fa} -> {fb} inferred from room numbers between t={a.kf.t:.0f}s and t={b.kf.t:.0f}s "
                     "(no stairs seen: check stairs vs elevator in Map)")
+        elif vertical != "none" and fb != fa and (vertical == "stairs_up") != (fb > fa):
+            # assign_floors already let room numbers/floor signs overrule the stair count: follow the floors,
+            # or the route would say "take the stairs up to floor 1" from floor 2.
+            log(f"Stairs between t={a.kf.t:.0f}s and t={b.kf.t:.0f}s looked {vertical[7:]}, but floors go "
+                f"{fa} -> {fb}: using the floor direction")
+            vertical = "stairs_up" if fb > fa else "stairs_down"
+        elif vertical != "none" and fb == fa:
+            # Steps that stay on one floor (split level, a few steps, or Gemma misread a flight). Kept as stairs:
+            # the walker does climb, and routing only says "to floor N" when the floor changes.
+            log(f"Stairs between t={a.kf.t:.0f}s and t={b.kf.t:.0f}s stay on floor {fa} (room numbers/floor "
+                "signs): kept as steps on one floor, no floor change")
         frames_seq = [a.depart_frame or a.kf.frame_id] + [k.frame_id for k in seg
                                                           if k.kind not in ("glance",) and k.frame_id != a.depart_frame]
         frames_seq.append(b.kf.frame_id)
@@ -736,9 +760,12 @@ def _dedupe_labels(bundle: MapBundle) -> None:
 def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str, log=print) -> None:
     """Make two places one. Raises ValueError (before changing anything) when both floors are known and
     differ: that would join two floors' corridors on the flat. A guessed ('default') floor takes the known
-    one, together with the rest of its walk's guessed places."""
-    keep = next(n for n in bundle.nodes if n.id == keep_id)
-    remove = next(n for n in bundle.nodes if n.id == remove_id)
+    one, together with the rest of its walk's guessed places. Raises KeyError (also before changing anything)
+    for an id that is not a place on the map."""
+    by_id = {n.id: n for n in bundle.nodes}
+    if (missing := [i for i in (keep_id, remove_id) if i not in by_id]):
+        raise KeyError(f"no place {', '.join(repr(i) for i in missing)} on the map")
+    keep, remove = by_id[keep_id], by_id[remove_id]
     if (why := _merge_floor_conflict(keep, remove)):
         raise ValueError(why)
     if (keep.floor_source == "default") != (remove.floor_source == "default"):

@@ -117,6 +117,15 @@ def resolve_merge(building_id: str, merge_id: str, body: MergeDecision):
         if s is None:
             raise HTTPException(404, "Unknown merge suggestion")
         if body.accept:
+            ids = {n.id for n in bundle.nodes}
+            if (gone := [i for i in (s.keep, s.remove) if i not in ids]) or s.keep == s.remove:
+                # The map changed since this was suggested (a place was deleted in the editor or merged away):
+                # drop the stale suggestion so it stops showing, and say why nothing was merged.
+                bundle.suggested_merges = [x for x in bundle.suggested_merges if x.id != merge_id]
+                store.save_map(bundle)
+                what = f"place {', '.join(gone)} no longer exists" if gone else "both sides are the same place"
+                raise HTTPException(409, f"Merge suggestion {merge_id} is out of date ({what}); it has been "
+                                         "removed. Reload the map.")
             _merge_or_400(bundle, s.keep, s.remove)
         else:
             bundle.suggested_merges = [x for x in bundle.suggested_merges if x.id != merge_id]

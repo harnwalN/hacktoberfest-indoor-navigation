@@ -296,7 +296,6 @@ def test_probe_consolidate_default_to_default_still_merges(monkeypatch, tmp_path
     assert len(b.nodes) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="pre-existing: merge_nodes next() raises StopIteration -> 500 for a suggestion whose node was deleted")
 def test_probe_unknown_node_id_in_merge_endpoints(client):
     c, bid = client
     c2 = TestClient(app, raise_server_exceptions=False)
@@ -305,5 +304,20 @@ def test_probe_unknown_node_id_in_merge_endpoints(client):
     s = store.load_map(bid)
     s.suggested_merges[0].remove = "ghost"
     store.save_map(s)
+    before = {n.id for n in store.load_map(bid).nodes}
     r = c2.post(f"/api/buildings/{bid}/merges/m001", json={"accept": True})
-    assert r.status_code in (400, 404), r.status_code  # stale suggestion with a deleted node
+    assert r.status_code == 409, r.status_code  # stale suggestion with a deleted node: conflict, not a 500
+    assert "ghost" in r.json()["detail"] and "out of date" in r.json()["detail"]
+    after = store.load_map(bid)
+    assert after.suggested_merges == [] and {n.id for n in after.nodes} == before  # dropped, nothing merged
+    r = c2.post(f"/api/buildings/{bid}/merges/m001", json={"accept": True})
+    assert r.status_code == 404  # it is gone now
+
+
+def test_merge_nodes_unknown_id_is_key_error_and_map_unchanged():
+    b = _lobby_map()
+    before = b.model_dump()
+    for keep, remove in (("n001", "ghost"), ("ghost", "n001")):
+        with pytest.raises(KeyError, match="ghost"):
+            mapper.merge_nodes(b, keep, remove)
+    assert b.model_dump() == before
