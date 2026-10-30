@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import config
+
 Vertical = Literal["none", "stairs_up", "stairs_down", "elevator", "ramp_up", "ramp_down"]
 PlaceType = Literal[
     "room", "intersection", "hallway", "entrance", "stairs", "elevator", "exit", "restroom", "landmark"
@@ -170,7 +172,7 @@ class RouteResponse(BaseModel):
 
 
 class VideoUpdate(BaseModel):
-    start_floor: int
+    start_floor: int = Field(ge=1, le=config.MAX_FLOOR)
 
 
 class MergeDecision(BaseModel):

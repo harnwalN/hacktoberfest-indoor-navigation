@@ -144,7 +144,7 @@ async def upload_video(
     sensors: UploadFile | None = File(None),
     model: str | None = Form(None),
     priority: bool = Form(False),
-    start_floor: int | None = Form(None),
+    start_floor: int | None = Form(None, ge=1, le=config.MAX_FLOOR),
 ):
     _load(building_id)
     fd, tmp_name = tempfile.mkstemp(suffix=Path(video.filename or "v.mp4").suffix)
@@ -179,11 +179,8 @@ def update_video(building_id: str, video_id: str, body: VideoUpdate):
             raise HTTPException(404, "Unknown video")
         v.start_floor = body.start_floor
         if v.status == "done":
-            delta = body.start_floor - v.floor_offset
-            for n in bundle.nodes:
-                if n.video_id == video_id:
-                    n.floor += delta
-            v.floor_offset = body.start_floor
+            mapper.set_walk_floor(bundle, video_id, body.start_floor)  # also updates v.floor_offset
+            mapper.finalize(bundle)  # re-lay out the plan around any new stairs/elevator links
         store.save_map(bundle)
     return v
 

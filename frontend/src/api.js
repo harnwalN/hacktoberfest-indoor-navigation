@@ -47,3 +47,11 @@ export const api = {
 export { detail }
 
 export const frameUrl = (b, frameId) => (frameId ? `/bfiles/${b}/frames/${frameId}` : null)
+
+// Mirrors backend config.MAX_FLOOR (valid start floors are 1..MAX_FLOOR).
+export const MAX_FLOOR = 9
+// Returns an integer in 1..MAX_FLOOR, or null if blank/out of range.
+export const validFloor = (v) => {
+  const n = Number(v)
+  return v !== '' && v != null && Number.isInteger(n) && n >= 1 && n <= MAX_FLOOR ? n : null
+}

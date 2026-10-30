@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Cpu, RefreshCw, Search, Trash2, UploadCloud } from 'lucide-react'
-import { api, detail } from '../api'
+import { api, detail, MAX_FLOOR, validFloor } from '../api'
 import JobProgress from './JobProgress'
 import QueuePanel from './QueuePanel'
 import VideoDebug from './VideoDebug'
@@ -31,7 +31,7 @@ export default function Uploader({ building, onDone }) {
     try {
       const sensors = sensorFile ? JSON.parse(await sensorFile.text()) : null
       setUploadPct(0)
-      const r = await api.uploadVideo(building, file, { sensors, model, priority, startFloor, onProgress: setUploadPct })
+      const r = await api.uploadVideo(building, file, { sensors, model, priority, startFloor: validFloor(startFloor) ?? '', onProgress: setUploadPct })
       setJobId(r.job_id)
       setInspect(null)
     } catch (e) {
@@ -80,7 +80,8 @@ export default function Uploader({ building, onDone }) {
         )}
         <label className="field">
           <span>Starts on floor (keeps floors from stacking; leave blank to inherit from places it passes)</span>
-          <input type="number" placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+          <input type="number" min={1} max={MAX_FLOOR} placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+          {startFloor !== '' && validFloor(startFloor) == null && <small className="error">Floor must be a whole number from 1 to {MAX_FLOOR}; it will be ignored.</small>}
         </label>
         <label className="check">
           <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
@@ -137,8 +138,15 @@ export default function Uploader({ building, onDone }) {
               <span className={`pill ${v.status}`}>{v.status}</span>
               <label className="floor-input" title="Floor this walk starts on">
                 Floor
-                <input type="number" defaultValue={v.start_floor ?? v.floor_offset ?? 0}
-                  onBlur={(e) => e.target.value !== '' && api.setVideoFloor(building, v.id, e.target.value).then(reload).catch((err) => setError(detail(err)))} />
+                <input type="number" min={1} max={MAX_FLOOR} placeholder="1"
+                  defaultValue={v.start_floor ?? (v.floor_offset >= 1 ? v.floor_offset : '')}
+                  onBlur={(e) => {
+                    const shown = String(v.start_floor ?? (v.floor_offset >= 1 ? v.floor_offset : ''))
+                    const f = validFloor(e.target.value)
+                    if (e.target.value === shown) return
+                    if (f == null) { setError(`Floor must be a whole number from 1 to ${MAX_FLOOR}`); return }
+                    api.setVideoFloor(building, v.id, f).then(reload).catch((err) => setError(detail(err)))
+                  }} />
               </label>
               {v.status === 'done' && (
                 <button className="ghost" onClick={() => setInspect(v.id)}>

@@ -23,7 +23,7 @@ import numpy as np
 from . import config, gemma
 from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep working)
     _RANK, _add_vertical_edge, _adopt_floor, _connected, _floor_rank, _floors_compatible, _is_vertical,
-    _link_floors, assign_floors, room_floor,
+    _link_floors, assign_floors, room_floor, set_walk_floor,
 )
 from .matching import _next_id, text_tokens
 from .motion import focal_px, median_heading
@@ -604,8 +604,10 @@ def solve_positions(bundle: MapBundle) -> None:
     for e in bundle.edges:
         if e.from_node not in idx or e.to_node not in idx:
             continue
-        if e.vertical in ("stairs_up", "stairs_down", "elevator") and e.source != "walk":
-            rows.append((idx[e.from_node], idx[e.to_node], 0.0, 0.0, 0.5))
+        if e.vertical in ("stairs_up", "stairs_down", "elevator"):
+            # Walked or linked, a staircase/elevator is one spot on the plan: the floor above sits on top of
+            # the floor below. Its length_m is climbing distance, not a horizontal walk, so weight it high.
+            rows.append((idx[e.from_node], idx[e.to_node], 0.0, 0.0, 5.0))
             continue
         length = e.length_m or config.DEFAULT_EDGE_M
         # average leaving/arriving directions (vector mean handles 350/10 deg)

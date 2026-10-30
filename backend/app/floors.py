@@ -70,6 +70,10 @@ def _adopt_floor(bundle: MapBundle, guessed: Node, sure: Node, log) -> None:
             n.floor += delta
             n.floor_source = "linked"
             moved += 1
+    if delta and moved:  # keep the walk's recorded offset in step with its places (PATCH start floor uses it)
+        for v in bundle.videos:
+            if v.id == guessed.video_id:
+                v.floor_offset += delta
     if delta:
         log(f"Walk {guessed.video_id} placed on floor {sure.floor} via '{sure.label}' ({moved} places moved)")
 
@@ -159,3 +163,35 @@ def _add_vertical_edge(bundle: MapBundle, lower: Node, upper: Node, kind: str, i
         frames_rev=[f for f in (upper.frame_id, lower.frame_id) if f],
         source="merge", verified=not inferred, inferred_floor_change=inferred,
     ))
+
+
+def set_walk_floor(bundle: MapBundle, video_id: str, floor: int, log=print) -> dict:
+    """The uploader says which floor a processed walk starts on: move that walk's own places there.
+
+    The shift is measured from the floor of the walk's earliest own place as it is now, not from the
+    stored floor_offset, so it is right even after consolidation adopted the walk onto another floor.
+    Places the walk shares with other walks belong to those walks and stay put. Floor links that no
+    longer join a lower floor to the one above are dropped, then floors are linked again.
+    """
+    own = [n for n in bundle.nodes if n.video_id == video_id]
+    first = min(own, key=lambda n: n.t if n.t is not None else float("inf"), default=None)  # ties: walk order
+    delta = floor - first.floor if first is not None else 0
+    for n in own:
+        n.floor += delta
+        n.floor_source = "user"
+    for v in bundle.videos:
+        if v.id == video_id:
+            v.floor_offset = floor
+    dropped = 0
+    if delta:
+        moved = {n.id for n in own}
+        floor_of = {n.id: n.floor for n in bundle.nodes}
+        kept = [e for e in bundle.edges
+                if not (e.source == "merge" and e.vertical != "none" and {e.from_node, e.to_node} & moved
+                        and floor_of.get(e.to_node) != floor_of.get(e.from_node, 0) + 1)]
+        dropped = len(bundle.edges) - len(kept)
+        bundle.edges = kept
+        log(f"Walk {video_id} set to start on floor {floor} ({len(own)} places moved by {delta:+d}, "
+            f"{dropped} stale floor links dropped)")
+    linked = _link_floors(bundle, Path("."), None, False, log)  # no Gemma: this runs inside an API request
+    return {"delta": delta, "moved": len(own) if delta else 0, "dropped_links": dropped, "floor_links": linked}

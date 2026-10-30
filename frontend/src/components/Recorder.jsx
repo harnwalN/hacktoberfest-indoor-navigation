@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Circle, Square, UploadCloud } from 'lucide-react'
-import { api, detail } from '../api'
+import { api, detail, MAX_FLOOR, validFloor } from '../api'
 
 // Records the walkthrough in the phone browser AND logs the gyroscope on the same clock, so the
 // backend can use real rotation rates for turns instead of inferring them from pixels.
@@ -92,7 +92,7 @@ export default function Recorder({ building, onUploaded }) {
       await api.uploadVideo(building, result.file, {
         sensors: result.sensors.samples.length > 20 ? result.sensors : null,
         priority: true, // phone recordings jump the queue so you can try them right away
-        startFloor,
+        startFloor: validFloor(startFloor) ?? '',
         onProgress: (p) => setStatus(`Uploading ${Math.round(p * 100)}%`),
       })
       setStatus('Uploaded. It jumps the queue: processing starts on the laptop now (see Build → Queue).')
@@ -117,7 +117,8 @@ export default function Recorder({ building, onUploaded }) {
       {result && !recording && (
         <label className="field">
           <span>This walk starts on floor</span>
-          <input type="number" inputMode="numeric" placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+          <input type="number" inputMode="numeric" min={1} max={MAX_FLOOR} placeholder="e.g. 1" value={startFloor} onChange={(e) => setStartFloor(e.target.value)} />
+          {startFloor !== '' && validFloor(startFloor) == null && <small className="error">Floor must be a whole number from 1 to {MAX_FLOOR}; it will be ignored.</small>}
         </label>
       )}
       {result && !recording && (
