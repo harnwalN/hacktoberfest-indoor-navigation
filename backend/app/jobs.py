@@ -4,7 +4,8 @@ Jobs run one at a time on a single worker thread (Gemma saturates the GPU anyway
 can be reordered: queued jobs can be paused, resumed or moved to the front, and a running job pauses
 cooperatively at the next checkpoint (between stages / Gemma frames). A paused job restarts from the
 beginning when resumed, which is cheap because every Gemma answer is cached; the map is only written
-in the final stage, so pausing never leaves it half-updated.
+in the final stage (a rebuild re-analyzes every walk first, then replaces the map in one step), so
+pausing never leaves it half-updated.
 
 Queued/paused videos are persisted in map.json (VideoInfo.status), so `recover()` re-queues them after
 a server restart.
@@ -76,7 +77,8 @@ def get(job_id: str) -> Job | None:
 
 def queue(building_id: str | None = None) -> list[Job]:
     """Running job first, then queued/paused in run order, then recent finished jobs."""
-    jobs = [j for j in JOBS.values() if building_id in (None, j.building_id)]
+    with _cv:
+        jobs = [j for j in JOBS.values() if building_id in (None, j.building_id)]
     rank = {"running": 0, "queued": 1, "paused": 1, "error": 2, "done": 3}
     return sorted(jobs, key=lambda j: (rank.get(j.status, 9), j.order if rank.get(j.status) == 1 else -j.created))
 
@@ -93,9 +95,9 @@ def _set_video_status(building_id: str, video_id: str, **kw) -> None:
 
 def _enqueue(job: Job, fn, front: bool = False) -> Job:
     job.fn = fn
-    if front:
-        job.order = min([j.order for j in JOBS.values() if j.status in ("queued", "paused")] + [time.time()]) - 1
     with _cv:
+        if front:
+            job.order = min([j.order for j in JOBS.values() if j.status in ("queued", "paused")] + [time.time()]) - 1
         JOBS[job.id] = job
         _cv.notify_all()
     _ensure_worker()
@@ -154,7 +156,7 @@ def pause(job_id: str) -> Job:
         elif job.status == "running":
             job.pause_requested = True
             job.say("Pause requested: stopping at the next checkpoint")
-    if job.video_id and job.status == "paused":
+    if job.kind == "video" and job.status == "paused":
         _set_video_status(job.building_id, job.video_id, status="paused")
     return job
 
@@ -162,13 +164,14 @@ def pause(job_id: str) -> Job:
 def resume(job_id: str, front: bool = False) -> Job:
     job = JOBS[job_id]
     with _cv:
-        if job.status in ("paused", "error"):
+        resumed = job.status in ("paused", "error")
+        if resumed:
             job.status, job.stage, job.pct, job.error = "queued", "queued", 0.0, None
             job.say("Resumed")
         if front and job.status == "queued":
             job.order = min([j.order for j in JOBS.values() if j.status in ("queued", "paused")]) - 1
         _cv.notify_all()
-    if job.video_id:
+    if resumed and job.kind == "video":
         _set_video_status(job.building_id, job.video_id, status="queued")
     return job
 
@@ -176,7 +179,8 @@ def resume(job_id: str, front: bool = False) -> Job:
 def run_next(job_id: str) -> Job:
     """Move a job to the front; if something else is running, pause it so this one starts now."""
     job = resume(job_id, front=True)
-    running = next((j for j in JOBS.values() if j.status == "running" and j.id != job_id), None)
+    with _cv:
+        running = next((j for j in JOBS.values() if j.status == "running" and j.id != job_id), None)
     if running:
         pause(running.id)
         running.order = job.order + 0.5  # it resumes right after the prioritized job
@@ -194,29 +198,44 @@ def _run(job: Job) -> None:
     except JobPaused:
         job.pause_requested = False
         if job.cancelled:
-            job.status, job.stage = "cancelled", "cancelled"
-            job.say("Cancelled: video removed")
-            _purge_files(job.building_id, job.video_id)  # anything written after the delete
-            return
+            return _cancel(job)
         auto = getattr(job, "auto_resume", False)
         job.auto_resume = False
         job.status, job.stage, job.pct = ("queued" if auto else "paused"), "queued", 0.0
         job.say("Re-queued" if auto else "Paused")
-        if job.video_id:
+        if job.kind == "video":
             _set_video_status(job.building_id, job.video_id, status="queued" if auto else "paused")
     except Exception as exc:
+        if job.cancelled:  # e.g. its files were deleted under it: that's the delete, not a failure
+            return _cancel(job)
         job.status, job.error = "error", f"{type(exc).__name__}: {exc}"
         job.say(f"ERROR {job.error}")
         traceback.print_exc()
-        if job.video_id:
+        if job.kind == "video":
             _set_video_status(job.building_id, job.video_id, status="error")
+
+
+def _cancel(job: Job) -> None:
+    job.pause_requested = False
+    job.status, job.stage = "cancelled", "cancelled"
+    job.say("Cancelled: video removed")
+    _purge_files(job.building_id, job.video_id)  # anything written after the delete
+
+
+def _video_info(job: Job, bundle, video_id: str) -> VideoInfo:
+    """The walk's entry in the map; a walk deleted mid-run cancels a video job."""
+    v = next((v for v in bundle.videos if v.id == video_id), None)
+    if v is None:
+        job.cancelled = True
+        raise JobPaused()
+    return v
 
 
 def delete_video(building_id: str, video_id: str) -> dict:
     """Stop the video's job (if any) and remove the walk and all its data from the building."""
-    for j in JOBS.values():
-        if j.video_id == video_id and j.building_id == building_id:
-            with _cv:
+    with _cv:
+        for j in list(JOBS.values()):
+            if j.video_id == video_id and j.building_id == building_id:
                 j.cancelled = True
                 if j.status in ("queued", "paused"):
                     j.status, j.stage = "cancelled", "cancelled"
@@ -313,8 +332,8 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     job.enter("motion"); job.say("Estimating camera motion (optical flow" + (" + phone gyro)" if sensors else ")"))
     track = motion.compute_track(analysis_path, sensors, log=job.say)
     events = motion.detect_events(track)
-    store.write_json_atomic(vdir / "track.json", {**track, "events": events})
-    summary = ", ".join(f"{e['type']}@{e['start']:.1f}s" + (f" {e['delta']:+.0f}deg" if e["type"] == "turn" else "")
+    store.write_json_atomic(vdir / "track.json", {**track, "events": events}, mkdir=False)
+    summary =", ".join(f"{e['type']}@{e['start']:.1f}s" + (f" {e['delta']:+.0f}deg" if e["type"] == "turn" else "")
                         for e in events if e["type"] != "dwell")
     job.say(f"Motion events: {summary or 'none'}")
 
@@ -325,18 +344,18 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     store.write_json_atomic(vdir / "walk.json", {
         "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
         "events": events, "gemma": use_gemma,
-    })
+    }, mkdir=False)
 
     job.enter("mapping"); job.say("Building graph and closing loops")
     with store.lock_for(bid):
         bundle = store.load_map(bid)
-        info = next(v for v in bundle.videos if v.id == vid)
+        info = _video_info(job, bundle, vid)
         result = mapper.integrate_walk(bundle, vid, keyframes, track, store.frames_dir(bid),
                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
                                        start_floor=info.start_floor)
         if use_gemma:
             bundle.processed_with = {"model": model or gemma.resolve_model(), "prompt": gemma.PROMPT_VERSION}
-        v = next(v for v in bundle.videos if v.id == vid)
+        v = _video_info(job, bundle, vid)
         v.duration, v.keyframes, v.status = round(duration, 1), len(keyframes), "done"
         v.floor_offset = result.get("floor_offset") or 0
         job.say("Linking with the rest of the building map")
@@ -348,43 +367,61 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
 
 
 def _rebuild(job: Job) -> None:
-    """Re-run motion/keyframes/mapping over every processed video (Gemma answers come from cache)."""
+    """Re-run motion/keyframes over every processed video (Gemma answers come from cache), then rebuild the
+    map from scratch in one locked step, so pausing mid-rebuild never leaves it half-built.
+
+    job.video_id stays None: the rebuild must never change a walk's status (or be cancelled by deleting one)."""
     bid = job.building_id
-    with store.lock_for(bid):
-        bundle = store.load_map(bid)
-        bundle.nodes, bundle.edges, bundle.suggested_merges = [], [], []
-        store.save_map(bundle)
     # only finished walks: queued/paused ones will be integrated when their own job runs
-    videos = [v for v in bundle.videos if v.status == "done" and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
+    videos = [v for v in store.load_map(bid).videos
+              if v.status == "done" and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
+    walks = []
     for i, v in enumerate(videos):
         job.say(f"Reprocessing {v.filename} ({i + 1}/{len(videos)})")
         vdir = store.video_dir(bid, v.id)
-        sensors = store.read_json(vdir / "sensors.json")
-        job.video_id = v.id
-        job.enter("motion")
-        track = motion.compute_track(vdir / "analysis.mp4", sensors, log=job.say)
-        events = motion.detect_events(track)
-        store.write_json_atomic(vdir / "track.json", {**track, "events": events})
-        job.enter("keyframes")
-        keyframes = select_keyframes(vdir / "hq.mp4", track, events, v.duration or track["t"][-1], v.id,
-                                     store.frames_dir(bid), log=job.say)
-        use_gemma = _analyze(job, keyframes, None)
-        store.write_json_atomic(vdir / "walk.json", {
-            "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
-            "events": events, "gemma": use_gemma,
-        })
-        job.enter("mapping")
-        with store.lock_for(bid):
-            bundle = store.load_map(bid)
+        try:
+            sensors = store.read_json(vdir / "sensors.json")
+            job.enter("motion", i / len(videos))
+            track = motion.compute_track(vdir / "analysis.mp4", sensors, log=job.say)
+            events = motion.detect_events(track)
+            store.write_json_atomic(vdir / "track.json", {**track, "events": events}, mkdir=False)
+            job.enter("keyframes", i / len(videos))
+            keyframes = select_keyframes(vdir / "hq.mp4", track, events, v.duration or track["t"][-1], v.id,
+                                         store.frames_dir(bid), log=job.say)
+            use_gemma = _analyze(job, keyframes, None)
+            store.write_json_atomic(vdir / "walk.json", {
+                "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
+                "events": events, "gemma": use_gemma,
+            }, mkdir=False)
+        except JobPaused:
+            raise
+        except Exception:
+            if vdir.exists():
+                raise
+            job.say(f"{v.filename} was deleted, skipping it")
+            _purge_files(bid, v.id)  # keyframes written after the delete
+            continue
+        walks.append((v, keyframes, track, use_gemma))
+
+    job.enter("mapping")
+    with store.lock_for(bid):
+        bundle = store.load_map(bid)
+        bundle.nodes, bundle.edges, bundle.suggested_merges = [], [], []
+        for v, keyframes, track, use_gemma in walks:
+            info = next((x for x in bundle.videos if x.id == v.id), None)
+            if info is None:  # deleted while it was being re-analyzed
+                job.say(f"{v.filename} was deleted, skipping it")
+                _purge_files(bid, v.id)
+                continue
             res = mapper.integrate_walk(bundle, v.id, keyframes, track, store.frames_dir(bid),
                                         gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
-                                        start_floor=v.start_floor)
-            info = next(x for x in bundle.videos if x.id == v.id)
+                                        start_floor=info.start_floor)
             info.floor_offset = res.get("floor_offset") or 0
-            store.save_map(bundle)
-        job.say(f"{v.filename}: {res}")
-    job.video_id = None
-    _consolidate(job)
+            job.say(f"{v.filename}: {res}")
+        job.say("Linking all walks into one building map")
+        job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
+                                        _gemma_ok(), log=job.say)
+        store.save_map(bundle)
 
 
 def submit_consolidate(building_id: str) -> Job:

@@ -51,8 +51,10 @@ def frame_url(building_id: str, frame_id: str | None) -> str | None:
     return f"/bfiles/{building_id}/frames/{frame_id}" if frame_id else None
 
 
-def write_json_atomic(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_json_atomic(path: Path, data, mkdir: bool = True) -> None:
+    """mkdir=False: fail (FileNotFoundError) if the directory is gone, e.g. a video deleted mid-processing."""
+    if mkdir:
+        path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
