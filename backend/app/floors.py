@@ -234,13 +234,29 @@ def _adopt_floor(bundle: MapBundle, guessed: Node, sure: Node, log) -> None:
         log(f"Walk {guessed.video_id} placed on floor {sure.floor} via '{sure.label}' ({moved} places moved)")
 
 
+_STAIR_WORD = re.compile(r"\bSTAIR(S|WAYS?|WELLS?|CASES?)?\b")  # not UPSTAIRS / DOWNSTAIRS (a lounge, a cafe)
+_ABOUT_A_SIGN = re.compile(r"\b(POSTERS?|SIGNS?|SIGNAGE|NOTICES?|BANNERS?|FLYERS?|ARROWS?|DIRECTORY|MAP)\b")
+
+
 def _is_vertical(n: Node) -> str | None:
-    """Stairs/elevator from what the place IS (type, label), never from text read nearby: posters
-    like 'take the stairs, not the elevator' hang in ordinary hallways."""
+    """Stairs/elevator from what the place IS, never from text read nearby: posters like 'take the stairs,
+    not the elevator' hang in ordinary hallways.
+
+    In order: what the walk did here (`vertical`: climbed a flight / faced the stairs, even if Gemma called
+    it a hallway), the place type, then the label, unless the label is about a sign or poster
+    ('Take the stairs poster', 'Elevator sign')."""
+    if n.vertical:
+        return n.vertical
+    if n.type in ("elevator", "stairs"):
+        return n.type
+    if n.type in ("room", "restroom", "exit"):
+        return None
     label = n.label.upper()
-    if n.type == "elevator" or (n.type not in ("room", "restroom", "exit") and "ELEVATOR" in label):
+    if _ABOUT_A_SIGN.search(label):
+        return None
+    if "ELEVATOR" in label:
         return "elevator"
-    if n.type == "stairs" or (n.type not in ("room", "restroom", "exit") and "STAIR" in label):
+    if _STAIR_WORD.search(label):
         return "stairs"
     return None
 
@@ -261,25 +277,61 @@ def _connected(bundle: MapBundle, a: str, b: str) -> bool:
     return False
 
 
-def _link_floors(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log) -> int:
-    """Add stairs/elevator connections between adjacent floors that no single walk climbed."""
+SURE_LINK = 0.7  # evidence (same sign, Gemma "same stairwell") this strong makes a verified link
+VETO_LINK = 0.7  # Gemma "different stairwell" this sure blocks a link, including the only-staircase guess
+
+
+def _is_guess(e: Edge) -> bool:
+    """A link _link_floors added with no evidence (the only staircase on both floors)."""
+    return e.source == "merge" and e.inferred_floor_change and e.vertical in ("stairs_up", "elevator")
+
+
+def _reaches_floor(bundle: MapBundle, node_id: str, floor: int, floor_of: dict[str, int], ignore: set[str]) -> bool:
+    """Does this node already have a stairs/elevator edge to `floor` (a walk climbed it, or an earlier link)?"""
+    for e in bundle.edges:
+        if e.vertical == "none" or e.id in ignore or node_id not in (e.from_node, e.to_node):
+            continue
+        if floor_of.get(e.to_node if e.from_node == node_id else e.from_node) == floor:
+            return True
+    return False
+
+
+def _link_floors(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log) -> int:  # noqa: C901
+    """Add stairs/elevator connections between adjacent floors that no single walk climbed.
+
+    A stair node that already has a vertical edge to the other floor is left alone. Links this function
+    guessed earlier (no evidence, `inferred_floor_change`) are revisited each run, conservatively: kept as
+    they are by default, confirmed when the same pair gains evidence, dropped when Gemma is now sure they
+    are different stairwells, and replaced when a pair with real evidence claims one of their places.
+    Walk, manual and evidence-backed links are never changed. Returns the number of links added."""
     linked = 0
+    floor_of = {n.id: n.floor for n in bundle.nodes}
     by_kind: dict[tuple[str, int], list[Node]] = {}
     for n in bundle.nodes:
         if (kind := _is_vertical(n)):
             by_kind.setdefault((kind, n.floor), []).append(n)
     floors = sorted({f for _, f in by_kind})
+
+    def drop(e: Edge, why: str) -> None:
+        bundle.edges = [x for x in bundle.edges if x is not e]
+        log(f"Floor link removed: {e.from_node} <-> {e.to_node} ({why})")
+
     for kind in ("stairs", "elevator"):
         for f in floors:
             lower, upper = by_kind.get((kind, f), []), by_kind.get((kind, f + 1), [])
             if not lower or not upper:
                 continue
+            lo_ids, up_ids = {a.id for a in lower}, {b.id for b in upper}
+            guesses = {(e.from_node, e.to_node): e for e in bundle.edges
+                       if _is_guess(e) and e.from_node in lo_ids and e.to_node in up_ids}
+            revisit = {e.id for e in guesses.values()}
+            done_lo = {a.id for a in lower if _reaches_floor(bundle, a.id, f + 1, floor_of, revisit)}
+            done_up = {b.id for b in upper if _reaches_floor(bundle, b.id, f, floor_of, revisit)}
             pairs = []
             for a in lower:
                 for b in upper:
-                    if _connected(bundle, a.id, b.id) and any(
-                            e for e in bundle.edges if e.vertical != "none" and {e.from_node, e.to_node} & {a.id, b.id}):
-                        continue  # a walk already climbed between these
+                    if a.id in done_lo or b.id in done_up:
+                        continue  # already reaches that floor: a walk climbed here, or a sure link exists
                     score, why = 0.0, ""
                     ids_a, ids_b = text_tokens(a.texts), text_tokens(b.texts)
                     if ids_a & ids_b:
@@ -287,20 +339,39 @@ def _link_floors(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log) -
                     elif use_gemma and a.frame_id and b.frame_id:
                         try:
                             v = gemma.same_stairwell(frames / a.frame_id, frames / b.frame_id, cache)
-                            if v.same_place:
-                                score, why = v.confidence, f"Gemma: {v.reason}"
                         except gemma.GemmaUnavailable:
-                            use_gemma = False
-                    pairs.append((score, why, a, b))
-            pairs.sort(key=lambda p: -p[0])
+                            use_gemma, v = False, None
+                        if v is not None and v.same_place:
+                            score, why = v.confidence, f"Gemma: {v.reason}"
+                        elif v is not None and v.confidence >= VETO_LINK:
+                            if (old := guesses.pop((a.id, b.id), None)) is not None:
+                                drop(old, f"Gemma: different {kind}: {v.reason}")
+                            else:
+                                log(f"No floor link '{a.label}' (floor {f}) <-> '{b.label}' (floor {f + 1}): "
+                                    f"Gemma says different {kind} ({v.reason})")
+                            continue
+                    known = (a.floor_source != "default") + (b.floor_source != "default")
+                    pairs.append((score, known, why, a, b))
+            # Strongest evidence first; among equals, places whose floor is known rather than guessed.
+            pairs.sort(key=lambda p: (-p[0], -p[1]))
+            single = len(lower) == 1 and len(upper) == 1
             used: set[str] = set()
-            for score, why, a, b in pairs:
+            for score, _, why, a, b in pairs:
                 if a.id in used or b.id in used:
                     continue
-                inferred = score < 0.7
-                if inferred and not (len(lower) == 1 and len(upper) == 1):
+                sure = score >= SURE_LINK
+                if (old := guesses.pop((a.id, b.id), None)) is not None:
+                    used |= {a.id, b.id}  # guessed before: keep it, and confirm it if there is evidence now
+                    if sure:
+                        old.verified, old.inferred_floor_change = True, False
+                        log(f"Floor link confirmed: '{a.label}' (floor {f}) <-> '{b.label}' (floor {f + 1}) ({why})")
+                    continue
+                if not sure and not single:
                     continue  # ambiguous: several staircases and no evidence which one
-                _add_vertical_edge(bundle, a, b, kind, inferred)
+                if sure:  # real evidence beats an earlier guess that used either of these places
+                    for key in [k for k in guesses if a.id in k or b.id in k]:
+                        drop(guesses.pop(key), f"replaced by '{a.label}' <-> '{b.label}': {why}")
+                _add_vertical_edge(bundle, a, b, kind, not sure)
                 used |= {a.id, b.id}
                 linked += 1
                 log(f"Floor link: '{a.label}' (floor {f}) <-> '{b.label}' (floor {f + 1}) by {kind} "

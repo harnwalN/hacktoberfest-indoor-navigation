@@ -150,6 +150,7 @@ class WalkNode:
     depart_frame: str | None = None
     rel_floor: int = 0
     node_id: str | None = None  # map node this walk node became / merged into
+    vertical: str | None = None  # "stairs" / "elevator" access point (see _walk_vertical), whatever Gemma called it
     extra_texts: list[str] = field(default_factory=list)
 
     @property
@@ -202,17 +203,33 @@ def _worthy(kf: Keyframe) -> bool:
     return bool(a and (a.room_numbers or _key_place(a) or (a.place_type == "room" and _has_sign(a))))
 
 
+ROOM_LIKE = {"room", "restroom", "exit"}  # places with their own identity, never a stair landing
+
+
+def _walk_vertical(a: FrameAnalysis, boundary: bool) -> str | None:
+    """Stairs/elevator access point from what the walk shows, not from the place label: Gemma often calls the
+    top or bottom of a flight a "hallway". `boundary` = last frame before a climb or first frame after it.
+    Stairs merely seen ahead (ahead_up/ahead_down) do not count: the walker may never go near them, and a
+    flagged node on each of two floors would be enough for _link_floors to guess a floor link."""
+    if boundary or a.place_type == "stairs":
+        return "stairs"
+    if a.place_type == "elevator":
+        return "elevator"
+    return None
+
+
 def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
     kfs = sorted(keyframes, key=lambda k: k.t)
     states = [_stairs_state(k.analysis) for k in kfs]
     worthy = [_worthy(k) for k in kfs]
+    boundary = [False] * len(kfs)
     # Stair boundaries: last frame before climbing and first frame after.
     for i in range(1, len(kfs)):
         if states[i] != states[i - 1]:
             if states[i - 1] == "none":
-                worthy[i - 1] = True
+                worthy[i - 1] = boundary[i - 1] = True
             if states[i] == "none":
-                worthy[i] = True
+                worthy[i] = boundary[i] = True
 
     nodes: list[WalkNode] = []
     for i, k in enumerate(kfs):
@@ -222,7 +239,8 @@ def walk_nodes(keyframes: list[Keyframe]) -> list[WalkNode]:
             continue  # never put a node in the middle of a staircase
         a = k.analysis or FrameAnalysis()
         wn = WalkNode(kf=k, t_arrive=k.t_arrive if k.t_arrive is not None else k.t,
-                      t_depart=k.t_depart if k.t_depart is not None else k.t, analysis=a)
+                      t_depart=k.t_depart if k.t_depart is not None else k.t, analysis=a,
+                      vertical=_walk_vertical(a, boundary[i]))
         prev = nodes[-1] if nodes else None
         if prev and not _crosses_stairs(kfs, states, prev, wn) and not _keep_apart(prev, wn) and (
                 wn.t_arrive - prev.t_depart < config.NODE_MIN_GAP_SEC
@@ -249,7 +267,11 @@ def _norm_label(s: str) -> str:
 def _keep_apart(a: WalkNode, b: WalkNode) -> bool:
     """Keep the walk's start/end separate from an adjacent turn, so that turn stays routable."""
     kinds = {a.kf.kind, b.kf.kind}
-    return bool(kinds & {"start", "end"}) and "turn_start" in kinds
+    if kinds & {"start", "end"} and "turn_start" in kinds:
+        return True
+    # A stair landing and the door beside it are two places: one node would either be a "room" that is
+    # stairs (and then never merges with the same room seen on another walk) or lose the stairs.
+    return bool(a.vertical) != bool(b.vertical) and bool({a.analysis.place_type, b.analysis.place_type} & ROOM_LIKE)
 
 
 def _same_spot(a: WalkNode, b: WalkNode) -> bool:
@@ -283,12 +305,18 @@ def _absorb(keep: WalkNode, other: WalkNode) -> None:
     else:
         keep.extra_texts += other.texts
     keep.t_arrive, keep.t_depart = min(keep.t_arrive, other.t_arrive), max(keep.t_depart, other.t_depart)
+    keep.vertical = keep.vertical or other.vertical  # stair-ness survives even when the other frame's analysis wins
 
 
 # ---------------------------------------------------------------- labels
 def _label(wn: WalkNode) -> tuple[str, str]:
     a = wn.analysis
     ptype = a.place_type
+    if wn.vertical and ptype in ("hallway", "intersection"):
+        ptype = wn.vertical  # the walk climbed here: it is the stairwell, not a corridor
+        word = "STAIR" if wn.vertical == "stairs" else "ELEVATOR"
+        if not _has_sign(a) and word not in a.suggested_label.upper():
+            return ("Stairs" if wn.vertical == "stairs" else "Elevator"), ptype
     if wn.kf.kind == "turn_start" and ptype == "hallway":
         ptype = "intersection"
     if a.suggested_label and (_has_sign(a) or ptype != "hallway"):
@@ -415,6 +443,8 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             wn.node_id = node.id
             merged += 1
             node.texts = list(dict.fromkeys(node.texts + wn.texts))
+            if wn.vertical and not node.vertical and node.type not in ROOM_LIKE:
+                node.vertical = wn.vertical  # this walk climbed here: the known place is a stair landing
             if node.soft and not wn.kf.soft:
                 node.frame_id, node.soft = wn.kf.frame_id, False
                 node.frame_heading = None  # re-set below once headings are corrected
@@ -434,7 +464,7 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             node = Node(
                 id=f"n{node_counter:03d}", label=label, type=ptype, frame_id=wn.kf.frame_id,
                 texts=wn.texts, sign_texts=wayfinding_texts(wn.analysis), description=wn.analysis.description,
-                soft=wn.kf.soft,
+                soft=wn.kf.soft, vertical=wn.vertical,
                 video_id=video_id, t=wn.kf.t,
                 verified=bool(wn.analysis.room_numbers) or _key_place(wn.analysis)
                 or (ptype == "room" and _has_sign(wn.analysis)),
@@ -662,6 +692,7 @@ def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str) -> None:
     keep = next(n for n in bundle.nodes if n.id == keep_id)
     remove = next(n for n in bundle.nodes if n.id == remove_id)
     keep.texts = list(dict.fromkeys(keep.texts + remove.texts))
+    keep.vertical = keep.vertical or remove.vertical
     if keep.soft and not remove.soft and remove.frame_id:
         keep.frame_id, keep.frame_heading, keep.soft = remove.frame_id, remove.frame_heading, False
     for e in bundle.edges:

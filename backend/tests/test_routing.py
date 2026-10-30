@@ -102,3 +102,26 @@ def test_positions_are_metric():
     p = {n.id: (n.x, n.y) for n in m.nodes}
     dist = lambda a, b: ((p[a][0] - p[b][0]) ** 2 + (p[a][1] - p[b][1]) ** 2) ** 0.5
     assert abs(dist("A", "B") - 10) < 0.5 and abs(dist("B", "C") - 20) < 0.5 and abs(dist("A", "C") - 22.4) < 0.5
+
+
+def test_cross_floor_route_through_linked_stairs():
+    """Two walks (floor 1: A -> S, floor 2: T -> U) joined only by a floor link S <-> T."""
+    nodes = [Node(id="A", label="Room 121", frame_id="A.jpg", texts=["121"], floor=1),
+             Node(id="S", label="Stairs", type="stairs", vertical="stairs", frame_id="S.jpg", floor=1),
+             Node(id="T", label="Stairs (2)", type="stairs", vertical="stairs", frame_id="T.jpg", floor=2),
+             Node(id="U", label="Room 208", frame_id="U.jpg", texts=["208"], floor=2)]
+    link = Edge(id="e3", from_node="S", to_node="T", heading_out=0, heading_in=0, vertical="stairs_up",
+                frames_fwd=["S.jpg", "T.jpg"], frames_rev=["T.jpg", "S.jpg"], source="merge")
+    b = MapBundle(building_id="test", nodes=nodes, edges=[_edge(1, "A", "S", 90), link, _edge(2, "T", "U", 270)])
+
+    up = routing.route(b, "A", "U")
+    assert up.node_path == ["A", "S", "T", "U"]
+    assert [s.floor for s in up.steps] == [1, 1, 2, 2]
+    assert up.steps[1].action == "stairs_up"  # across a link there is no measured turn: go straight up
+    assert up.steps[1].instruction_text == "At Stairs, take the stairs up to floor 2."
+    assert up.steps[2].instruction_text == ("At the top of the stairs (Stairs (2), floor 2), "
+                                           "head toward Room 208 as shown in the photo.")
+    down = routing.route(b, "U", "A")
+    assert down.steps[1].action == "stairs_down"
+    assert down.steps[1].instruction_text == "At Stairs (2), take the stairs down to floor 1."
+    assert down.steps[2].instruction_text.startswith("At the bottom of the stairs (Stairs, floor 1)")

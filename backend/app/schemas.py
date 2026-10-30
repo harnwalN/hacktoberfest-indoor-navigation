@@ -76,6 +76,9 @@ class Node(BaseModel):
     description: str = ""
     floor: int = 1
     floor_source: Literal["user", "rooms", "linked", "default"] = "default"  # how sure we are of `floor`
+    # Stairs/elevator access point, from what the walker did here (climbed a flight, rode the elevator),
+    # even when the photo looks like a plain hallway. None = unknown (also every pre-existing map.json).
+    vertical: Literal["stairs", "elevator"] | None = None
     verified: bool = False
     soft: bool = False
     video_id: str | None = None
