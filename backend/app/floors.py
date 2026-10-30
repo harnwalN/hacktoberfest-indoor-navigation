@@ -291,19 +291,33 @@ def _adopt_floor(bundle: MapBundle, guessed: Node, sure: Node, log) -> None:
     """A walk whose floor was only a guess learns its floor from a place it shares with a known walk."""
     if guessed.floor_source != "default" or sure.floor_source == "default" or not guessed.video_id:
         return
-    delta = sure.floor - guessed.floor
+    _shift_guessed_walk(bundle, guessed.video_id, sure.floor - guessed.floor, f"'{sure.label}'", log)
+
+
+def _shift_guessed_walk(bundle: MapBundle, video_id: str, delta: int, via: str, log) -> int:
+    """Move every still-guessed ('default') place of one walk by `delta` floors and mark it 'linked'."""
     moved = 0
     for n in bundle.nodes:
-        if n.video_id == guessed.video_id and n.floor_source == "default":
+        if n.video_id == video_id and n.floor_source == "default":
             n.floor += delta
             n.floor_source = "linked"
             moved += 1
     if delta and moved:  # keep the walk's recorded offset in step with its places (PATCH start floor uses it)
         for v in bundle.videos:
-            if v.id == guessed.video_id:
+            if v.id == video_id:
                 v.floor_offset += delta
     if delta:
-        log(f"Walk {guessed.video_id} placed on floor {sure.floor} via '{sure.label}' ({moved} places moved)")
+        log(f"Walk {video_id} moved {delta:+d} floor(s) via {via} ({moved} places moved)")
+    return moved
+
+
+def _merge_floor_conflict(a: Node, b: Node) -> str | None:
+    """Why two places cannot be one (both floors known and different), else None. A guessed ('default')
+    floor never blocks a merge: the guessed place takes the known floor."""
+    if a.floor_source != "default" and b.floor_source != "default" and a.floor != b.floor:
+        return (f"'{a.label}' is on floor {a.floor} and '{b.label}' is on floor {b.floor}: places on different "
+                "floors cannot be merged (link them with stairs or an elevator, or fix a walk's start floor first)")
+    return None
 
 
 _STAIR_WORD = re.compile(r"\bSTAIR(S|WAYS?|WELLS?|CASES?)?\b")  # not UPSTAIRS / DOWNSTAIRS (a lounge, a cafe)

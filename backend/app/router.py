@@ -117,7 +117,7 @@ def resolve_merge(building_id: str, merge_id: str, body: MergeDecision):
         if s is None:
             raise HTTPException(404, "Unknown merge suggestion")
         if body.accept:
-            mapper.merge_nodes(bundle, s.keep, s.remove)
+            _merge_or_400(bundle, s.keep, s.remove)
         else:
             bundle.suggested_merges = [x for x in bundle.suggested_merges if x.id != merge_id]
         store.save_map(bundle)
@@ -131,9 +131,17 @@ def manual_merge(building_id: str, body: ManualMerge):
         ids = {n.id for n in bundle.nodes}
         if body.keep not in ids or body.remove not in ids or body.keep == body.remove:
             raise HTTPException(400, "Pick two different existing nodes")
-        mapper.merge_nodes(bundle, body.keep, body.remove)
+        _merge_or_400(bundle, body.keep, body.remove)
         store.save_map(bundle)
     return bundle
+
+
+def _merge_or_400(bundle: MapBundle, keep: str, remove: str) -> None:
+    """merge_nodes refuses (before changing anything) to merge places on two different known floors."""
+    try:
+        mapper.merge_nodes(bundle, keep, remove)
+    except ValueError as exc:
+        raise HTTPException(400, f"Cannot merge: {exc}")
 
 
 # ---------- processing ----------

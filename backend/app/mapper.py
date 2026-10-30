@@ -23,7 +23,8 @@ import numpy as np
 from . import config, gemma
 from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep working)
     _RANK, _add_vertical_edge, _adopt_floor, _connected, _floor_rank, _floors_compatible, _is_vertical,
-    _link_floors, assign_floors, room_floor, set_walk_floor, stair_rel_floors, stair_states,
+    _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, room_floor, set_walk_floor,
+    stair_rel_floors, stair_states,
 )
 from .matching import _next_id, text_tokens
 from .motion import focal_px, median_heading
@@ -431,6 +432,11 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     has_rooms = any(room_floor(wn.texts) is not None for wn in wnodes)
     known_source = "user" if start_floor is not None else ("rooms" if has_rooms else None)
     inherit: int | None = None
+    # While this walk's floor is unknown, a look-alike place on a known floor (identical elevator lobbies on
+    # every floor) is not trusted alone: it votes for a floor offset and waits. Two agreeing votes (different
+    # places on the same floor) set the walk's floor; a room-number/sign match sets it at once.
+    votes: dict[int, set[str]] = {}  # floor offset -> known places that voted for it
+    tentative: list[tuple[Match, WalkNode, int]] = []  # held matches (match, walk node, offset)
     created: list[tuple[Node, WalkNode]] = []
     merged = 0
     recent: list[str] = []
@@ -438,6 +444,17 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
     for i, wn in enumerate(wnodes):
         w_floor = floors[i] if floors[i] is not None else (wn.rel_floor + inherit if inherit is not None else None)
         match = _find_match(wn, bundle, frames, cache, use_gemma, set(recent[-2:]), walk_times, log, w_floor)
+        if (match and match.auto and w_floor is None and match.node.floor_source != "default"
+                and not match.signals.get("text")):
+            off = match.node.floor - wn.rel_floor
+            votes.setdefault(off, set()).add(match.node.id)
+            if len(votes[off]) >= 2 and all(len(votes[off]) > len(v) for o, v in votes.items() if o != off):
+                inherit = off  # second agreeing place: now the floors are known and equal, merge below
+                log(f"Walk floor from {len(votes[off])} matching places on floor {match.node.floor}")
+            else:
+                match.auto = False  # held: a suggestion unless a second place confirms the floor
+                match.signals["note"] = "walk floor unknown: one look-alike place does not decide it"
+                tentative.append((match, wn, off))
         if match and match.auto:
             node = match.node
             wn.node_id = node.id
@@ -474,9 +491,23 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
             created.append((node, wn))
             wn.node_id = node.id
             walk_times[node.id] = wn.kf.t
-            if match:
+            if match and not any(m is match for m, *_ in tentative):
                 pending_suggestions.append((match, wn))
         recent.append(wn.node_id)
+
+    # Held matches: merged after all if a later match settled the walk on their floor, else left for review.
+    promote: list[tuple[Match, WalkNode]] = []
+    for match, wn, off in tentative:
+        if inherit is None:
+            pending_suggestions.append((match, wn))
+        elif off == inherit:
+            promote.append((match, wn))
+            node = match.node
+            if match.rel_yaw is not None and node.frame_heading is not None:
+                abs_c.append((wn.kf.t, wrap180(wn.kf.heading - (node.frame_heading + match.rel_yaw))))
+        else:
+            log(f"Not merging walk t={wn.kf.t:.1f}s with '{match.node.label}': that place is on floor "
+                f"{match.node.floor}, this walk is on floor {wn.rel_floor + inherit}")
 
     # --- drift / alignment ---
     c0, k = _fit_correction(abs_c, rel_c)
@@ -561,11 +592,25 @@ def integrate_walk(bundle: MapBundle, video_id: str, keyframes: list[Keyframe], 
         edge_counter += 1
         new_edges += 1
 
+    promoted = 0
+    for match, wn in promote:  # held matches the walk's floor now confirms
+        mine = next((n for n in bundle.nodes if n.id == wn.node_id), None)
+        if mine is None or not any(n.id == match.node.id for n in bundle.nodes) or mine.id == match.node.id:
+            continue
+        if match.node.type in ROOM_LIKE:
+            mine.vertical = None  # a room is never a stair landing (same rule as a direct match)
+        log(f"Loop closure: walk t={wn.kf.t:.1f}s is '{match.node.label}' ({match.reason}; floor confirmed)")
+        merge_nodes(bundle, match.node.id, mine.id, log=log)
+        wn.node_id = match.node.id
+        merged += 1
+        promoted += 1
+
     info = next((v for v in bundle.videos if v.id == video_id), None)
     if info is not None:
         info.anchored = first_walk or bool(abs_c)
     finalize(bundle)
-    return {"nodes": len(created), "merged": merged, "edges": new_edges, "floor_offset": floors[0] - wnodes[0].rel_floor,
+    return {"nodes": len(created) - promoted, "merged": merged, "edges": new_edges,
+            "floor_offset": floors[0] - wnodes[0].rel_floor,
             "floors": sorted(set(floors)),
             "suggested": len(pending_suggestions), "drift_deg_per_min": round(k * 60, 1)}
 
@@ -688,9 +733,20 @@ def _dedupe_labels(bundle: MapBundle) -> None:
         n.label = base if seen[base] == 1 else f"{base} ({seen[base]})"
 
 
-def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str) -> None:
+def merge_nodes(bundle: MapBundle, keep_id: str, remove_id: str, log=print) -> None:
+    """Make two places one. Raises ValueError (before changing anything) when both floors are known and
+    differ: that would join two floors' corridors on the flat. A guessed ('default') floor takes the known
+    one, together with the rest of its walk's guessed places."""
     keep = next(n for n in bundle.nodes if n.id == keep_id)
     remove = next(n for n in bundle.nodes if n.id == remove_id)
+    if (why := _merge_floor_conflict(keep, remove)):
+        raise ValueError(why)
+    if (keep.floor_source == "default") != (remove.floor_source == "default"):
+        guessed, sure = (keep, remove) if keep.floor_source == "default" else (remove, keep)
+        if guessed.video_id:
+            _adopt_floor(bundle, guessed, sure, log)
+        if guessed.floor_source == "default":  # a place no walk owns (added by hand)
+            guessed.floor, guessed.floor_source = sure.floor, "linked"
     keep.texts = list(dict.fromkeys(keep.texts + remove.texts))
     keep.vertical = keep.vertical or remove.vertical
     if keep.soft and not remove.soft and remove.frame_id:
@@ -877,20 +933,81 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
     2. appearance: strong ORB geometry, or ORB + Gemma 'same place', between walks on the same floor;
     3. heading alignment for walks that joined the map without a geometric anchor.
     Floors are never mixed: similar corridors on different floors stay separate.
+
+    A walk whose floor is only a guess ('default') is placed by vote, after each pass has seen every pair
+    (so the result does not depend on node order): a room number or named sign it shares with a known
+    place counts 2, a look-alike (appearance only) counts 1. The floor with weight >= 2 and more than any
+    other wins; the walk moves there and only the matches on that floor merge. A tie or a lone look-alike
+    moves nothing: those matches become suggestions for review.
     """
     merged, suggested = 0, 0
     existing_pairs = {frozenset((s.keep, s.remove)) for s in bundle.suggested_merges}
+    deferred: list[tuple] = []  # merges that would place a guessed walk: (a, b, why, conf, signals, video, delta, w)
+    merged_into: dict[str, str] = {}
 
     def alive(nid):
         return any(n.id == nid for n in bundle.nodes)
 
-    def merge(a: Node, b: Node, why: str) -> None:
+    def suggest(keep_id: str, remove_id: str, confidence: float, reason: str, signals: dict) -> None:
+        nonlocal suggested
+        if frozenset((keep_id, remove_id)) in existing_pairs:
+            return
+        bundle.suggested_merges.append(SuggestedMerge(
+            id=f"m{_next_id('m', [x.id for x in bundle.suggested_merges]):03d}", keep=keep_id, remove=remove_id,
+            confidence=confidence, reason=reason, signals=signals,
+        ))
+        existing_pairs.add(frozenset((keep_id, remove_id)))
+        suggested += 1
+
+    def do_merge(a: Node, b: Node, why: str) -> None:
         nonlocal merged
         keep, drop = (a, b) if _floor_rank(a) <= _floor_rank(b) else (b, a)
-        _adopt_floor(bundle, drop, keep, log)
         log(f"{why}: merging '{drop.label}' into '{keep.label}' (floor {keep.floor})")
-        merge_nodes(bundle, keep.id, drop.id)
+        merge_nodes(bundle, keep.id, drop.id, log=log)
+        merged_into[drop.id] = keep.id
         merged += 1
+
+    def merge(a: Node, b: Node, why: str, confidence: float, signals: dict, strong: bool) -> None:
+        guessed = [n for n in (a, b) if n.floor_source == "default"]
+        if len(guessed) == 1 and guessed[0].video_id:  # would place a guessed walk: vote, decide later
+            g = guessed[0]
+            sure = b if g is a else a
+            deferred.append((sure.id, g.id, why, confidence, signals, g.video_id, sure.floor - g.floor,
+                             2.0 if strong else 1.0))
+            return
+        do_merge(a, b, why)
+
+    def current(nid: str) -> Node | None:
+        while nid in merged_into:
+            nid = merged_into[nid]
+        return next((n for n in bundle.nodes if n.id == nid), None)
+
+    def settle() -> None:
+        """Place guessed walks by vote, then apply (or suggest) the merges that were waiting on it."""
+        totals: dict[str, dict[int, float]] = {}
+        for *_, vid, delta, w in deferred:
+            totals.setdefault(vid, {}).setdefault(delta, 0.0)
+            totals[vid][delta] += w
+        for vid in sorted(totals):
+            best = max(totals[vid].values())
+            winners = [d for d, w in totals[vid].items() if w == best]
+            if best >= 2.0 and len(winners) == 1:
+                _shift_guessed_walk(bundle, vid, winners[0], f"{best:g} vote(s) from matching places", log)
+            else:
+                log(f"Walk {vid}: floor evidence from matching places is "
+                    f"{'too weak' if best < 2.0 else 'split'} ({totals[vid]}); left for review")
+        for sure_id, g_id, why, confidence, signals, *_ in deferred:
+            sure, g = current(sure_id), current(g_id)
+            if sure is None or g is None or sure.id == g.id:
+                continue
+            if _merge_floor_conflict(sure, g):
+                log(f"Not merging '{g.label}' into '{sure.label}' ({why}): floor {g.floor} won the vote, "
+                    f"not floor {sure.floor}")
+            elif (g.floor_source == "default") != (sure.floor_source == "default"):
+                suggest(sure.id, g.id, confidence, f"{why} (floor not settled)", signals)
+            else:
+                do_merge(sure, g, why)
+        deferred.clear()
 
     # 1. identity from several independent descriptors (sign words weighted by rarity, appearance,
     #    Gemma's description, surroundings). A word alone never decides: posters and directional signs
@@ -907,14 +1024,15 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
             ra, rb = _room_ids(a), _room_ids(b)
             if ra and rb:
                 if ra & rb and len(ra) <= 2 and len(rb) <= 2:
-                    merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}")
+                    merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}", 1.0,
+                          {"rooms": sorted(ra & rb)}, strong=True)
                 continue  # different room numbers: different places
             sim = place_similarity(descs[a.id], descs[b.id], frames, weights)
             if sim["score"] < 0.35 or not sim["agree"]:
                 continue
             why = f"{', '.join(sim['agree'])} agree (score {sim['score']})"
             if sim["score"] >= 0.5 and len(sim["agree"]) >= 2:
-                merge(a, b, f"Same place: {why}")
+                merge(a, b, f"Same place: {why}", sim["score"], sim, strong="name" in sim["agree"])
                 continue
             verdict = None
             if use_gemma and a.frame_id and b.frame_id:
@@ -924,7 +1042,8 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                     use_gemma = False
             # Gemma's visual judgement is an independent descriptor of its own
             if verdict and verdict.same_place and verdict.confidence >= 0.8 and len(sim["agree"]) >= 1:
-                merge(a, b, f"Same place: {why}; Gemma: {verdict.reason[:120]}")
+                merge(a, b, f"Same place: {why}; Gemma: {verdict.reason[:120]}", sim["score"],
+                      sim | {"gemma": verdict.model_dump()}, strong="name" in sim["agree"])
             elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place):
                 bundle.suggested_merges.append(SuggestedMerge(
                     id=f"m{_next_id('m', [x.id for x in bundle.suggested_merges]):03d}", keep=a.id, remove=b.id,
@@ -933,6 +1052,7 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                 ))
                 existing_pairs.add(frozenset((a.id, b.id)))
                 suggested += 1
+    settle()
 
     # 2. appearance across walks
     nodes = list(bundle.nodes)
@@ -953,7 +1073,9 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
             strong = inliers >= 1.5 * config.ORB_STRONG_INLIERS
             if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE):
                 why = f"{inliers} matching features" + (f"; Gemma: {verdict.reason}" if verdict else "")
-                merge(a, b, f"Same place across walks ({why})")
+                merge(a, b, f"Same place across walks ({why})",
+                      round(verdict.confidence if verdict else min(1.0, inliers / (2 * config.ORB_STRONG_INLIERS)), 2),
+                      {"orb_inliers": inliers, **({"gemma": verdict.model_dump()} if verdict else {})}, strong=False)
             elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place
                                                                         and verdict.confidence >= 0.7):
                 bundle.suggested_merges.append(SuggestedMerge(
@@ -964,6 +1086,7 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                 ))
                 existing_pairs.add(frozenset((a.id, b.id)))
                 suggested += 1
+    settle()
 
     # 3. align walks that joined without a geometric anchor
     aligned = 0
