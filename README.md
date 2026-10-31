@@ -92,8 +92,10 @@ record new walks at `#/record?b=<building-id>`, or share a route directly with
 cd backend
 uv run python -m app.cli ingest "Sample Building" ../IMG_31*.MOV
 uv run python -m app.cli route sample-building n001 n012
+uv run python -m app.cli route sample-building n001 n012 --avoid-stairs   # only flat walks, ramps and elevators
 uv run python -m app.cli rebuild sample-building   # re-run CV + mapping; Gemma answers come from cache (each walk's own model)
 # add --model gemma3:12b to ingest for a slower, higher-quality run
+# add --model gemini-2.5-flash-lite to ingest for the hosted Gemini model (frames leave the machine and cost money; see Hosted vision)
 ```
 
 ### Tests
@@ -247,6 +249,15 @@ Every setting has a default and can be overridden with an environment variable, 
 | `GEMMA_NUM_PREDICT_COMPARE` | 320 | Answer token cap for "same place?" and "same stairwell?" |
 | `GEMMA_LIST_TIMEOUT_SEC` | 3 | Timeout for model list, model check and health calls, so a stopped Ollama fails fast |
 | `GEMMA_BREAKER_FAILS` | 3 | Failures in a row before the rest of the walk uses cached answers only |
+| `VISION_PROVIDER` | auto | Model for new walks: `auto`, `gemma` (local only) or `hosted` (Gemini only). See *Hosted vision* |
+| `GEMINI_API_KEY` | unset | Key for the hosted Gemini model. Set it in the environment only, never in a file. Unset: no hosted calls |
+| `HOSTED_MODEL` | gemini-2.5-flash-lite | Gemini model for hosted walks. The name must start with `gemini` |
+| `HOSTED_MAX_CALLS_PER_DAY` | 5000 | Cost guard: most Gemini requests per server per UTC day. Past it, cached answers only until the next UTC day |
+| `HOSTED_TIMEOUT_SEC` | 60 | Timeout for one Gemini request |
+| `HOSTED_CHECK_TIMEOUT_SEC` | 5 | Timeout for the reachability check of the hosted model |
+| `HOSTED_CHECK_TTL_SEC` | 300 | How long a reachability result is reused |
+| `HOSTED_RETRY_MAX_SEC` | 10 | Longest server `Retry-After` wait before the one retry. Longer waits mean no retry |
+| `HOSTED_CONCURRENCY` | 4 | Frames sent at once for a hosted walk |
 | `MAX_FLOOR` | 9 | Highest floor number. `start_floor` must be 1 to this value |
 | `FLOOR_SIGNS` | 1 | Set to `0` to ignore floor signs and Gemma's floor hints |
 | `FLOOR_SIGN_WEIGHT` | 2.0 | Evidence weight of one OCR-confirmed floor sign. A room number weighs 1, and a floor needs 2 |
@@ -254,6 +265,22 @@ Every setting has a default and can be overridden with an environment variable, 
 | `STAIR_LANDING_MAX_S` | 15.0 | Longer gap (seconds) allowed only when every frame between is a stairwell. **Untuned guess: tune on real walks** |
 
 Set both `STAIR_LANDING_*` values to `0` to count every flight as a floor change.
+
+**Hosted vision (optional).** Google Gemini can read walk frames in place of local Gemma.
+
+- **Privacy and cost.** Hosted walk photos leave your machine and are sent to Google. Each call costs money. Use it
+  only if you accept both.
+- **`auto` (the default).** A new walk uses `HOSTED_MODEL` when `GEMINI_API_KEY` is set, the API answers, and today's
+  calls are under `HOSTED_MAX_CALLS_PER_DAY`. Otherwise the walk uses local Gemma, as before. Each walk picks its
+  model once.
+- **`gemma`.** Local only. The hosted API is never called.
+- **`hosted`.** Always Gemini. Fails if `GEMINI_API_KEY` is missing.
+- **An explicit model wins.** An upload's `model` field, or `--model gemini-...` on the CLI, selects that model.
+- **Key.** Pass `GEMINI_API_KEY` in the environment, for example `GEMINI_API_KEY=... uv run uvicorn app.main:app`. The
+  key is never logged and never shown by `/api/health`.
+- **Retries.** One retry after a network error, HTTP 429, a 5xx or an unreadable answer. The retry waits the server's
+  `Retry-After` (1 s if none). A longer wait than `HOSTED_RETRY_MAX_SEC` is not waited for. Other 4xx errors do not retry.
+- **Call count.** Calls per UTC day are kept in `backend/data/hosted_usage.json`, shared by all walks on the server.
 
 **Gemma calls and failures**
 - Every call uses temperature 0 and the `GEMMA_NUM_*` limits and `GEMMA_KEEP_ALIVE` above.
@@ -281,6 +308,10 @@ Set both `STAIR_LANDING_*` values to `0` to count every flight as a floor change
   values get HTTP 422.
 - `PUT /api/buildings/<id>/map` takes only `nodes` and `edges`, and both are required (a body missing either gets
   422). Videos, processing status and suggested merges come from the server.
+- Merging two places on different known floors, by hand or by accepting a suggestion, returns HTTP 400.
+- `POST /api/buildings/<id>/route` takes an optional `avoid_stairs` boolean (default `false`). `true` uses only flat
+  walks, ramps and elevators. If the only way climbs stairs, the API returns HTTP 400. Every answer has `step_free`,
+  which is `true` when the route uses no stairs.
 - Merging two places on different known floors, by hand or by accepting a suggestion, returns HTTP 400.
 
 ## How it works
