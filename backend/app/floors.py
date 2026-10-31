@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING
 
 from . import config, gemma
 from .matching import _next_id, text_tokens
-from .schemas import Edge, MapBundle, Node
+from .schemas import Edge, FrameAnalysis, MapBundle, Node
 
 if TYPE_CHECKING:  # annotation only; a runtime import would be circular
     from .mapper import WalkNode
-    from .schemas import FrameAnalysis, Keyframe
+    from .schemas import Keyframe
 
 _log = logging.getLogger(__name__)
 _HYPHENATED = re.compile(r"[A-Z0-9]*\d\s*[-–]\s*\d[A-Z0-9]*")  # 2-105, 858-534-1234: not a plain room number
@@ -182,6 +182,96 @@ def stair_states(kfs: list[Keyframe]) -> list[str]:
     return out
 
 
+_STAIRS_HINT = {"ahead_up", "ahead_down", "on_stairs_up", "on_stairs_down"}
+_DOOR = {"room", "restroom", "exit", "elevator"}  # a frame at a door is on a floor, never mid-flight
+
+
+def _stairs_hint(a: FrameAnalysis | None) -> bool:
+    return a is not None and (a.stairs in _STAIRS_HINT or a.place_type == "stairs")
+
+
+def _majority(votes: list[str]) -> str | None:
+    up, down = votes.count("up"), votes.count("down")
+    return "up" if up > down else "down" if down > up else None
+
+
+def _at_door(a: FrameAnalysis | None) -> bool:
+    return a is not None and bool(a.room_numbers or a.place_type in _DOOR)
+
+
+def mark_climbs(keyframes: list[Keyframe], climbs: list[dict], log=None) -> list[Keyframe]:
+    """Keyframes with stair climbs measured from camera motion (motion.detect_climbs) written into their
+    stairs state, so stair_states / walk_nodes / assign_floors / the walk's edges count the climb even when
+    Gemma called every frame of the flight 'stairs ahead' and none 'on the stairs'.
+
+    A motion candidate is only accepted when Gemma backs it up: some frame from CLIMB_HINT_SEC before it to its
+    end shows stairs (ahead_up/ahead_down/on_stairs_*, or a stairs place). Then every keyframe inside it gets
+    on_stairs_<dir>, except at its two ends a frame at a door or a room number (the climb's end time is a few
+    tenths of a second off); a door in the middle of a candidate means it is not one flight, so it is dropped.
+    The direction is Gemma's on_stairs majority inside the climb, else the vertical flow (the camera rising or
+    falling is physical), else Gemma's ahead_up/ahead_down majority near it, else the tilt (people look down
+    while climbing too, so the tilt is the weakest hint). Room numbers / floor signs after the climb still
+    overrule a wrong count (assign_floors). Changed keyframes are copies: the caller's list is not modified.
+    """
+    say = log or _log.info
+    if not climbs or not config.CLIMB_DETECT:
+        return keyframes
+    kfs = sorted(keyframes, key=lambda k: k.t)
+    marks: dict[int, str] = {}  # index in kfs -> on_stairs label
+    for c in climbs:
+        span = f"t={c['start']:.1f}-{c['end']:.1f}s"
+        hints = [k for k in kfs if c["start"] - config.CLIMB_HINT_SEC <= k.t <= c["end"] and _stairs_hint(k.analysis)]
+        if not hints:
+            say(f"Camera motion at {span} looks like a stair climb ({c['by']}), but Gemma saw no stairs near it: "
+                "not counted")
+            continue
+        inside = [i for i, k in enumerate(kfs) if c["start"] <= k.t <= c["end"]]
+        while inside and _at_door(kfs[inside[0]].analysis):
+            inside.pop(0)
+        while inside and _at_door(kfs[inside[-1]].analysis):
+            inside.pop()
+        if not inside:
+            say(f"Stair climb at {span} from camera motion has no keyframe on the stairs: not counted")
+            continue
+        if any(_at_door(kfs[i].analysis) for i in inside):
+            say(f"Camera motion at {span} looks like a stair climb, but a door/room number is in the middle of it: "
+                "not counted")
+            continue
+        d = (_majority([_STAIRS.get(kfs[i].analysis.stairs, "") for i in inside if kfs[i].analysis])
+             or (c["dir"] if "flow" in c["by"] else None)
+             or _majority([k.analysis.stairs[6:] for k in hints if k.analysis.stairs.startswith("ahead_")])
+             or c["dir"])
+        for i in inside:
+            marks[i] = f"on_stairs_{d}"
+        say(f"Stair climb {d} at {span} from camera motion ({c['by']}), Gemma saw stairs at "
+            f"t={', '.join(f'{k.t:.1f}' for k in hints[:3])}s")
+    if not marks:
+        return keyframes
+    out = list(kfs)
+    for i, label in marks.items():
+        k = kfs[i]
+        if k.analysis is not None and k.analysis.stairs == label:
+            continue
+        a = (k.analysis or FrameAnalysis()).model_copy(update={"stairs": label})
+        out[i] = k.model_copy(update={"analysis": a})
+    return out
+
+
+def _approach(kfs: list[Keyframe], states: list[str]) -> list[bool]:
+    """Keyframes on a floor in the last CLIMB_SIGN_APPROACH_SEC before a climb starts. A floor sign read there
+    is most likely the stairwell sign of the floor the stairs lead to ('LEVEL 2' is readable from the bottom
+    of the flight on floor 1), so it is not evidence for either floor."""
+    out = [False] * len(kfs)
+    for j in range(1, len(kfs)):
+        if states[j] == "none" or states[j - 1] != "none":
+            continue
+        i = j - 1
+        while i >= 0 and states[i] == "none" and kfs[j].t - kfs[i].t <= config.CLIMB_SIGN_APPROACH_SEC:
+            out[i] = True
+            i -= 1
+    return out
+
+
 def stair_rel_floors(states: list[str]) -> list[int]:
     """Relative floor at each keyframe: +1/-1 when a run of up/down frames ends (a direction flip with no
     frame between ends the first run too)."""
@@ -204,9 +294,12 @@ def _signs_from_keyframes(wnodes: list[WalkNode], keyframes: list[Keyframe]) -> 
     def gap(wn: WalkNode, t: float) -> float:
         return 0.0 if wn.t_arrive <= t <= wn.t_depart else min(abs(t - wn.t_arrive), abs(t - wn.t_depart))
 
-    for k, state, rel in zip(kfs, states, stair_rel_floors(states)):
+    approach = _approach(kfs, states) if config.CLIMB_SIGN_APPROACH_SEC > 0 else [False] * len(kfs)
+    for k, state, rel, near in zip(kfs, states, stair_rel_floors(states), approach):
         if state != "none" or not wnodes:
             continue  # mid-flight it is unclear which floor a landing sign belongs to
+        if near and _frame_readings(k.analysis):
+            continue  # just before a climb: likely the next floor's stairwell sign (see _approach)
         if not (readings := _frame_readings(k.analysis)):
             continue
         i = min(range(len(wnodes)), key=lambda i: (wnodes[i].rel_floor != rel, gap(wnodes[i], k.t)))
@@ -240,6 +333,9 @@ def assign_floors(wnodes: list[WalkNode], start_floor: int | None,
     flights (counted +2, rooms say +1; or Gemma saw stairs and rooms say same floor), the evidence wins from
     the last stair crossing on, so the top of the flight is not left on a floor that does not exist, and the
     disagreement is reported to `log` (default: this module's logger, as a warning).
+
+    Floor signs read in the last CLIMB_SIGN_APPROACH_SEC before a climb are not evidence (see _approach), so
+    the 'LEVEL 2' sign readable from the bottom of the flight does not lift the bottom onto floor 2.
     """
     warn = log or _log.warning
     signs = _signs_from_keyframes(wnodes, keyframes) if keyframes is not None else [_node_sign(w) for w in wnodes]

@@ -276,6 +276,149 @@ def _dwells(track: dict) -> list[dict]:
             for a, b in _segments(still) if (b - a + 1) / fps >= config.DWELL_MIN_SEC and t[a] > 0.5]
 
 
+# ---------------------------------------------------------------- stair climbs
+def _vertical_motion(track: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """(t, per-frame vertical image motion in deg relative to level walking, valid mask, forward motion).
+
+    The 'pitch' track is the cumulative vertical image shift, which mixes camera tilt with the camera rising or
+    falling. Frames whose fit is unreliable (phase-correlation fallback, turning) are marked invalid: a turn's
+    fit often adds a spurious vertical jump. Level walking itself shows a small steady vertical drift (uneven
+    depth above and below the horizon), so the median over walking frames is subtracted as the baseline.
+    """
+    if not track.get("pitch") or len(track["pitch"]) < 3:
+        return None
+    t = np.asarray(track["t"], dtype=float)
+    pitch = np.asarray(track["pitch"], dtype=float)
+    n = len(t)
+    dp = np.diff(pitch, prepend=pitch[0])
+    valid = np.ones(n, bool)
+    if track.get("inliers") is not None:
+        valid &= np.asarray(track["inliers"]) > 0
+    if track.get("rate") is not None:
+        valid &= np.abs(np.asarray(track["rate"], dtype=float)) < config.TURN_RATE_DEG_S
+    fwd = np.asarray(track["fwd"], dtype=float) if track.get("fwd") is not None else np.zeros(n)
+    walking = valid & (fwd > config.FWD_WALKING)
+    bias = 0.0
+    if walking.sum() >= 10:
+        # The median over all walking frames is pulled toward a long climb; refine it on the frames whose
+        # running median is near it (the level-walking cluster), so a climb does not eat its own signal.
+        fps = float(track.get("fps") or config.ANALYSIS_FPS)
+        local = _running_median(dp, walking, max(1, int(config.CLIMB_WINDOW_SEC * fps / 2)))
+        bias = float(np.median(dp[walking]))
+        for _ in range(2):
+            near = walking & (np.abs(local - bias) * fps < config.CLIMB_FLOW_DEG_S / 2)
+            if near.sum() < 10:
+                break
+            bias = float(np.median(local[near]))
+    return t, np.where(valid, dp - bias, 0.0), valid, fwd
+
+
+def _running_median(x: np.ndarray, valid: np.ndarray, half: int) -> np.ndarray:
+    out = np.zeros(len(x))
+    for i in range(len(x)):
+        w = x[max(0, i - half):i + half + 1][valid[max(0, i - half):i + half + 1]]
+        out[i] = float(np.median(w)) if len(w) > half else 0.0  # mostly invalid (a turn): no evidence
+    return out
+
+
+def _flow_climbs(t, rel, valid, fps) -> list[dict]:
+    """Sustained vertical sliding of the scene: the camera rising (scene slides down, pitch track grows) or
+    falling. Only a slope seen from the side or from below shows it; descending while looking down the flight
+    moves almost along the view axis and is caught by _tilt_climbs instead."""
+    med = _running_median(rel, valid, max(1, int(config.CLIMB_WINDOW_SEC * fps / 2))) * fps  # deg/s
+    out = []
+    for sign, d in ((1, "up"), (-1, "down")):
+        segs = []
+        for a, b in _segments(sign * med >= config.CLIMB_FLOW_DEG_S):
+            if segs and t[a] - t[segs[-1][1]] <= config.CLIMB_MERGE_GAP_SEC:
+                segs[-1] = (segs[-1][0], b)  # a short dip (a landing step, a stumble) does not split the climb
+            else:
+                segs.append((a, b))
+        for a, b in segs:
+            out.append({"start": float(t[a]), "end": float(t[b]), "dir": d, "by": "flow",
+                        "strength": round(float(np.mean(med[a:b + 1])), 2)})
+    return out
+
+
+def _tilt_climbs(t, rel, fps) -> list[dict]:
+    """The camera tilts down (or up) by CLIMB_TILT_DEG within CLIMB_TILT_STEP_SEC, holds that tilt, then tilts
+    back: looking down the steps while descending (or up a flight). Short looks (a sign overhead, the floor) are
+    dropped later by CLIMB_MIN_SEC; the direction is only a hint (people also look down while climbing)."""
+    level = np.cumsum(rel)
+    k = max(1, int(config.CLIMB_TILT_STEP_SEC * fps))
+    if len(level) <= k:
+        return []
+    diff = level[k:] - level[:-k]
+    steps = []  # (sign, first index, last index, size): the frames that carry the tilt
+    for sign in (1, -1):
+        for a, b in _segments(sign * diff >= config.CLIMB_TILT_DEG):
+            i = a + int(np.argmax(sign * diff[a:b + 1]))
+            size = float(diff[i])
+            moved = sign * (level[i:i + k + 1] - level[i]) / abs(size)
+            s0 = i + max(int(np.argmax(moved >= 0.1)) - 1, 0)
+            s1 = i + int(np.argmax(moved >= 0.9))
+            steps.append((sign, s0, s1, size))
+    steps.sort(key=lambda s: s[1])
+    w = max(1, int(config.CLIMB_MIN_SEC * fps))  # the walker's own level: this long before / after the stretch
+    out = []
+    for j, (sign, a0, a1, size) in enumerate(steps):
+        for sign2, b0, b1, size2 in steps[j + 1:]:
+            if sign2 == sign:
+                break  # tilted further the same way first: a ramp of vertical flow, not a held tilt
+            if t[b0] - t[a1] < config.CLIMB_MIN_SEC:
+                continue
+            if abs(size + size2) > 0.5 * max(abs(size), abs(size2)):
+                break  # did not come back to about the same level
+            # Held away from the level before AND after the stretch. Measured from the walker's usual level, not
+            # from the step: coming back from a glance up at a sign, then glancing up again later, is two
+            # opposite steps with nothing held in between.
+            before = float(np.median(level[max(0, a0 - w):a0])) if a0 > 0 else float(level[a0])
+            after = float(np.median(level[b1 + 1:b1 + 1 + w])) if b1 + 1 < len(level) else float(level[b1])
+            stretch = level[a1:b0 + 1]
+            held = np.minimum(sign * (stretch - before), sign * (stretch - after)) >= 0.5 * config.CLIMB_TILT_DEG
+            if np.median(held) >= 0.5:  # the tilt was held for most of the stretch
+                out.append({"start": float(t[a0]), "end": float(t[b1]), "dir": "up" if sign > 0 else "down",
+                            "by": "tilt", "strength": round(size, 1)})
+            break
+    return out
+
+
+def detect_climbs(track: dict) -> list[dict]:
+    """Stretches whose camera motion looks like a stair climb, as candidates: floors.mark_climbs only accepts a
+    candidate that Gemma's stairs hints back up (stairs ahead / a stairwell near it).
+
+    [{"start", "end", "dir": "up"|"down", "by": "flow"|"tilt"|"flow+tilt", "strength"}]. Overlapping flow and
+    tilt stretches are one climb; its direction comes from the flow (the camera rising or falling is physical,
+    a tilt is only where the walker looked). Every candidate lasts >= CLIMB_MIN_SEC with the walker moving
+    forward (median forward expansion > FWD_WALKING) and at most CLIMB_MAX_SEC. Thresholds are in config.py
+    (CLIMB_*); they were set on synthetic walks and need checking against real phone footage."""
+    if not config.CLIMB_DETECT or (vm := _vertical_motion(track)) is None:
+        return []
+    t, rel, valid, fwd = vm
+    fps = float(track.get("fps") or config.ANALYSIS_FPS)
+    cands = sorted(_flow_climbs(t, rel, valid, fps) + _tilt_climbs(t, rel, fps), key=lambda c: c["start"])
+    merged: list[dict] = []
+    for c in cands:
+        if merged and c["start"] <= merged[-1]["end"]:
+            m = merged[-1]
+            m["end"] = max(m["end"], c["end"])
+            if c["by"] == "flow" and "flow" not in m["by"]:
+                m["dir"], m["strength"] = c["dir"], c["strength"]
+            if c["by"] not in m["by"]:
+                m["by"] = "flow+tilt"
+        else:
+            merged.append(dict(c))
+    out = []
+    for c in merged:
+        m = (t >= c["start"]) & (t <= c["end"])
+        if not (config.CLIMB_MIN_SEC <= c["end"] - c["start"] <= config.CLIMB_MAX_SEC):
+            continue
+        if not m.any() or float(np.median(fwd[m])) <= config.FWD_WALKING:
+            continue  # standing still (looking around, an elevator, an escalator ride): not a climb on foot
+        out.append({**c, "start": round(c["start"], 2), "end": round(c["end"], 2)})
+    return out
+
+
 def heading_at(track: dict, ts: float) -> float:
     return float(np.interp(ts, track["t"], track["heading"]))
 
