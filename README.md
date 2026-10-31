@@ -54,6 +54,8 @@ Everything else is classical computer vision with no learned model: Lucas–Kana
 - Prachet
 - Sudarshan
 
+Working on the Street View viewer? Read [docs/CONTRIBUTING-streetview.md](docs/CONTRIBUTING-streetview.md) for the branch and file rules.
+
 ## Run it
 
 ```bash
