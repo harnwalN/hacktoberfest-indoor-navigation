@@ -1,7 +1,7 @@
 """Pydantic models shared by the pipeline, the API and (by convention) the frontend."""
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from . import config
 
@@ -143,6 +143,22 @@ class MapBundle(BaseModel):
     processed_with: dict = {}
 
 
+# ---------- Map as returned by the API ----------
+# The signed photo URLs below are built per response (router._map_out) and never stored: store.save_map drops them.
+class NodeOut(Node):
+    frame_url: str | None = None  # signed /bfiles URL of frame_id (plain path with AUTH_REQUIRED=0), or null
+
+
+class EdgeOut(Edge):
+    frames_fwd_urls: list[str | None] = []  # same order as frames_fwd
+    frames_rev_urls: list[str | None] | None = None  # same order as frames_rev
+
+
+class MapOut(MapBundle):
+    nodes: list[NodeOut] = []
+    edges: list[EdgeOut] = []
+
+
 # ---------- API payloads ----------
 class MapEdit(BaseModel):
     """PUT /buildings/{id}/map body. nodes and edges are required (no defaults) so a partial body is a 422
@@ -156,9 +172,15 @@ class CreateBuilding(BaseModel):
     name: str
 
 
+class InviteCreate(BaseModel):
+    role: Literal["viewer", "editor"]
+    label: str | None = Field(default="", max_length=80)
+
+
 class RouteRequest(BaseModel):
     start_node_id: str
     target_node_id: str
+    avoid_stairs: bool = False  # True: only flat walks, ramps and elevators (400 if the only way climbs stairs)
 
 
 class Step(BaseModel):
@@ -177,6 +199,7 @@ class Step(BaseModel):
 class RouteResponse(BaseModel):
     steps: list[Step]
     node_path: list[str]
+    step_free: bool  # True when no stairs are used (always computed, whether or not avoid_stairs was asked)
 
 
 class VideoUpdate(BaseModel):
@@ -190,3 +213,42 @@ class MergeDecision(BaseModel):
 class ManualMerge(BaseModel):
     keep: str
     remove: str
+
+
+# ---------- problem reports (reports.py, router.py) ----------
+ReportKind = Literal["wrong_direction", "place_missing", "sign_changed", "photo_wrong", "blocked", "other"]
+ReportStatus = Literal["open", "resolved"]
+
+
+def _stripped_note(value: str | None, limit: int) -> str | None:
+    """Strip surrounding whitespace, then check the length. An empty note is stored as no note."""
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) > limit:
+        raise ValueError(f"must be at most {limit} characters (after stripping spaces)")
+    return value or None
+
+
+class ReportCreate(BaseModel):
+    kind: ReportKind
+    note: str | None = None
+    node_id: str | None = Field(None, min_length=1, max_length=64)  # must exist on the map (checked in the route)
+    step_index: int | None = Field(None, strict=True, ge=0, le=500)  # position in the route the walker followed
+    from_node: str | None = Field(None, min_length=1, max_length=64)  # must exist on the map (checked in the route)
+    to_node: str | None = Field(None, min_length=1, max_length=64)  # must exist on the map (checked in the route)
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return _stripped_note(value, 500)
+
+
+class ReportStatusUpdate(BaseModel):
+    status: ReportStatus
+    resolution_note: str | None = None
+
+    @field_validator("resolution_note")
+    @classmethod
+    def _resolution_note(cls, value: str | None) -> str | None:
+        return _stripped_note(value, 300)

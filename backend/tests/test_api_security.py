@@ -205,6 +205,7 @@ def test_bfiles_serves_frames_only(env):
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
     assert r.content == frame.read_bytes()
+    # AUTH_REQUIRED=0 (this file's default): the plain path, no signature (signed URLs are tested in test_auth.py)
     assert store.frame_url(bid, "v1200001234_0001.jpg") == f"/bfiles/{bid}/frames/v1200001234_0001.jpg"
 
     for path in [f"/bfiles/{bid}/map.json", f"/bfiles/{bid}/gemma_cache.json",

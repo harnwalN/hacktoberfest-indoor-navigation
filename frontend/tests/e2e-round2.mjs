@@ -32,7 +32,7 @@ async function mockApi(page, o = {}) {
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url()); const p = url.pathname.replace(/^\/api/, ''); const m = route.request().method()
     const json = (b, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) })
-    if (p === '/buildings') return o.buildingsFail ? json({ detail: 'Server exploded' }, 500) : json([{ id: 'b1', name: 'B1' }])
+    if (p === '/buildings') return o.buildingsFail ? json({ detail: 'Server exploded' }, 500) : json([{ id: 'b1', name: 'B1', role: 'owner' }])
     if (p === '/buildings/b1/map' && m === 'GET') return json(o.map || FULL)
     if (p === '/buildings/b1/route') return json(o.route || { steps: STEPS, node_path: STEPS.map((s) => s.node_id) })
     return json({ detail: 'nope' }, 404)

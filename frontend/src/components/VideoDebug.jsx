@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Eye } from 'lucide-react'
 import { api, detail } from '../api'
+import ServerPhoto from './ServerPhoto'
 
 const W = 800
 const H = 180
@@ -12,12 +13,31 @@ export default function VideoDebug({ building, videoId }) {
   const [d, setD] = useState(null)
   const [sel, setSel] = useState(null)
   const [error, setError] = useState('')
+  // The current video's view. A refetch only counts for the video it was started for.
+  const view = useRef(null)
 
   useEffect(() => {
+    const v = { stale: false }
+    view.current = v
     setD(null)
     setSel(null)
     api.videoDebug(building, videoId).then(setD).catch((e) => setError(detail(e)))
+    return () => { view.current = null }
   }, [building, videoId])
+
+  // A keyframe URL failed (revoked or expired). Fetch the analysis once more and copy only the fresh image URLs.
+  const onPhotoStale = () => {
+    const v = view.current
+    if (!v || v.stale) return
+    v.stale = true
+    api.videoDebug(building, videoId)
+      .then((fresh) => {
+        if (view.current !== v) return
+        const urls = Object.fromEntries((fresh?.keyframes || []).map((k) => [k.frame_id, k.url ?? null]))
+        setD((cur) => cur && { ...cur, keyframes: cur.keyframes.map((k) => (k.frame_id in urls ? { ...k, url: urls[k.frame_id] } : k)) })
+      })
+      .catch(() => {})
+  }
 
   const chart = useMemo(() => {
     if (!d?.t?.length) return null
@@ -78,7 +98,7 @@ export default function VideoDebug({ building, videoId }) {
       <div className="strip">
         {d.keyframes.map((k, idx) => (
           <button key={k.frame_id} className={`thumb ${sel === idx ? 'sel' : ''}`} onClick={() => setSel(idx)}>
-            <img src={k.url} loading="lazy" alt="" />
+            <ServerPhoto src={k.url} loading="lazy" alt="" onStale={onPhotoStale} placeholder={<span className="nophoto" />} />
             <span>
               {k.t.toFixed(1)}s · {k.kind}
               {k.soft ? ' · soft' : ''}
@@ -89,7 +109,7 @@ export default function VideoDebug({ building, videoId }) {
       </div>
       {kf && (
         <div className="kf-detail">
-          <img src={kf.url} alt="" />
+          <ServerPhoto src={kf.url} alt="" onStale={onPhotoStale} placeholder={<div className="nophoto" />} />
           <pre>
             {JSON.stringify(
               { t: kf.t, kind: kf.kind, heading: kf.heading, sharpness: kf.score, gemma: kf.analysis },

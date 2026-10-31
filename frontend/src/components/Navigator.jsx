@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import { api, detail } from '../api'
 import ErrorBoundary from './ErrorBoundary'
+import ServerPhoto from './ServerPhoto'
 import SignGlyph, { PlaceChip, glyphKind, isWaypoint, placeKind } from './ArrowOverlay'
 import { Confetti, EmptyArt, PlannerArt, PlannerSkeleton } from './Motion'
 
@@ -226,6 +227,79 @@ const normalizeMap = (m) => ({
   videos: m?.videos || [],
 })
 
+// ---------- avoid stairs ----------
+const AVOID_KEY = 'waypoint.avoidStairs'
+const NO_ROUTE = 'No route found between those places.'
+// The server's 400 when the only way climbs stairs. Only this answer offers the "Show route with stairs" retry.
+const STEP_FREE_RE = /step-free/i
+
+// The choice is kept on this device. Guarded: private mode can throw, and then the toggle simply starts off each time.
+function savedAvoid() {
+  try {
+    return window.localStorage.getItem(AVOID_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+function saveAvoid(on) {
+  try {
+    window.localStorage.setItem(AVOID_KEY, on ? '1' : '0')
+  } catch {
+    /* private mode: the choice lasts for this page only */
+  }
+}
+
+const hashQuery = () => new URLSearchParams(window.location.hash.split('?')[1] || '')
+
+// A trip is shareable: #/navigate?b=<building>&from=<place>&to=<place>[&avoid=1] is the address of the trip on screen.
+// It is written when a trip starts or changes, and dropped when the trip ends. replaceState keeps history clean.
+function writeTripLink(building, trip) {
+  const p = new URLSearchParams({ b: building })
+  if (trip) {
+    p.set('from', trip.from)
+    p.set('to', trip.to)
+    if (trip.avoid) p.set('avoid', '1')
+  }
+  try {
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}#/navigate?${p}`)
+  } catch {
+    /* the trip works without the address bar; it just is not in the link */
+  }
+}
+
+// The toggle sits in the planner and on the trip, so one component serves both. The helper text is the description.
+function AvoidStairs({ on, onChange }) {
+  return (
+    <div className="avoid-stairs">
+      <label className="check">
+        <input id="avoid-stairs" type="checkbox" checked={on} onChange={(e) => onChange(e.target.checked)} aria-describedby="avoid-stairs-help" />
+        <span>Avoid stairs</span>
+      </label>
+      <p id="avoid-stairs-help" className="check-help">Use elevators and ramps only</p>
+    </div>
+  )
+}
+
+// Same look as every other error in this screen; the stairs offer is a single button under the server's message.
+function RouteError({ message, onShowStairs }) {
+  return (
+    <div className="notice error route-error" role="alert">
+      <span>{message}</span>
+      {onShowStairs && (
+        <button type="button" className="ghost" onClick={onShowStairs}>Show route with stairs</button>
+      )}
+    </div>
+  )
+}
+
+// "No stairs" only when the server says the route is step-free. "Uses stairs" only when the toggle is off and the route
+// climbs stairs (with the toggle on, a stairs route is not offered, so nothing is shown for it).
+function StairsBadge({ stepFree, avoid }) {
+  if (stepFree === true) return <span className="route-badge is-step-free">No stairs on this route</span>
+  if (stepFree === false && !avoid) return <span className="route-badge is-stairs">This route uses stairs</span>
+  return null
+}
+
 const TRK0 = { i: 0, dir: 1, prev: null }
 
 export default function Navigator({ building }) {
@@ -252,10 +326,27 @@ function NavigatorInner({ building }) {
   // rendering with the React "adjust state on prop change" pattern, so no ref is mutated during render.
   const [trk, setTrk] = useState(TRK0)
   const [swapTurn, setSwapTurn] = useState(0)
+  // The trip on screen: its ends, the stairs choice it was routed with, and whether its photo URLs were already
+  // refetched once. Null when no trip is shown.
+  const trip = useRef(null)
+  // Avoid stairs. A shared link carries its own choice (absent means off); otherwise the saved choice applies.
+  const [avoid, setAvoid] = useState(() => {
+    const q = hashQuery()
+    return q.get('from') && q.get('to') ? q.get('avoid') === '1' : savedAvoid()
+  })
+  // step_free from the answer on screen (null when the server did not say).
+  const [stepFree, setStepFree] = useState(null)
+  // Set with the error when the server refused a stairs-free route: the request to repeat with stairs.
+  const [stairsRetry, setStairsRetry] = useState(null)
+  // Counts route requests. Only the newest may change the screen, so an old slow answer cannot overwrite a newer one.
+  const seq = useRef(0)
 
   useEffect(() => {
     let live = true
+    trip.current = null
+    seq.current += 1
     setRaw(null); setMap(null); setStart(''); setTarget(''); setError(''); setLoadError(''); setI(0)
+    setStepFree(null); setStairsRetry(null)
     api.getMap(building)
       .then((m) => live && setMap(normalizeMap(m)))
       .catch((e) => live && setLoadError(detail(e)))
@@ -264,28 +355,46 @@ function NavigatorInner({ building }) {
 
   const steps = useMemo(() => (raw && map ? buildSteps(raw, map) : null), [raw, map])
 
-  // Shareable directions: #/navigate?b=<building>&from=<place>&to=<place> opens straight into the route.
+  // One route request. A failed request leaves the trip on screen as it was.
+  const routeTrip = (from, to, avoidOn, step = 0) => {
+    const id = ++seq.current
+    setRouting(true)
+    setError('')
+    setStairsRetry(null)
+    return api.route(building, from, to, { avoidStairs: avoidOn })
+      .then((r) => {
+        if (id !== seq.current) return
+        if (!r?.steps?.length) throw new Error(NO_ROUTE)
+        trip.current = { from, to, avoid: avoidOn, refetched: false }
+        setRaw(r.steps)
+        setStepFree(typeof r.step_free === 'boolean' ? r.step_free : null)
+        setI(step)
+        writeTripLink(building, { from, to, avoid: avoidOn })
+      })
+      .catch((e) => {
+        if (id !== seq.current) return
+        const msg = detail(e)
+        setError(msg)
+        if (avoidOn && e?.response?.status === 400 && STEP_FREE_RE.test(msg)) setStairsRetry({ from, to, step })
+      })
+      .finally(() => {
+        if (id === seq.current) setRouting(false)
+      })
+  }
+
+  // Shareable directions: #/navigate?b=<building>&from=<place>&to=<place>[&avoid=1][&step=n] opens straight into the route.
   useEffect(() => {
     if (!map) return undefined
-    const q = new URLSearchParams(window.location.hash.split('?')[1] || '')
+    const q = hashQuery()
     const from = q.get('from')
     const to = q.get('to')
     if (!from || !to) return undefined
-    let live = true
+    const n = Number.parseInt(q.get('step') || '0', 10)
     setStart(from)
     setTarget(to)
-    setRouting(true)
-    api.route(building, from, to)
-      .then((r) => {
-        if (!live) return
-        if (!r?.steps?.length) { setError('No route found between those places.'); return }
-        setRaw(r.steps)
-        const n = Number.parseInt(q.get('step') || '0', 10)
-        setI(Number.isFinite(n) ? Math.max(0, n) : 0)
-      })
-      .catch((e) => live && setError(detail(e)))
-      .finally(() => live && setRouting(false))
-    return () => { live = false }
+    setAvoid(q.get('avoid') === '1')
+    routeTrip(from, to, q.get('avoid') === '1', Number.isFinite(n) ? Math.max(0, n) : 0)
+    return undefined
   }, [map])
 
   // Places you can pick: hallway points/ends/doorways are waypoints, not destinations. Unverified places are
@@ -296,23 +405,59 @@ function NavigatorInner({ building }) {
   const choices = showAll || verified.length < 2 ? candidates : verified
   const floors = new Set(allNodes.map((n) => n.floor)).size
 
-  const go = async () => {
+  const go = () => routeTrip(start, target, avoid, 0)
+
+  // Ends the trip on screen. A late answer for an ended trip is ignored (the seq bump), and so is a late photo refetch.
+  const endTrip = () => {
+    seq.current += 1
+    trip.current = null
+    setRaw(null)
+    setStepFree(null)
+    setRouting(false)
     setError('')
-    setRouting(true)
-    try {
-      const r = await api.route(building, start, target)
-      if (!r?.steps?.length) throw new Error('No route found between those places.')
-      setRaw(r.steps)
-      setI(0)
-    } catch (e) {
-      setError(detail(e))
-    } finally {
-      setRouting(false)
-    }
+    setStairsRetry(null)
+    writeTripLink(building, null)
+  }
+
+  // A photo URL in this trip failed (revoked or expired). The route is fetched again once for fresh URLs, keeping the
+  // same step. A second failure in the same trip just keeps the placeholder.
+  const onPhotoStale = () => {
+    const t = trip.current
+    if (!t || t.refetched) return
+    t.refetched = true
+    api.route(building, t.from, t.to, { avoidStairs: t.avoid })
+      .then((r) => {
+        if (trip.current === t && r?.steps?.length) setRaw(r.steps)
+      })
+      .catch(() => {})
   }
 
   const last = steps ? steps.length - 1 : 0
   const goTo = (k) => setI(Math.max(0, Math.min(k, last)))
+
+  // The choice is kept for next time. On a trip it re-routes from the place the trip is at now (from the start when
+  // that place is the destination), and the trip goes back to its first step.
+  const toggleAvoid = (on) => {
+    setAvoid(on)
+    saveAvoid(on)
+    const t = trip.current
+    if (!raw || !steps || !t) {
+      setError('')
+      setStairsRetry(null)
+      return
+    }
+    const here = steps[Math.min(i, last)].node_id
+    routeTrip(here === t.to ? t.from : here, t.to, on, 0)
+  }
+
+  // "Show route with stairs": repeat the refused request without the stairs rule, and keep the toggle in step with it.
+  const showWithStairs = () => {
+    const r = stairsRetry
+    if (!r) return
+    setAvoid(false)
+    saveAvoid(false)
+    routeTrip(r.from, r.to, false, r.step)
+  }
 
   // Preload the next photos so stepping forward is instant on a phone connection.
   useEffect(() => {
@@ -325,7 +470,7 @@ function NavigatorInner({ building }) {
       if (e.target.closest?.('input, select, textarea') || e.altKey || e.ctrlKey || e.metaKey) return
       if (e.key === 'ArrowRight') setI((x) => Math.min(x + 1, last))
       if (e.key === 'ArrowLeft') setI((x) => Math.max(x - 1, 0))
-      if (e.key === 'Escape') setRaw(null)
+      if (e.key === 'Escape') endTrip()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -379,7 +524,8 @@ function NavigatorInner({ building }) {
           <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
           Show unverified places too
         </label>
-        {error && <p className="notice error" role="alert">{error}</p>}
+        <AvoidStairs on={avoid} onChange={toggleAvoid} />
+        {error && <RouteError message={error} onShowStairs={stairsRetry ? showWithStairs : undefined} />}
         <button className={`go ${start && target && start !== target ? 'ready' : ''} ${routing ? 'busy' : ''}`} disabled={!start || !target || start === target || routing} onClick={go}>
           {routing ? 'Finding your route…' : <>Start directions <ArrowRight size={22} aria-hidden="true" /></>}
         </button>
@@ -412,7 +558,7 @@ function NavigatorInner({ building }) {
   return (
     <section className="trip-view" style={{ '--dir': dir }}>
       <header className="trip-head">
-        <button className="icon-btn" aria-label="End directions" onClick={() => setRaw(null)}>
+        <button className="icon-btn" aria-label="End directions" onClick={endTrip}>
           <X size={20} />
         </button>
         <p>
@@ -422,9 +568,20 @@ function NavigatorInner({ building }) {
           {idx + 1} of {steps.length}
         </span>
       </header>
+      <div className="trip-summary">
+        <StairsBadge stepFree={stepFree} avoid={avoid} />
+        <AvoidStairs on={avoid} onChange={toggleAvoid} />
+      </div>
+      {error && <RouteError message={error} onShowStairs={stairsRetry ? showWithStairs : undefined} />}
 
       <figure className="scene" onTouchStart={(e) => (touch.current = e.touches[0].clientX)} onTouchEnd={onTouchEnd}>
-        {s.frame_url ? <img key={s.frame_url} src={s.frame_url} alt={`View at ${s.label}`} /> : <div className="no-photo">No photo for this spot</div>}
+        <ServerPhoto
+          key={s.frame_url || 'none'}
+          src={s.frame_url}
+          alt={`View at ${s.label}`}
+          onStale={onPhotoStale}
+          placeholder={<div className="no-photo">No photo for this spot</div>}
+        />
         <span className={`floor-chip ${floorMoved ? `moved moved--${floorMoved}` : ''}`} key={`fc${idx}`}>Floor {s.floor}</span>
         {s.view_note && <figcaption>{s.view_note}</figcaption>}
       </figure>
@@ -454,7 +611,7 @@ function NavigatorInner({ building }) {
             Next <ChevronRight size={20} />
           </button>
         ) : (
-          <button className="next" onClick={() => setRaw(null)}>
+          <button className="next" onClick={endTrip}>
             Done
           </button>
         )}

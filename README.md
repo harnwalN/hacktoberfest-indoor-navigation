@@ -67,6 +67,7 @@ ollama pull gemma3:4b            # fast default; gemma3:12b for higher-quality p
 OLLAMA_NUM_PARALLEL=4 ollama serve
 
 # 2. backend (serves the API and the built frontend on :8000)
+#    first start prints your owner key once in the log: copy it somewhere safe (see Sharing and access)
 cd backend && uv sync && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 3. frontend: build once into backend/static ...
@@ -78,12 +79,13 @@ npm run dev
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Open the printed `https://….trycloudflare.com` URL on the phone.
+Open the printed `https://….trycloudflare.com` URL on the phone. The app asks for an invite link or the owner key
+before it shows anything. See *Sharing and access* below.
 
 Check the local model with `curl http://localhost:8000/api/health`: `gemma.ok` is true when Ollama answers, and
 `gemma.selected` is the model in use. If Ollama is stopped, the reply comes back within a few seconds with `ok: false`. Bookmark `#/navigate?b=<building-id>`,
 record new walks at `#/record?b=<building-id>`, or share a route directly with
-`#/navigate?b=<building-id>&from=<place-id>&to=<place-id>`.
+`#/navigate?b=<building-id>&from=<place-id>&to=<place-id>`. A bookmark only opens on a device that has access to that building.
 
 ### Batch pre-processing (no UI)
 ```bash
@@ -103,7 +105,11 @@ cd backend && uv run pytest
 **ffmpeg must be installed** (`brew install ffmpeg`). The tests that run the real normalize step
 (`test_pipeline.py`, `test_jobs_pipeline.py`, `test_motion.py`) need it. Other tests do not run it.
 
-The suite has 433 tests. Gemma tests replace the Ollama client, so no model is needed to run them.
+Run `uv run pytest -q` to see the current test count. Gemma tests replace the Ollama client, so no model is needed to run them.
+
+Access control has its own tests. `tests/test_auth.py` covers the owner key, invites, roles, signed photo links, the
+429 limit and startup checks. `tests/test_auth_adversarial.py` tries to get around them. `tests/conftest.py` turns
+access control off for every other test and points `DATA_DIR` at a temporary folder.
 
 They use synthetic videos with a known camera yaw and fixture maps:
 - 90° turns are measured to within 0.1°; a glance (look at something and back) is not a turn.
@@ -120,12 +126,117 @@ They use synthetic videos with a known camera yaw and fixture maps:
   room numbers and floor hints must be grounded in OCR; different plaque numbers block a merge; `/api/health`
   returns quickly when Ollama is down.
 
+## Sharing and access
+
+Access control is on by default. Nobody can see or change a building without the owner key or an invite link.
+
+- **Owner key.** One per server. It opens every building, creates buildings and makes invite links.
+- **Invite link.** One per person per building. It opens that one building, with the role you give it.
+
+Photos are served through signed links. Each one works for `FRAME_URL_TTL_SEC` (one day by default).
+
+### Find the owner key (first start)
+The first time the backend starts, it makes an owner key and prints it once in the server log:
+
+```
+OWNER KEY, shown only once: <key>
+```
+
+Copy it now. The server keeps only a SHA-256 hash of the key, in `backend/data/auth.json`, so it cannot show the key
+again. If you lose it, make a new one. The old key stops working at once:
+
+```bash
+cd backend && uv run python -m app.cli owner-key --rotate
+```
+
+To choose your own key, set `ADMIN_TOKEN` (at least 24 characters) before the first start:
+
+```bash
+ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+While `ADMIN_TOKEN` is set, `--rotate` refuses to run. Change the variable instead.
+To see where the key comes from (the key itself is never printed):
+
+```bash
+cd backend && uv run python -m app.cli owner-key
+```
+
+### Open the app as owner
+1. Open the app on your device.
+2. On the access screen, tap **I own this server**, paste the owner key and tap **Save owner key**.
+3. The app now lists every building. The owner key is saved in this browser only.
+
+### Invite a friend
+Pick the role first:
+
+| Role | Can do |
+|---|---|
+| **Viewer** | Get directions and plan routes. Read the map, but change nothing |
+| **Editor** | Everything a viewer can, plus add walks, record, review and edit the map, and rebuild |
+
+Only the owner can make invites. Make one in either of two ways.
+
+**In the app:** open the building, go to the **Build** tab, and find **Share this building**. Pick the role, add an
+optional label, and tap **Create link**. The link is shown once, so copy it then.
+
+**From the command line:**
+
+```bash
+cd backend
+uv run python -m app.cli invite sample-building --role viewer --label "Front desk"
+uv run python -m app.cli invite sample-building --role editor --label "Alex"
+```
+
+The command prints a join path such as `#/join?b=sample-building&t=...`. Put your server address in front of it:
+`https://<your-host>/#/join?b=sample-building&t=...`. The link is shown once.
+
+Send the link to your friend. They open it on their phone. The phone is signed in to that building, and the
+code is removed from the address bar. They need no account.
+
+### Revoke a link
+In the **Build** tab, next to the link under **Invite links**, tap **Revoke**, then **Yes, revoke**. Or from the
+command line:
+
+```bash
+cd backend
+uv run python -m app.cli invites sample-building                    # lists the invite ids (no codes)
+uv run python -m app.cli revoke sample-building <invite_id>
+```
+
+A revoked link stops working at once. Photo links for that building stop working too. Other people with a valid
+link may need to reload the page to see photos again.
+
+### What a visitor without access sees
+A visitor with no link sees an access screen and no buildings. The screen says the building is invite-only. The
+visitor can:
+
+- paste an invite link into the box and tap **Open building**, or
+- tap **I own this server** and enter the owner key.
+
+To remove the saved links and owner key from a shared device, open the sign-out menu in the top bar and tap
+**Sign out on this device**. (**Forget this building** removes only the link for the building on screen.)
+
+With access control on, `/docs` and `/openapi.json` are turned off.
+
+### Known limits
+- **Invite links do not expire.** A link works until its owner revokes it.
+- **Anyone holding a link has that access.** Sharing a link is like sharing a key. Send it only to the person it is
+  for, and do not post it anywhere public.
+- **The owner key opens everything.** The log from the first start holds it in clear text, so keep that log private.
+
 ## Configuration
 Every setting has a default and can be overridden with an environment variable, for example
 `MAX_UPLOAD_MB=4096 uv run uvicorn app.main:app --port 8000`. The full list is in `backend/app/config.py`.
 
 | Variable | Default | What it does |
 |---|---|---|
+| `DATA_DIR` | `backend/data` | Where buildings and `auth.json` (owner key hash and photo-link signing secret) are kept |
+| `AUTH_REQUIRED` | 1 | Access control. `0` turns it off, for local development only. Never use it with the cloudflared tunnel: tunnel traffic reaches the server from 127.0.0.1, so it looks local. With `0`, anyone who can reach the server has owner access |
+| `ADMIN_TOKEN` | unset | Your own owner key, at least 24 characters. The server will not start with a shorter one. Unset: a key is made on first start. See *Sharing and access* |
+| `FRAME_URL_TTL_SEC` | 86400 | How long a signed photo link works, in seconds (one day) |
+| `AUTH_MAX_FAILS` | 20 | Failed access attempts per address per minute. One more gets HTTP 429 |
 | `MAX_UPLOAD_MB` | 2048 | Largest walk video, in MiB. Bigger uploads get HTTP 413 |
 | `MAX_SENSOR_BYTES` | 52428800 (50 MiB) | Largest `sensors.json` sent with a video. Bigger gets 413 |
 | `MAX_IMAGE_BYTES` | 26214400 (25 MiB) | Largest manually added photo. Bigger gets 413 |
@@ -232,6 +343,7 @@ Set both `STAIR_LANDING_*` values to `0` to count every flight as a floor change
 Each building is a portable folder, `backend/data/buildings/<id>/`:
 - `map.json`: the graph, plus `processed_with` (model and prompt version of the last Gemma-processed walk)
 - `frames/`: photos users see
+- `access.json`: invite records (hashes only, never the links) and a revoke counter. The owner key is not in the folder; it lives in `DATA_DIR/auth.json`
 - `gemma_cache.jsonl`: Gemma answers, one JSON line per answer. Each new answer is appended. The file is only
   rewritten to remove duplicates when it is loaded. An old `gemma_cache.json` is converted the first time the cache is used, and kept as `gemma_cache.json.bak`
 - `videos/<vid>/`: normalized video, track, `walk.json` (keyframes, events, `gemma`, `gemma_frames_ok`, `model`)

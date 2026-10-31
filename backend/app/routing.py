@@ -15,6 +15,8 @@ from .schemas import Edge, MapBundle, Node, RouteResponse, Step
 from .store import frame_url
 
 NO_PATH_MESSAGE = "No valid path found between selected locations. Please check graph connections in Map Editor."
+NO_STEP_FREE_MESSAGE = "No step-free route between these places. The only way uses stairs."
+STAIR_VERTICALS = ("stairs_up", "stairs_down")
 
 TURN_TEXT = {
     "go_straight": "Continue straight", "slight_left": "Bear slightly left", "slight_right": "Bear slightly right",
@@ -62,12 +64,33 @@ def _cost(e: Edge) -> float:
     return cost
 
 
-def build_graph(bundle: MapBundle) -> nx.Graph:
+class NoStepFreePath(Exception):
+    """The two places are connected, but only by a route that uses stairs."""
+
+    def __init__(self) -> None:
+        super().__init__(NO_STEP_FREE_MESSAGE)
+
+
+def _step_free(e: Edge, floors: dict[str, int]) -> bool:
+    """Walkable without stairs: flat walks, elevators, ramps. A stair edge is never step-free, in either direction
+    (its vertical is stored once and flipped when walked backwards). A flat edge that changes floor is treated as
+    stairs: the only other things that climb are elevators and ramps, which carry their own vertical."""
+    if e.vertical in STAIR_VERTICALS:
+        return False
+    if e.vertical in ("elevator", "ramp_up", "ramp_down"):
+        return True
+    return floors.get(e.from_node) == floors.get(e.to_node)
+
+
+def build_graph(bundle: MapBundle, avoid_stairs: bool = False) -> nx.Graph:
+    floors = {n.id: n.floor for n in bundle.nodes}
     g = nx.Graph()
     for n in bundle.nodes:
         g.add_node(n.id)
     for e in bundle.edges:
         if e.from_node in g and e.to_node in g:
+            if avoid_stairs and not _step_free(e, floors):
+                continue  # dropped before add_edge: a stair edge must not hide a flat edge between the same pair
             g.add_edge(e.from_node, e.to_node, edge=e, cost=_cost(e))
     return g
 
@@ -86,18 +109,27 @@ def _place(node: Node) -> str:
     return d if d.split(" ", 1)[0] in ("the", "a", "an") else f"the {d}"
 
 
-def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:
+def route(bundle: MapBundle, start: str, target: str, avoid_stairs: bool = False) -> RouteResponse:
+    """Shortest walk from start to target. avoid_stairs: only elevators, ramps and flat walks (NoStepFreePath if the
+    only connection climbs stairs). Either way the response says whether its route is step_free."""
     nodes = {n.id: n for n in bundle.nodes}
     for nid in (start, target):
         if nid not in nodes:
             raise KeyError(nid)
-    g = build_graph(bundle)
-    path = nx.shortest_path(g, start, target, weight="cost")  # shortest walk; raises nx.NetworkXNoPath
+    floors = {nid: n.floor for nid, n in nodes.items()}
+    g = build_graph(bundle, avoid_stairs)
+    try:
+        path = nx.shortest_path(g, start, target, weight="cost")  # shortest walk; raises nx.NetworkXNoPath
+    except nx.NetworkXNoPath:
+        if avoid_stairs and nx.has_path(build_graph(bundle), start, target):
+            raise NoStepFreePath() from None
+        raise
     bid = bundle.building_id
+    step_free = all(_step_free(g.edges[u, v]["edge"], floors) for u, v in zip(path, path[1:]))
 
     if len(path) == 1:
         n = nodes[start]
-        return RouteResponse(node_path=path, steps=[Step(
+        return RouteResponse(node_path=path, step_free=True, steps=[Step(
             step_index=0, node_id=n.id, label=n.label, frame_url=frame_url(bid, n.frame_id),
             action="destination_reached", instruction_text=f"You are already at {n.label}.", floor=n.floor,
         )])
@@ -163,4 +195,4 @@ def route(bundle: MapBundle, start: str, target: str) -> RouteResponse:
     steps.append(Step(step_index=len(path) - 1, node_id=last.id, label=last.label, frame_url=url, view_note=note,
                       action="destination_reached", instruction_text=f"You have arrived at {last.label}.",
                       floor=last.floor))
-    return RouteResponse(steps=steps, node_path=path)
+    return RouteResponse(steps=steps, node_path=path, step_free=step_free)

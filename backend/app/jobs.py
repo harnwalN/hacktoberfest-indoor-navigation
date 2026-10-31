@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gemma, mapper, motion, store, video
+from . import config, gemma, hosted, mapper, motion, store, video
 from .keyframes import select_keyframes
 from .schemas import Keyframe, VideoInfo
 
@@ -292,6 +292,10 @@ class GemmaRun:
     online: bool = False  # Ollama answered; False = answers came from the cache only
 
 
+def _where(model: str) -> str:
+    return "hosted, Google Gemini API" if hosted.is_hosted(model) else "local, via Ollama"
+
+
 def _analyze(job: Job, keyframes: list[Keyframe], model: str | None) -> bool:
     return _analyze_walk(job, keyframes, model).ok
 
@@ -301,13 +305,21 @@ def _analyze_walk(job: Job, keyframes: list[Keyframe], model: str | None) -> Gem
     cache = gemma.cache_for(bdir)
     frames = store.frames_dir(job.building_id)
     online = True
+    # The walk's model: chosen here once (an explicit model wins, else VISION_PROVIDER), then every call on this walk
+    # uses it. A hosted model that fails mid-walk is never swapped for Gemma: the walk ends on cached answers.
+    chosen = model
     try:
-        chosen = model or gemma.resolve_model()
-        gemma.ensure_model(chosen)  # a missing model fails here once, not on every frame
-        job.say(f"Gemma model: {chosen} (local, via Ollama)")
+        chosen = model or gemma.choose_model()
+        gemma.ensure_model(chosen)  # missing model, or hosted key/limit/reachability: fails here once, not per frame
+        job.say(f"Gemma model: {chosen} ({_where(chosen)})")
     except gemma.GemmaUnavailable as exc:
-        online, chosen = False, model
-        job.say(f"WARNING Gemma unavailable, using cached answers only: {exc}")
+        what = f"hosted model {chosen}" if hosted.is_hosted(chosen) else "Gemma"
+        online = False
+        chosen = chosen if hosted.is_hosted(chosen) else model  # local: as before, the cache answers for `model` only
+        job.say(f"WARNING {what} unavailable, using cached answers only: {exc}")
+    hosted_walk = hosted.is_hosted(chosen)
+    who = f"hosted model {chosen}" if hosted_walk else "Gemma"
+    usage_mark = hosted.usage_snapshot() if hosted_walk else None
     # Circuit breaker: after GEMMA_BREAKER_FAILS GemmaUnavailable in a row (Ollama down, model unloaded,
     # broken output), stop calling Gemma for the rest of this walk instead of timing out on every frame.
     # Frames whose answer is cached still get it (cache only, Ollama is never contacted for them).
@@ -339,8 +351,10 @@ def _analyze_walk(job: Job, keyframes: list[Keyframe], model: str | None) -> Gem
     ok = n_skipped = 0
     used: Counter = Counter()
     announced = False
-    # A few requests in flight keeps the GPU busy (~25% faster with OLLAMA_NUM_PARALLEL>1).
-    with ThreadPoolExecutor(max_workers=config.GEMMA_CONCURRENCY) as pool:
+    # A few requests in flight keeps the GPU busy (~25% faster with OLLAMA_NUM_PARALLEL>1); a hosted model has its own
+    # limit (HOSTED_CONCURRENCY).
+    workers = config.HOSTED_CONCURRENCY if hosted_walk else config.GEMMA_CONCURRENCY
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         for i, (kf, res, dt) in enumerate(pool.map(one, keyframes)):
             job.enter("gemma", (i + 1) / max(len(keyframes), 1))
             if isinstance(res, JobPaused):
@@ -349,11 +363,16 @@ def _analyze_walk(job: Job, keyframes: list[Keyframe], model: str | None) -> Gem
                 n_skipped += 1
                 continue
             if isinstance(res, gemma.GemmaUnavailable):
-                job.say(f"WARNING Gemma failed on {kf.frame_id}: {res}")
+                job.say(f"WARNING {who} failed on {kf.frame_id}: {res}")
                 if breaker["open"] and not announced:
                     announced = True
-                    job.say(f"WARNING Gemma failed {config.GEMMA_BREAKER_FAILS} frames in a row; "
-                            "not calling it again for this walk (cached answers are still used)")
+                    if hosted_walk:
+                        job.say(f"WARNING hosted model {chosen} failed {config.GEMMA_BREAKER_FAILS} frames in a row; "
+                                "not calling it again for this walk (cached answers are still used; the walk keeps "
+                                f"{chosen}, it is not switched to Gemma)")
+                    else:
+                        job.say(f"WARNING Gemma failed {config.GEMMA_BREAKER_FAILS} frames in a row; "
+                                "not calling it again for this walk (cached answers are still used)")
                 continue
             if isinstance(res, Exception):
                 job.say(f"WARNING Skipping {kf.frame_id}: {type(res).__name__}: {res}")
@@ -367,7 +386,9 @@ def _analyze_walk(job: Job, keyframes: list[Keyframe], model: str | None) -> Gem
                         f"texts={a.texts} stairs={a.stairs} ({dt:.1f}s)")
     job.checkpoint()
     if n_skipped:
-        job.say(f"Skipped Gemma on {n_skipped} frame(s): not cached, and Gemma unavailable or failing")
+        job.say(f"Skipped {who} on {n_skipped} frame(s): not cached, and {who} unavailable or failing")
+    if usage_mark is not None:
+        job.say(f"Hosted {chosen} analysis of this walk: {hosted.usage_summary(usage_mark)}")
     online = online and not breaker["open"]
     if keyframes and not ok:
         job.say("WARNING Gemma analysed no frames, mapping from motion only")
@@ -411,7 +432,9 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
 
     job.enter("mapping"); job.say("Building graph and closing loops")
     # same-place / same-stairwell checks use this walk's model; if Ollama was down they answer from the cache
-    with store.lock_for(bid), gemma.session(run.model or model, offline=not run.online):
+    map_model = run.model or model
+    map_mark = hosted.usage_snapshot() if hosted.is_hosted(map_model) else None
+    with store.lock_for(bid), gemma.session(map_model, offline=not run.online):
         bundle = store.load_map(bid)
         info = _video_info(job, bundle, vid)
         result = mapper.integrate_walk(bundle, vid, keyframes, track, store.frames_dir(bid),
@@ -426,6 +449,8 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
         result["consolidate"] = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
                                                    use_gemma, log=job.say)
         store.save_map(bundle)
+    if map_mark is not None:
+        job.say(f"Hosted {map_model} mapping of this walk: {hosted.usage_summary(map_mark)}")
     job.result = result
     job.say(f"Map updated: {result}")
 
@@ -473,7 +498,7 @@ def _rebuild(job: Job) -> None:
 
     job.enter("mapping")
     models = [m for *_, m in walks if m]
-    online = any(w[3].online for w in walks) if walks else _gemma_ok()
+    online = any(w[3].online for w in walks) if walks else _gemma_ok(default_model)
     with store.lock_for(bid), gemma.session(default_model or (models[-1] if models else None), lookup=models,
                                             offline=not online):
         bundle = store.load_map(bid)
@@ -507,9 +532,9 @@ def _consolidate(job: Job) -> None:
     bid = job.building_id
     job.enter("mapping")
     job.say("Linking all walks into one building map")
-    online = _gemma_ok()
     with store.lock_for(bid):
         bundle = store.load_map(bid)
+        online = _gemma_ok((bundle.processed_with or {}).get("model"))
         models = [m for v in bundle.videos if (m := _stored_model(store.video_dir(bid, v.id)))]
         with gemma.session((bundle.processed_with or {}).get("model"), lookup=models, offline=not online):
             job.result = mapper.consolidate(bundle, store.frames_dir(bid), gemma.cache_for(store.building_dir(bid)),
@@ -525,9 +550,14 @@ def _stored_model(vdir: Path) -> str | None:
         return None
 
 
-def _gemma_ok() -> bool:
+def _gemma_ok(model: str | None = None) -> bool:
+    """Can the building's model be asked now? A hosted one is checked for its key, limit and reachability; anything
+    else (no model recorded, or a local one) by the local Ollama check, as before."""
     try:
-        gemma.resolve_model()
+        if hosted.is_hosted(model):
+            gemma.ensure_model(model)
+        else:
+            gemma.resolve_model()
         return True
     except gemma.GemmaUnavailable:
         return False

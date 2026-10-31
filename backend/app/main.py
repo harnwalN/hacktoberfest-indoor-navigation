@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, jobs, store
+from . import auth, config, jobs, store
 from .router import api
 
 
@@ -26,10 +26,19 @@ class BodySizeLimit:
         await self.app(scope, receive, send)
 
 
-app = FastAPI(title="Indoor Visual Navigation", version="0.2.0")
+_docs_on = not config.AUTH_REQUIRED  # with access control on, the schema would list every route to anyone
+app = FastAPI(title="Indoor Visual Navigation", version="0.2.0",
+              docs_url="/docs" if _docs_on else None, redoc_url="/redoc" if _docs_on else None,
+              openapi_url="/openapi.json" if _docs_on else None)
 app.add_middleware(BodySizeLimit)
+app.add_middleware(auth.WriteGuard)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])  # outermost
 app.include_router(api)
+
+
+@app.on_event("startup")
+def _auth_startup():
+    auth.startup()  # owner key on first run; loud warning when AUTH_REQUIRED=0
 
 
 @app.on_event("startup")
@@ -42,8 +51,11 @@ _FRAME_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")  # one path segment, n
 
 
 @app.api_route("/bfiles/{building_id}/frames/{filename}", methods=["GET", "HEAD"])
-def frame_file(building_id: str, filename: str):
-    """Serve keyframe images only; the rest of a building bundle (map, cache, videos) stays private."""
+def frame_file(building_id: str, filename: str, exp: str | None = None, sig: str | None = None):
+    """Serve keyframe images only; the rest of a building bundle (map, cache, videos) stays private.
+    The ?exp=&sig= signature (auth.frame_urls) is the access check: <img> tags cannot send headers."""
+    if config.AUTH_REQUIRED and not auth.frame_signature_ok(building_id, filename, exp, sig):
+        raise HTTPException(404, "Not found")  # missing, forged or expired: same answer as an absent file
     try:
         frames = store.frames_dir(building_id)
     except ValueError:

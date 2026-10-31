@@ -13,6 +13,17 @@ DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data"))
 BUILDINGS_DIR = DATA_DIR / "buildings"
 STATIC_DIR = BACKEND_DIR / "static"
 
+# --- Access control (auth.py) ---
+# Every /api route except /api/health needs a token: the owner key, or an invite token for one building.
+# AUTH_REQUIRED=0 turns all checks off (local development only). There is no localhost bypass: the tunnel
+# delivers public traffic from 127.0.0.1 too.
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "1") != "0"
+# Owner key from the environment. Unset: a key is generated on first start and only its hash is kept in DATA_DIR/auth.json.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN_MIN_CHARS = 24  # with AUTH_REQUIRED=1 the server refuses to start when ADMIN_TOKEN is set and shorter
+FRAME_URL_TTL_SEC = int(os.getenv("FRAME_URL_TTL_SEC", 86400))  # how long a signed photo URL stays valid (one day)
+AUTH_MAX_FAILS = int(os.getenv("AUTH_MAX_FAILS", 20))  # failed auth attempts per client IP per minute before HTTP 429
+
 # --- Upload limits (requests over these get HTTP 413) ---
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 2048))  # one walk video
 MAX_SENSOR_BYTES = int(os.getenv("MAX_SENSOR_BYTES", 50 * 1024 * 1024))  # sensors.json recorded with a video
@@ -35,6 +46,25 @@ GEMMA_NUM_CTX = int(os.getenv("GEMMA_NUM_CTX", 4096))  # fixed so every request 
 GEMMA_NUM_PREDICT_ANALYZE = int(os.getenv("GEMMA_NUM_PREDICT_ANALYZE", 512))  # answer token cap, frame analysis
 GEMMA_NUM_PREDICT_COMPARE = int(os.getenv("GEMMA_NUM_PREDICT_COMPARE", 320))  # same place / same stairwell
 GEMMA_BREAKER_FAILS = int(os.getenv("GEMMA_BREAKER_FAILS", 3))  # consecutive failures that stop Gemma for a walk
+
+# --- Vision model choice (gemma.choose_model): hosted Gemini (hosted.py) or local Gemma (Ollama) ---
+# auto: HOSTED_MODEL when GEMINI_API_KEY is set, the API answers and the daily call limit has room; else local Gemma.
+# gemma: local Gemma only, the hosted API is never called. hosted: HOSTED_MODEL only (needs the key).
+# A walk picks its model once; an explicit model (upload form field, CLI --model, eval --model) always wins.
+VISION_PROVIDER = os.getenv("VISION_PROVIDER", "auto").strip().lower()
+if VISION_PROVIDER not in ("auto", "gemma", "hosted"):
+    raise ValueError(f"VISION_PROVIDER must be auto, gemma or hosted (got {VISION_PROVIDER!r})")
+# Env only: never logged, never returned by /api/health. Unset: no hosted calls at all.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+HOSTED_MODEL = os.getenv("HOSTED_MODEL", "gemini-2.5-flash-lite").strip()  # cheapest Gemini model with image input
+if not HOSTED_MODEL.startswith("gemini"):
+    raise ValueError(f"HOSTED_MODEL must be a Gemini model name (got {HOSTED_MODEL!r})")
+HOSTED_TIMEOUT_SEC = _f("HOSTED_TIMEOUT_SEC", 60)  # one generateContent request
+HOSTED_CHECK_TIMEOUT_SEC = _f("HOSTED_CHECK_TIMEOUT_SEC", 5)  # the reachability GET (model metadata)
+HOSTED_CHECK_TTL_SEC = _f("HOSTED_CHECK_TTL_SEC", 300)  # how long a reachability result is reused
+HOSTED_RETRY_MAX_SEC = _f("HOSTED_RETRY_MAX_SEC", 10)  # longest Retry-After waited before the one retry
+HOSTED_CONCURRENCY = int(os.getenv("HOSTED_CONCURRENCY", 4))  # frames in flight for a hosted walk
+HOSTED_MAX_CALLS_PER_DAY = int(os.getenv("HOSTED_MAX_CALLS_PER_DAY", 5000))  # cost guard, per server, UTC day
 
 # On-device OCR (macOS Vision) grounds Gemma's sign text so it cannot invent room numbers.
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") != "0"
@@ -124,3 +154,7 @@ CLIMB_HINT_SEC = _f("CLIMB_HINT_SEC", 5.0)  # Gemma's stairs hint may come this 
 # stairwell sign of the floor the stairs lead to ('LEVEL 2' seen from the bottom of the flight): it is not floor
 # evidence for either floor (floors._approach). Room numbers there still count. 0 = off.
 CLIMB_SIGN_APPROACH_SEC = _f("CLIMB_SIGN_APPROACH_SEC", 5.0)
+
+# --- "Something's wrong here" reports (reports.py) ---
+REPORTS_PER_HOUR = int(os.getenv("REPORTS_PER_HOUR", 20))  # reports one reporter may send for one building per hour
+REPORTS_MAX = int(os.getenv("REPORTS_MAX", 5000))  # reports one building may hold; past this new ones get 507

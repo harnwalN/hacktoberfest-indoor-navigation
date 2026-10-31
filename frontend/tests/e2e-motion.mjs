@@ -29,7 +29,7 @@ async function session(vp, o = {}, ctxOpts = {}) {
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url()); const p = url.pathname.replace(/^\/api/, ''); const m = route.request().method()
     const json = (b, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) })
-    if (p === '/buildings') return json([{ id: 'b1', name: 'B1' }])
+    if (p === '/buildings') return json([{ id: 'b1', name: 'B1', role: 'owner' }])
     if (p === '/health') return json({ gemma: { ok: true, selected: 'gemma3', models: ['gemma3'] } })
     if (p === '/buildings/b1/map' && m === 'GET') {
       if (st.mapDelay) await sleep(st.mapDelay)

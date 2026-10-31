@@ -3,6 +3,7 @@ import { ArrowRight, Check, GitMerge, ImagePlus, Link2, Plus, RefreshCw, Save, T
 import { api, detail, frameUrl } from '../api'
 import ErrorBoundary from './ErrorBoundary'
 import Map3D from './Map3D'
+import ServerPhoto from './ServerPhoto'
 import { EmptyArt } from './Motion'
 import { PlaceChip, isMinorNode, placeKind } from './ArrowOverlay'
 
@@ -386,6 +387,19 @@ function MapReviewInner({ building, onChanged }) {
   const load = () => api.getMap(building)
     .then((m) => { setMap(normalize(m)); setDirty(false); setLoadFailed(false) })
     .catch((e) => { setError(detail(e)); setLoadFailed(true) })
+  // A photo URL failed (revoked or expired). Fetch the map once more and copy only the fresh photo URLs onto the nodes
+  // on screen, so unsaved edits are kept. A second failure keeps the placeholder.
+  const photoRefetch = useRef(false)
+  const onPhotoStale = () => {
+    if (photoRefetch.current) return
+    photoRefetch.current = true
+    api.getMap(building)
+      .then((m) => {
+        const fresh = Object.fromEntries((m?.nodes || []).map((n) => [n.id, n.frame_url ?? null]))
+        setMap((cur) => cur && { ...cur, nodes: cur.nodes.map((n) => (n.id in fresh ? { ...n, frame_url: fresh[n.id] } : n)) })
+      })
+      .catch(() => {})
+  }
   useEffect(() => {
     let live = true
     setMap(null); setSelected(null); setError(''); setNote(''); setDirty(false); setLoadFailed(false)
@@ -541,11 +555,11 @@ function MapReviewInner({ building, onChanged }) {
             <div key={s.id} className="merge">
               <div className="pair">
                 <figure>
-                  {byId[s.keep]?.frame_id && <img src={frameUrl(building, byId[s.keep].frame_id)} alt="" />}
+                  {byId[s.keep]?.frame_id && <ServerPhoto src={frameUrl(building, byId[s.keep].frame_id, byId[s.keep].frame_url)} alt="" onStale={onPhotoStale} placeholder={<div className="nophoto" />} />}
                   <figcaption>{byId[s.keep]?.label}</figcaption>
                 </figure>
                 <figure>
-                  {byId[s.remove]?.frame_id && <img src={frameUrl(building, byId[s.remove].frame_id)} alt="" />}
+                  {byId[s.remove]?.frame_id && <ServerPhoto src={frameUrl(building, byId[s.remove].frame_id, byId[s.remove].frame_url)} alt="" onStale={onPhotoStale} placeholder={<div className="nophoto" />} />}
                   <figcaption>{byId[s.remove]?.label}</figcaption>
                 </figure>
               </div>
@@ -573,7 +587,15 @@ function MapReviewInner({ building, onChanged }) {
               <Trash2 size={16} /> Delete
             </button>
           </div>
-          {sel.frame_id && <img className="node-photo" src={frameUrl(building, sel.frame_id)} alt={`Photo of ${sel.label}`} />}
+          {sel.frame_id && (
+            <ServerPhoto
+              className="node-photo"
+              src={frameUrl(building, sel.frame_id, sel.frame_url)}
+              alt={`Photo of ${sel.label}`}
+              onStale={onPhotoStale}
+              placeholder={<div className="nophoto node-photo" />}
+            />
+          )}
           <label className="field">
             <span>Label</span>
             <input value={sel.label} onChange={(e) => patchNode(sel.id, { label: e.target.value })} />
@@ -668,7 +690,13 @@ function MapReviewInner({ building, onChanged }) {
         <div className="node-grid">
           {sortedNodes.filter((n) => !hideWaypoints || n.id === selected || !isMinorNode(n)).map((n, k) => (
             <button key={n.id} className={`node-card ${selected === n.id ? 'sel' : ''}`} style={{ '--i': Math.min(k, 12) }} onClick={() => setSelected(n.id)}>
-              {n.frame_id ? <img src={frameUrl(building, n.frame_id)} loading="lazy" alt="" /> : <div className="nophoto" />}
+              <ServerPhoto
+                src={n.frame_id ? frameUrl(building, n.frame_id, n.frame_url) : null}
+                loading="lazy"
+                alt=""
+                onStale={onPhotoStale}
+                placeholder={<div className="nophoto" />}
+              />
               <span>{n.label || 'Unnamed place'}</span>
               <PlaceChip node={n} />
               <small>

@@ -302,6 +302,18 @@ small.error { color: var(--danger); }
 .trip-head p { flex: 1; margin: 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .trip-head b { color: var(--text); }
 .trip-head .icon-btn { background: var(--surface); border: 0; }
+
+/* avoid stairs: the toggle (planner and trip), its helper text, the route badge, and the error with its stairs offer */
+.avoid-stairs { margin: 4px 0; }
+.avoid-stairs .check { margin: 0; }
+.check-help { margin: 0 0 6px 30px; color: var(--muted); font-size: 0.9rem; }
+.trip-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 0 16px 8px; }
+.trip-summary .avoid-stairs { margin: 0; }
+.route-badge { display: inline-flex; align-items: center; min-height: 28px; padding: 2px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 700; white-space: nowrap; }
+.route-badge.is-step-free { background: var(--exit-bg); color: var(--exit-fg); }
+.route-badge.is-stairs { background: var(--stairs-bg); color: var(--stairs-fg); }
+.route-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+.route-error > button { min-height: var(--tap); }
 .step-count { font: 700 1rem var(--display); color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .scene { position: relative; margin: 0; background: var(--photo-bg); overflow: hidden; touch-action: pan-y; border-radius: var(--r-xl) var(--r-xl) 0 0; }
@@ -420,9 +432,12 @@ html:has(.trip-view) { scroll-padding-top: 76px; }
 .merge { background: var(--well); border-radius: var(--r-md); padding: 14px; margin-top: 12px; }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .pair figure { margin: 0; }
-.pair img { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; border-radius: var(--r-md); }
+.pair img, .pair .nophoto { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; border-radius: var(--r-md); }
 .pair figcaption { font-size: 0.88rem; color: var(--muted); margin-top: 4px; }
 .node-photo { max-height: 320px; border-radius: var(--r-md); margin-bottom: 8px; }
+/* Placeholder shown in place of a photo that failed to load (see ServerPhoto). */
+.nophoto { background: var(--border); border-radius: var(--r-md); }
+.nophoto.node-photo { width: 100%; aspect-ratio: 4 / 3; }
 .scroll-hint { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; font-size: 0.85rem; font-weight: 700; color: var(--text-2); }
 .table-scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; border-radius: var(--r-sm); scrollbar-width: thin; }
 .edges { width: 100%; min-width: 600px; border-collapse: collapse; font-size: 0.9rem; }
@@ -465,6 +480,8 @@ html:has(.trip-view) { scroll-padding-top: 76px; }
 .queue li > :not(.q-main) { margin: 0 14px 12px; }
 .banner-dismiss { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .banner-dismiss > button { flex: none; min-width: var(--tap); min-height: var(--tap); color: var(--danger-deep); }
+.notice-dismiss { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.notice-dismiss > button { flex: none; min-width: var(--tap); min-height: var(--tap); }
 @media (hover: hover) { .banner-dismiss > button.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--danger-deep) 14%, transparent); } }
 
 /* visually hidden; becomes visible while something inside has keyboard focus */
@@ -494,10 +511,12 @@ html:has(.trip-view) { scroll-padding-top: 76px; }
 .strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; scroll-snap-type: x proximity; }
 .thumb { flex: 0 0 100px; display: flex; flex-direction: column; gap: 3px; padding: 5px; font-size: 0.78rem; font-weight: 400; text-align: left; align-items: stretch; scroll-snap-align: start; min-height: 0; border-radius: var(--r-md); }
 .thumb img { width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: var(--r-sm); }
+.thumb .nophoto { width: 100%; aspect-ratio: 9 / 16; border-radius: var(--r-sm); }
 .thumb b { color: var(--accent-deep); font-size: 0.78rem; }
 .thumb.sel { border-color: var(--accent); }
 .kf-detail { display: grid; grid-template-columns: minmax(0, 200px) 1fr; gap: 12px; margin-top: 10px; }
 .kf-detail img { border-radius: var(--r-md); }
+.kf-detail .nophoto { border-radius: var(--r-md); aspect-ratio: 3 / 4; width: 100%; }
 .kf-detail pre { margin: 0; font-size: 0.8rem; background: var(--well); padding: 12px; border-radius: var(--r-md); overflow: auto; max-height: 360px; }
 @media (max-width: 560px) { .kf-detail { grid-template-columns: 1fr; } }
 
@@ -740,3 +759,49 @@ html, body { overflow-x: clip; }
 }
 /* background tab: freeze every running animation (set from main.jsx on visibilitychange) */
 .page-hidden *, .page-hidden *::before, .page-hidden *::after { animation-play-state: paused !important; }
+
+/* ---------- access: invites, owner key, sign out, sharing ---------- */
+[hidden] { display: none !important; } /* the attribute must win over the display rules below */
+.topbar-tools { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.topbar-tools .building-picker { flex: 0 1 220px; min-width: 150px; }
+.pill.role-viewer { background: var(--hallway-bg); color: var(--hallway-fg); }
+.pill.role-editor { background: var(--room-bg); color: var(--room-fg); }
+.pill.role-owner { background: var(--exit-bg); color: var(--exit-fg); }
+.signout { position: relative; flex: none; }
+.signout-btn { background: var(--well); border-color: transparent; color: var(--text-2); }
+.signout-panel { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; width: min(300px, 86vw); display: grid; gap: 8px; padding: 14px; border-radius: var(--r-md); background: var(--surface); }
+.signout-panel p { margin: 0; font-size: 0.9rem; }
+.signout-options { display: grid; gap: 6px; }
+.signout-options button { justify-content: flex-start; }
+.access-screen { display: grid; gap: 12px; max-width: 560px; width: 100%; margin: 12px auto 0; }
+.access-screen h2 { margin-bottom: 0; }
+.access-screen h2:focus { outline-offset: 4px; }
+.access-form { display: grid; gap: 8px; }
+.access-form .field { margin: 0; }
+.access-form > button { justify-self: start; }
+.access-owner { display: grid; gap: 8px; justify-items: start; }
+.access-owner .access-form { width: 100%; }
+.access-others, .access-signout { display: grid; gap: 8px; }
+.access-signout { border-top: 1px solid var(--rule); padding-top: 14px; }
+.loading-card { color: var(--muted); }
+.share-panel { display: grid; gap: 12px; }
+.share-panel h3 { margin: 0; }
+.share-panel > p { margin: 0; }
+.share-form { display: grid; gap: 4px; }
+.share-form > button { justify-self: start; }
+.role-choice { border: 0; margin: 4px 0 0; padding: 0; display: grid; gap: 4px; min-width: 0; }
+.role-choice legend { font-size: 0.92rem; font-weight: 700; color: var(--text-2); padding: 0; margin-bottom: 2px; }
+.role-choice .check { align-items: flex-start; margin: 0; }
+.role-choice .check > span { padding-top: 12px; }
+.share-made { display: grid; gap: 8px; padding: 14px; border-radius: var(--r-md); background: var(--well); }
+.share-made > p { margin: 0; }
+.share-made input { font-size: 0.92rem; }
+.invites { display: grid; gap: 8px; }
+.invites h4 { margin: 8px 0 0; font-size: 1rem; }
+.invite-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.invite-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.invite-main { display: grid; gap: 2px; min-width: 0; }
+.invite-main b { overflow-wrap: anywhere; }
+.invite-row.is-revoked .invite-main b { color: var(--muted); text-decoration: line-through; }
+.revoke-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 0.92rem; }
+.revoke-confirm > span { flex-basis: 100%; }

@@ -56,13 +56,16 @@ def test_stairs_flip(bundle):
 
 
 def test_direction_correct_photos(bundle):
+    def path(url):  # frame URLs carry ?exp=&sig=; the photo name is what these checks are about
+        return url.split("?")[0]
+
     up = routing.route(bundle, "A", "T")
-    assert up.steps[0].frame_url.endswith("A_dep.jpg")
-    assert up.steps[1].frame_url.endswith("B_arr.jpg")
+    assert path(up.steps[0].frame_url).endswith("A_dep.jpg")
+    assert path(up.steps[1].frame_url).endswith("B_arr.jpg")
     down = routing.route(bundle, "S", "A")  # S->B was never walked: node photo + a note
-    assert down.steps[0].frame_url.endswith("/S.jpg") and down.steps[0].view_note
-    assert down.steps[1].frame_url.endswith("/B.jpg") and down.steps[1].view_note
-    assert down.steps[2].frame_url.endswith("A_arr.jpg") and down.steps[2].view_note is None
+    assert path(down.steps[0].frame_url).endswith("/S.jpg") and down.steps[0].view_note
+    assert path(down.steps[1].frame_url).endswith("/B.jpg") and down.steps[1].view_note
+    assert path(down.steps[2].frame_url).endswith("A_arr.jpg") and down.steps[2].view_note is None
 
 
 def test_no_path(bundle):

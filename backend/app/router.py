@@ -6,15 +6,16 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 import networkx as nx
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from PIL import Image
 
-from . import config, gemma, jobs, mapper, routing, store
+from . import auth, config, gemma, jobs, mapper, reports, routing, store
 from .schemas import (
-    CreateBuilding, FrameAnalysis, ManualMerge, MapBundle, MapEdit, MergeDecision, Node, RouteRequest,
-    RouteResponse, VideoUpdate,
+    CreateBuilding, EdgeOut, FrameAnalysis, InviteCreate, ManualMerge, MapBundle, MapEdit, MapOut, MergeDecision, Node,
+    NodeOut, ReportCreate, ReportStatusUpdate, RouteRequest, RouteResponse, VideoUpdate,
 )
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,25 @@ def _load(building_id: str) -> MapBundle:
         return store.load_map(building_id)
     except (FileNotFoundError, ValueError):
         raise HTTPException(404, f"Unknown building '{building_id}'")
+
+
+def _map_out(bundle: MapBundle) -> MapOut:
+    """The map as an API response: each photo reference (node frame_id, edge frames_fwd/frames_rev) also comes
+    with its URL, built now. The bundle is not changed, so none of this reaches map.json."""
+    bid = bundle.building_id
+    names = {n.frame_id for n in bundle.nodes} | {f for e in bundle.edges for f in e.frames_fwd + (e.frames_rev or [])}
+    names.discard(None)
+    ordered = list(names)
+    urls = dict(zip(ordered, auth.frame_urls(bid, ordered)))  # one signing-key read for the whole map
+    nodes = [NodeOut(**n.model_dump(), frame_url=urls.get(n.frame_id)) for n in bundle.nodes]
+    edges = [EdgeOut(**e.model_dump(), frames_fwd_urls=[urls[f] for f in e.frames_fwd],
+                     frames_rev_urls=None if e.frames_rev is None else [urls[f] for f in e.frames_rev])
+             for e in bundle.edges]
+    return MapOut(**bundle.model_dump(exclude={"nodes", "edges"}), nodes=nodes, edges=edges)
+
+
+def _node_out(building_id: str, node: Node) -> NodeOut:
+    return NodeOut(**node.model_dump(), frame_url=store.frame_url(building_id, node.frame_id))
 
 
 _CHUNK = 1 << 20
@@ -71,26 +91,73 @@ def _image_ext(data: bytes) -> str:
 def health():
     ffmpeg = shutil.which("ffmpeg")
     version = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True).stdout.split("\n")[0] if ffmpeg else None
-    return {"ffmpeg": version, "gemma": gemma.health()}
+    return {"ffmpeg": version, "gemma": gemma.health(), "hosted": gemma.hosted_health(),
+            "vision_provider": gemma.vision_provider()}
 
 
 # ---------- buildings & map ----------
 @api.get("/buildings")
-def list_buildings():
-    return store.list_buildings()
+def list_buildings(request: Request, authorization: str | None = Header(None),
+                   x_access_tokens: str | None = Header(None, alias="X-Access-Tokens")):
+    """Buildings the caller may open, each with their role. Owner key (Authorization): all. Invite tokens
+    (X-Access-Tokens, comma-separated): their buildings. No valid token: []. Any other Authorization: 401."""
+    grants = auth.caller_grants(request, authorization, x_access_tokens)
+    if grants is not None and not grants:
+        return []
+    out = []
+    for b in store.list_buildings(only=None if grants is None else set(grants)):
+        role = "owner" if grants is None else grants.get(b["id"])
+        if role:
+            out.append({**b, "role": role})
+    return out
 
 
-@api.post("/buildings")
+@api.post("/buildings", dependencies=[Depends(auth.require_owner_key)])
 def create_building(body: CreateBuilding):
     return store.create_building(body.name.strip() or "Building")
 
 
-@api.get("/buildings/{building_id}/map")
-def get_map(building_id: str) -> MapBundle:
-    return _load(building_id)
+@api.get("/buildings/{building_id}/access")
+def my_access(building_id: str, role: str = Depends(auth.require("viewer"))):
+    """The caller's role on this building (the frontend uses it to show or hide editing). Editors and the owner
+    also get open_reports, the number of open 'something's wrong' reports; viewers do not."""
+    _load(building_id)  # the owner key on an unknown building: 404, as everywhere else
+    if role in ("editor", "owner"):
+        return {"role": role, "open_reports": reports.open_count(building_id)}
+    return {"role": role}
 
 
-@api.put("/buildings/{building_id}/map")
+@api.post("/buildings/{building_id}/invites", dependencies=[Depends(auth.require("owner"))])
+def create_invite(building_id: str, body: InviteCreate):
+    """Owner only. The raw token is in this response and nowhere else: only its SHA-256 is stored."""
+    _load(building_id)
+    entry, token = auth.create_invite(building_id, body.role, (body.label or "").strip())
+    return {"id": entry["id"], "role": entry["role"], "label": entry["label"], "created_at": entry["created_at"],
+            "token": token, "join_path": f"#/join?b={building_id}&t={token}"}
+
+
+@api.get("/buildings/{building_id}/invites", dependencies=[Depends(auth.require("owner"))])
+def list_invites(building_id: str):
+    _load(building_id)
+    return auth.list_invites(building_id)
+
+
+@api.delete("/buildings/{building_id}/invites/{invite_id}", dependencies=[Depends(auth.require("owner"))])
+def revoke_invite(building_id: str, invite_id: str):
+    """The token stops working immediately (401). The record stays in the list, marked revoked."""
+    _load(building_id)
+    entry = auth.revoke_invite(building_id, invite_id)
+    if entry is None:
+        raise HTTPException(404, "Unknown invite")
+    return entry
+
+
+@api.get("/buildings/{building_id}/map", dependencies=[Depends(auth.require("viewer"))])
+def get_map(building_id: str) -> MapOut:
+    return _map_out(_load(building_id))
+
+
+@api.put("/buildings/{building_id}/map", dependencies=[Depends(auth.require("editor"))])
 def save_map(building_id: str, body: MapEdit):
     """Save the editor's places and connections.
 
@@ -99,6 +166,7 @@ def save_map(building_id: str, body: MapEdit):
     processed_with, name, suggested merges) is owned by the server and read from disk, so a stale editor copy cannot reset
     walk statuses or persist bad video ids. Load + apply + save happen under the building lock, so the
     save serializes with background jobs instead of overwriting their video/merge bookkeeping.
+    A `frame_url` sent back in the nodes is ignored: photo URLs are built by the server for each response.
     """
     with store.lock_for(building_id):
         bundle = _load(building_id)
@@ -108,11 +176,12 @@ def save_map(building_id: str, body: MapEdit):
         bundle.suggested_merges = [s for s in bundle.suggested_merges if s.keep in ids and s.remove in ids]
         mapper.finalize(bundle)
         store.save_map(bundle)  # re-takes the same RLock: fine
-    return {"status": "ok", "map": bundle}
+        out = _map_out(bundle)
+    return {"status": "ok", "map": out}
 
 
-@api.post("/buildings/{building_id}/merges/{merge_id}")
-def resolve_merge(building_id: str, merge_id: str, body: MergeDecision):
+@api.post("/buildings/{building_id}/merges/{merge_id}", dependencies=[Depends(auth.require("editor"))])
+def resolve_merge(building_id: str, merge_id: str, body: MergeDecision) -> MapOut:
     with store.lock_for(building_id):
         bundle = _load(building_id)
         s = next((s for s in bundle.suggested_merges if s.id == merge_id), None)
@@ -132,11 +201,11 @@ def resolve_merge(building_id: str, merge_id: str, body: MergeDecision):
         else:
             bundle.suggested_merges = [x for x in bundle.suggested_merges if x.id != merge_id]
         store.save_map(bundle)
-    return bundle
+        return _map_out(bundle)
 
 
-@api.post("/buildings/{building_id}/merge")
-def manual_merge(building_id: str, body: ManualMerge):
+@api.post("/buildings/{building_id}/merge", dependencies=[Depends(auth.require("editor"))])
+def manual_merge(building_id: str, body: ManualMerge) -> MapOut:
     with store.lock_for(building_id):
         bundle = _load(building_id)
         ids = {n.id for n in bundle.nodes}
@@ -144,7 +213,7 @@ def manual_merge(building_id: str, body: ManualMerge):
             raise HTTPException(400, "Pick two different existing nodes")
         _merge_or_400(bundle, body.keep, body.remove)
         store.save_map(bundle)
-    return bundle
+        return _map_out(bundle)
 
 
 def _merge_or_400(bundle: MapBundle, keep: str, remove: str) -> None:
@@ -156,7 +225,7 @@ def _merge_or_400(bundle: MapBundle, keep: str, remove: str) -> None:
 
 
 # ---------- processing ----------
-@api.post("/buildings/{building_id}/videos")
+@api.post("/buildings/{building_id}/videos", dependencies=[Depends(auth.require("editor"))])
 async def upload_video(
     building_id: str,
     video: UploadFile = File(...),
@@ -188,7 +257,7 @@ async def upload_video(
     return {"job_id": job.id, "video_id": job.video_id}
 
 
-@api.patch("/buildings/{building_id}/videos/{video_id}")
+@api.patch("/buildings/{building_id}/videos/{video_id}", dependencies=[Depends(auth.require("editor"))])
 def update_video(building_id: str, video_id: str, body: VideoUpdate):
     """Set the floor a walk starts on. Places from an already-processed walk move instantly."""
     with store.lock_for(building_id):
@@ -204,7 +273,7 @@ def update_video(building_id: str, video_id: str, body: VideoUpdate):
     return v
 
 
-@api.delete("/buildings/{building_id}/videos/{video_id}")
+@api.delete("/buildings/{building_id}/videos/{video_id}", dependencies=[Depends(auth.require("editor"))])
 def delete_video(building_id: str, video_id: str):
     """Remove a video: cancels its processing, drops its places/connections, frames and files.
     Places that other videos also pass through are kept."""
@@ -219,20 +288,20 @@ def delete_video(building_id: str, video_id: str):
         raise HTTPException(404, "Unknown video")
 
 
-@api.post("/buildings/{building_id}/consolidate")
+@api.post("/buildings/{building_id}/consolidate", dependencies=[Depends(auth.require("editor"))])
 def consolidate(building_id: str):
     """Link all walks into one map now (runs next in the queue; fast, Gemma answers are cached)."""
     _load(building_id)
     return {"job_id": jobs.submit_consolidate(building_id).id}
 
 
-@api.post("/buildings/{building_id}/rebuild")
+@api.post("/buildings/{building_id}/rebuild", dependencies=[Depends(auth.require("editor"))])
 def rebuild(building_id: str):
     _load(building_id)
     return {"job_id": jobs.submit_rebuild(building_id).id}
 
 
-@api.get("/jobs/{job_id}")
+@api.get("/jobs/{job_id}", dependencies=[Depends(auth.require_job("editor"))])
 def job_status(job_id: str):
     job = jobs.get(job_id)
     if job is None:
@@ -240,12 +309,12 @@ def job_status(job_id: str):
     return job.public()
 
 
-@api.get("/buildings/{building_id}/queue")
+@api.get("/buildings/{building_id}/queue", dependencies=[Depends(auth.require("editor"))])
 def job_queue(building_id: str):
     return [j.public() | {"log": j.log[-1:]} for j in jobs.queue(building_id)]
 
 
-@api.post("/jobs/{job_id}/{action}")
+@api.post("/jobs/{job_id}/{action}", dependencies=[Depends(auth.require_job("editor"))])
 def job_action(job_id: str, action: str):
     """action: pause | resume | run-next (move to front; pauses the running job, which resumes after)."""
     if jobs.get(job_id) is None:
@@ -256,7 +325,7 @@ def job_action(job_id: str, action: str):
     return fn(job_id).public()
 
 
-@api.get("/buildings/{building_id}/videos/{video_id}/debug")
+@api.get("/buildings/{building_id}/videos/{video_id}/debug", dependencies=[Depends(auth.require("editor"))])
 def video_debug(building_id: str, video_id: str):
     """Motion track + events + keyframes with Gemma output: the 'what did the AI see' view."""
     _load(building_id)
@@ -279,7 +348,7 @@ def video_debug(building_id: str, video_id: str):
     }
 
 
-@api.post("/buildings/{building_id}/frames/manual")
+@api.post("/buildings/{building_id}/frames/manual", dependencies=[Depends(auth.require("editor"))])
 async def manual_frame(building_id: str, image: UploadFile = File(...), label: str = Form("")):
     """Add a photo by hand (e.g. a sign the video blurred). Gemma labels it; connect it in the editor."""
     bundle = _load(building_id)
@@ -308,16 +377,72 @@ async def manual_frame(building_id: str, image: UploadFile = File(...), label: s
         bundle.nodes.append(node)
         mapper.finalize(bundle)
         store.save_map(bundle)
-    return {"node": node, "analysis": a, **({"warning": warning} if warning else {})}
+    return {"node": _node_out(building_id, node), "analysis": a, **({"warning": warning} if warning else {})}
 
 
 # ---------- navigation ----------
-@api.post("/buildings/{building_id}/route")
+@api.post("/buildings/{building_id}/route", dependencies=[Depends(auth.require("viewer"))])
 def route(building_id: str, body: RouteRequest) -> RouteResponse:
     bundle = _load(building_id)
     try:
-        return routing.route(bundle, body.start_node_id, body.target_node_id)
+        return routing.route(bundle, body.start_node_id, body.target_node_id, avoid_stairs=body.avoid_stairs)
     except KeyError as exc:
         raise HTTPException(404, f"Unknown node {exc}")
+    except routing.NoStepFreePath as exc:
+        raise HTTPException(400, str(exc))
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         raise HTTPException(400, routing.NO_PATH_MESSAGE)
+
+
+# ---------- problem reports (reports.py) ----------
+def _refused(exc: reports.Refused) -> HTTPException:
+    return HTTPException(exc.status, exc.detail, headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else None)
+
+
+def _with_labels(bundle: MapBundle, items: list[dict]) -> list[dict]:
+    """Adds node_label: the label of node_id on the current map, or null if that place no longer exists."""
+    labels = {n.id: n.label for n in bundle.nodes}
+    return [{**item, "node_label": labels.get(item["node_id"]) if item["node_id"] else None} for item in items]
+
+
+@api.post("/buildings/{building_id}/reports", dependencies=[Depends(auth.require("viewer"))])
+def create_report(building_id: str, body: ReportCreate, authorization: str | None = Header(None)):
+    """Flag a wrong step or place. Any role that can read the building may send one. node_id, from_node and
+    to_node must exist on the current map. 429 + Retry-After past REPORTS_PER_HOUR for this reporter; 507 once
+    the building holds REPORTS_MAX reports."""
+    with store.lock_for(building_id):
+        bundle = _load(building_id)
+        ids = {n.id for n in bundle.nodes}
+        for field in ("node_id", "from_node", "to_node"):
+            if getattr(body, field) is not None and getattr(body, field) not in ids:
+                raise HTTPException(422, f"{field}: no place with that id on this map")
+        fields = {"kind": body.kind, "note": body.note, "node_id": body.node_id, "step_index": body.step_index,
+                  "from_node": body.from_node, "to_node": body.to_node}
+        try:
+            return reports.add(building_id, fields, reports.reporter_for(building_id, authorization))
+        except reports.Refused as exc:
+            raise _refused(exc)
+
+
+@api.get("/buildings/{building_id}/reports", dependencies=[Depends(auth.require("editor"))])
+def list_reports(building_id: str, status: Literal["open", "resolved", "all"] = "open",
+                 limit: int = Query(100, ge=1, le=500)):
+    """Newest first. status: open (default), resolved or all. Each item has its full history."""
+    bundle = _load(building_id)
+    return _with_labels(bundle, reports.list_reports(building_id, status, limit))
+
+
+@api.patch("/buildings/{building_id}/reports/{report_id}", dependencies=[Depends(auth.require("editor"))])
+def update_report(building_id: str, report_id: str, body: ReportStatusUpdate,
+                  authorization: str | None = Header(None)):
+    """Resolve or reopen a report. Appends a status event (the history is kept). resolution_note is kept only
+    when resolving; reopening clears it."""
+    bundle = _load(building_id)
+    try:
+        by = reports.reporter_for(building_id, authorization)
+        item = reports.set_status(building_id, report_id, body.status, body.resolution_note, by)
+    except reports.Refused as exc:
+        raise _refused(exc)
+    if item is None:
+        raise HTTPException(404, "Unknown report")
+    return _with_labels(bundle, [item])[0]

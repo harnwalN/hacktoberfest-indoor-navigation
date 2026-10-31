@@ -7,6 +7,10 @@ Cache first: every call looks its answer up before contacting Ollama, so a build
 processed can be rebuilt with Ollama stopped and keeps every Gemma answer. The model used for the key is
 the explicit `model` argument, else the one of the enclosing `session()` (jobs set it to the model the walk
 was processed with), else the last resolved / configured GEMMA_MODEL.
+
+A model name starting with "gemini" is the hosted model (hosted.py) and goes through the same functions: the
+same prompts, parse and grounding. choose_model() picks it for a new walk (VISION_PROVIDER), and a walk keeps
+that one model for every call, so answers from different models are never mixed.
 """
 import contextvars
 import functools
@@ -27,7 +31,7 @@ import httpx
 import ollama
 from PIL import Image, ImageOps
 
-from . import config, ocr
+from . import config, hosted, ocr
 from .matching import PLAQUE_PREFIX, complete_room_id, directional, room_id, room_ids
 from .schemas import FrameAnalysis, GemmaFrame, SamePlace
 
@@ -160,7 +164,14 @@ def available_models() -> list[str]:
 
 
 def ensure_model(model: str) -> None:
-    """Fail fast if `model` is not pulled (or Ollama is down), instead of failing on every frame."""
+    """Fail fast if `model` is not pulled (or Ollama is down), instead of failing on every frame. A hosted model is
+    checked for its key, the daily call limit and reachability instead."""
+    if hosted.is_hosted(model):
+        try:
+            hosted.check(model)
+        except hosted.HostedError as exc:
+            raise GemmaUnavailable(str(exc)) from exc
+        return
     try:
         _client(timeout=config.GEMMA_LIST_TIMEOUT_SEC).show(model)
     except ollama.ResponseError as exc:
@@ -196,6 +207,32 @@ def resolve_model() -> str:
             _resolved_model = gemmas[0]
             return gemmas[0]
         raise GemmaUnavailable(f"No Gemma model pulled. Run: ollama pull {config.GEMMA_MODEL}")
+
+
+def choose_model() -> str:
+    """The model for a walk that was not given one. Called once when the walk starts; the walk keeps it for every
+    call. VISION_PROVIDER=hosted: the hosted model (the key is required, else GemmaUnavailable). auto: the hosted
+    model when the key is set, the daily limit has room and the API answers; else the local Gemma model, exactly as
+    before. gemma: always local, the hosted API is not contacted."""
+    provider = config.VISION_PROVIDER
+    if provider == "hosted":
+        try:
+            hosted.require_key()
+        except hosted.HostedError as exc:
+            raise GemmaUnavailable(str(exc)) from exc
+        return config.HOSTED_MODEL
+    if provider == "auto" and hosted.auto_ready():
+        return config.HOSTED_MODEL
+    return resolve_model()
+
+
+def vision_provider() -> dict:
+    """/api/health: the VISION_PROVIDER setting and the provider that `auto` would pick for a new walk now."""
+    return {"setting": config.VISION_PROVIDER, "auto_pick": "hosted" if hosted.auto_ready() else "gemma"}
+
+
+def hosted_health() -> dict:
+    return hosted.health()
 
 
 def health() -> dict:
@@ -349,7 +386,9 @@ def _schema(schema_cls) -> dict:
 def _chat(model: str, prompt: str, images: list[bytes], schema_cls, num_predict: int):
     """One structured answer. At most 2 attempts: a transient error (connection reset, timeout, HTTP 5xx) or
     unparseable JSON is retried once; anything else (404 model not found, other 4xx, truncated output)
-    raises GemmaUnavailable immediately."""
+    raises GemmaUnavailable immediately. A "gemini" model goes to the hosted API (_chat_hosted) with the same rules."""
+    if hosted.is_hosted(model):
+        return _chat_hosted(model, prompt, images, schema_cls, num_predict)
     last_exc: Exception | None = None
     for _ in range(2):
         try:
@@ -380,6 +419,37 @@ def _chat(model: str, prompt: str, images: list[bytes], schema_cls, num_predict:
                     f"Gemma output truncated at num_predict={num_predict} tokens (raise GEMMA_NUM_PREDICT_*)") from exc
             last_exc = exc
     raise GemmaUnavailable(f"Gemma failed after a retry: {type(last_exc).__name__}: {last_exc}")
+
+
+def _chat_hosted(model: str, prompt: str, images: list[bytes], schema_cls, num_predict: int):
+    """_chat for the hosted Gemini model, same contract: 2 attempts; one retry after a transient failure (network,
+    429, 5xx, unreadable answer or JSON that does not parse), waiting the Retry-After the server gave (default 1 s).
+    A Retry-After longer than HOSTED_RETRY_MAX_SEC is not waited for: no retry. 4xx, a SAFETY or other blocked
+    answer and truncated output (MAX_TOKENS) raise GemmaUnavailable at once. Parsed with the same pydantic model."""
+    schema = hosted.response_schema(_schema(schema_cls))
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            reply = hosted.generate(model, prompt, images, schema, num_predict)
+        except hosted.HostedError as exc:
+            if not exc.retry:
+                raise GemmaUnavailable(str(exc)) from exc
+            last_exc = exc
+            if attempt == 0:
+                wait = hosted.DEFAULT_WAIT_SEC if exc.retry_after is None else exc.retry_after
+                if wait > config.HOSTED_RETRY_MAX_SEC:
+                    raise GemmaUnavailable(f"{exc}; Gemini asked to wait {wait:.0f} s (over HOSTED_RETRY_MAX_SEC), "
+                                           "so no retry") from exc
+                hosted.sleep(wait)
+            continue
+        if reply.finish == "MAX_TOKENS":
+            raise GemmaUnavailable(
+                f"Gemini output truncated at num_predict={num_predict} tokens (raise GEMMA_NUM_PREDICT_*)")
+        try:
+            return _parse(reply.text, schema_cls)
+        except ValueError as exc:  # invalid JSON or schema mismatch: one more attempt, as for Gemma
+            last_exc = exc
+    raise GemmaUnavailable(f"Gemini failed after a retry: {type(last_exc).__name__}: {last_exc}")
 
 
 def _strip_ungrounded_numbers(text: str, lines: list[str]) -> tuple[str, bool]:
@@ -573,10 +643,12 @@ def _cached(cache: GemmaCache, key_for, models, model_cls):
 
 
 def _offline_models(explicit: str | None) -> list[str]:
-    """Models whose cached answers are acceptable when Ollama cannot be asked."""
+    """Models whose cached answers are acceptable when the model cannot be asked. Only models of the same provider
+    as the walk's own (hosted with hosted, local with local): a walk never reads another provider's labels."""
     s = _session.get()
-    out = list(s.lookup) if s else []
-    if not explicit:  # nobody chose a model: any of the usual ones
+    same = hosted.is_hosted(explicit)
+    out = [m for m in (s.lookup if s else ()) if hosted.is_hosted(m) == same]
+    if not explicit:  # nobody chose a model: any of the usual local ones
         out += [_resolved_model, config.GEMMA_MODEL, config.GEMMA_FALLBACK_MODEL]
     return out
 
@@ -593,7 +665,7 @@ def _cache_first(cache: GemmaCache, key_for, model_cls, model: str | None, compu
             return hit
         raise NotCached("Gemma offline in this job and the answer is not cached")
     try:
-        use = explicit or resolve_model()
+        use = explicit or choose_model()
     except GemmaUnavailable:
         if s is not None:
             s.offline = True
