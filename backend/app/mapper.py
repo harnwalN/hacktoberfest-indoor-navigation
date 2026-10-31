@@ -111,11 +111,17 @@ def fuzzy_name_match(a: list[str], b: list[str], threshold: float = 0.65) -> boo
 
 
 @lru_cache(maxsize=2048)
-def _orb_features(path: str):
+def _orb_features(path: str, zoom: float = 1.0):
+    """ORB keypoints of a photo; zoom < 1 keeps only the centre (that fraction of width and height), enlarged: the
+    view ahead as it looks a few metres closer."""
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None, None, (0, 0)
     h, w = img.shape
+    if zoom < 1.0:
+        ch, cw = int(h * zoom), int(w * zoom)
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        img = cv2.resize(img[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_CUBIC)
     s = 640 / max(h, w)
     if s < 1:
         img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
@@ -123,10 +129,9 @@ def _orb_features(path: str):
     return [k.pt for k in kp], des, img.shape
 
 
-def orb_match(path_a: Path, path_b: Path) -> tuple[int, float | None]:
-    """Return (homography inliers, yaw of B relative to A in degrees, if well-determined)."""
-    pa, da, sa = _orb_features(str(path_a))
-    pb, db, _ = _orb_features(str(path_b))
+def _homography(fa, fb):
+    """(inliers, homography or None) between two _orb_features results."""
+    (pa, da, _), (pb, db, _) = fa, fb
     if da is None or db is None or len(da) < 10 or len(db) < 10:
         return 0, None
     pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
@@ -138,8 +143,25 @@ def orb_match(path_a: Path, path_b: Path) -> tuple[int, float | None]:
     H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
     if H is None:
         return 0, None
-    inliers = int(mask.sum())
-    h, w = sa
+    return int(mask.sum()), H
+
+
+def zoomed_inliers(path_a: Path, path_b: Path, zoom: float = 0.67) -> int:
+    """Feature matches between two photos of one sign taken from different distances: the farther view's centre,
+    enlarged, against the nearer view (either photo may be the farther one). Plain ORB loses a sign that is a
+    third of the size in one photo."""
+    a, b = _orb_features(str(path_a)), _orb_features(str(path_b))
+    za, zb = _orb_features(str(path_a), zoom), _orb_features(str(path_b), zoom)
+    return max(_homography(za, b)[0], _homography(zb, a)[0])
+
+
+def orb_match(path_a: Path, path_b: Path) -> tuple[int, float | None]:
+    """Return (homography inliers, yaw of B relative to A in degrees, if well-determined)."""
+    fa = _orb_features(str(path_a))
+    inliers, H = _homography(fa, _orb_features(str(path_b)))
+    if H is None:
+        return inliers, None
+    h, w = fa[2]
     centre = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), H)[0, 0]
     dx = float(centre[0] - w / 2)
     rel = -math.degrees(math.atan2(dx, focal_px(w, h)))
@@ -207,13 +229,26 @@ KEY_SIGN_WORDS = {
 }
 _NEGATION = {"NO", "NOT", "NON"}  # 'NO EXIT', 'NOT AN EXIT', 'NON-EXIT', 'DO NOT ENTER', 'NO ENTRY'
 _NEG_SCOPE = 2  # a negation reaches the next word or the one after ('NOT AN EXIT', 'NO THROUGH EXIT')
+_ARTICLES = {"A", "AN", "THE"}  # 'NOT AN' + 'EXIT' on two lines: the negation still reaches the next line
 _KEY_WORDS = set().union(*KEY_SIGN_WORDS.values())
+_OCR_LOOKALIKE = str.maketrans("01", "OI")
+
+
+def _ocr_letters(token: str) -> str:
+    """A word OCR spelled with a 0 for an O or a 1 for an I ('N0', 'EX1T', 'N0EXIT') back in letters. Only a token
+    that is mostly letters and has no other digit: plaques ('107', '1O7', '214A', '101') keep their digits."""
+    digits = sum(ch.isdigit() for ch in token)
+    if not digits or digits > len(token) - digits or any(ch.isdigit() and ch not in "01" for ch in token):
+        return token
+    return token.translate(_OCR_LOOKALIKE)
 
 
 def _sign_words(text: str) -> list[str]:
-    """Upper-case words, with a negation OCR glued on split off again ('NOEXIT' -> 'NO', 'EXIT')."""
+    """Upper-case words, with a negation OCR glued on split off again ('NOEXIT' -> 'NO', 'EXIT') and OCR's 0-for-O /
+    1-for-I read back as letters ('N0 EXIT' -> 'NO', 'EXIT')."""
     out = []
-    for w in re.findall(r"[A-Z]+", text.upper()):
+    text = re.sub(r"[A-Z0-9]+", lambda m: _ocr_letters(m.group()), text.upper())
+    for w in re.findall(r"[A-Z]+", text):
         neg = next((n for n in ("NOT", "NON", "NO") if w.startswith(n) and w[len(n):] in _KEY_WORDS), None)
         out += [neg, w[len(neg):]] if neg else [w]
     return out
@@ -263,15 +298,22 @@ def _negated_spans(text: str, kind: str) -> list[list[str]]:
 
 
 def _split_signs(lines: list[str]) -> list[str]:
-    """Neighbouring lines read as one sign where a line ends in a negation: OCR splits a 'NO EXIT' plate into
-    'NO' + 'EXIT' (a bare 'NO' line may come after the line it belongs to). 'NO SMOKING' + 'EXIT' stays two."""
+    """Neighbouring lines read as one sign where a line ends in a negation, or a negation and an article: OCR splits
+    a 'NO EXIT' plate into 'NO' + 'EXIT', 'NOT AN EXIT' into 'NOT AN' + 'EXIT' or 'NOT' + 'AN' + 'EXIT' (an
+    article alone on the next line: the chain goes on to the line after, three lines at most; a line that is only
+    the negation may come after the line it belongs to). 'NO SMOKING' + 'EXIT' stays two."""
     out = []
     for i, line in enumerate(lines):
         words = _sign_words(line)
+        while words and words[-1] in _ARTICLES and len(words) > 1:
+            words = words[:-1]  # 'NOT AN' / 'NOT A' / 'NOT THE': the negation reaches past the article
         if not words or words[-1] not in _NEGATION:
             continue
         if i + 1 < len(lines):
             out.append(f"{line} {lines[i + 1]}")
+            nxt = _sign_words(lines[i + 1])
+            if i + 2 < len(lines) and nxt and all(w in _ARTICLES for w in nxt):
+                out.append(f"{line} {lines[i + 1]} {lines[i + 2]}")  # 'NOT' + 'AN' + 'EXIT'
         if i > 0 and len(words) == 1:
             out.append(f"{line} {lines[i - 1]}")
     return out
@@ -1510,14 +1552,26 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         if not progress:
             break
 
-    # 3b. one place seen from opposite sides: an exit faced from two corridors, the bottom (or top) of a staircase
-    #     seen walking up and walking down. The photos share no features, so kind and position decide.
-    for a, b, d, kind in _twin_views(bundle):
-        a, b = current(a.id), current(b.id)
+    # 3b. one place seen twice where the photos did not match: an exit faced from two corridors, or read from down the
+    #     corridor and then reached; the bottom (or top) of a staircase walked up and walked down. Kind and plan
+    #     position are never enough alone: view directions, the walk, sign text or the photos back each pair.
+    #     A sign only read from afar (Twin.far) is not merged: the spot it was read from is a real spot of the
+    #     corridor (other places may lie between it and the exit), so it stays, as a corridor spot.
+    sign_views = 0
+    for tw in _twin_candidates(bundle, frames):
+        a, b = current(tw.a.id), current(tw.b.id)
         if a is None or b is None or a.id == b.id:
             continue
-        merge(a, b, f"Same {kind} seen from two directions ({d:.1f} m apart on the plan)", 0.8,
-              {"distance_m": round(d, 1), "kind": kind}, strong=False)
+        if tw.far is not None:
+            far, near = (a, b) if tw.far.id == tw.a.id else (b, a)
+            if far.id == tw.far.id and far.type in KEY_FAMILY and not far.vertical and not _room_ids(far):
+                log(f"'{far.label}' only read the sign of '{near.label}' from {tw.d:.1f} m ({tw.why}): "
+                    "a hallway spot, not a second exit")
+                far.type, far.label = "hallway", "Hallway point"
+                sign_views += 1
+            continue
+        merge(a, b, f"Same {tw.kind}: {tw.why} ({tw.d:.1f} m apart on the plan)", 0.8,
+              {"distance_m": round(tw.d, 1), "kind": tw.kind, "evidence": tw.why}, strong=False)
     settle()
 
     # 4. connect floors: the same stairwell / elevator bank seen on adjacent floors
@@ -1526,14 +1580,28 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
     finalize(bundle)
     g_components = _components(bundle)
     floors = sorted({n.floor for n in bundle.nodes})
-    log(f"Consolidated: {merged} merged, {suggested} suggested, {aligned} walks aligned, {linked} floor links; "
+    log(f"Consolidated: {merged} merged, {suggested} suggested, {aligned} walks aligned, {linked} floor links"
+        + (f", {sign_views} sign(s) read from afar made hallway spots" if sign_views else "") + "; "
         f"{len(bundle.nodes)} places on floors {floors} in {g_components} connected piece(s)")
     return {"merged": merged, "suggested": suggested, "aligned": aligned, "floor_links": linked,
             "components": g_components}
 
 
-TWIN_VIEW_M = 4.0  # an exit / stair landing seen twice this close on the plan is one place (if nothing closer)
+TWIN_VIEW_M = 4.0  # an exit / stair landing seen twice this close on the plan may be one place (if nothing closer)
 TWIN_VIEW_DEG = 45.0  # ... seen from directions at least this far apart (else the photos would have matched)
+TWIN_TIGHT_M = 2.5  # stair landings with only their plan positions to go on (no photo, no sign): this close, both ends
+APPROACH_M = 5.0  # a sign read from this far, then reached, is one place (eval/score.py's far-merge limit)
+APPROACH_DEG = 30.0  # ... both photos (and the walk between them) facing within this of one direction
+APPROACH_MERGE_M = 1.5  # ... closer than this the two photos were taken at one spot: one place. Farther, the far
+#                         photo is where the sign was read from: a corridor spot of its own (see consolidate 3b)
+VIEW_CONE_DEG = 40.0  # two photos can show one sign when a spot lies within this of both views (heading drift)
+VIEW_RANGE_M = 6.0  # ... and this close to both walkers
+VIEW_CROSS_DEG = 30.0  # views closer than this in direction (or than this short of opposite) are parallel: they
+#                        never meet on their own (two doors side by side on one wall, faced from either end)
+VIEW_BEHIND_M = 0.5  # where two views cross may lie this far behind a walker (one standing at the sign; drift)
+ONE_SPOT_M = 2.5  # two photos facing one side (within 90 deg) from this close: taken at one spot (plan drift puts
+#                   one door 2.1-2.3 m apart). Farther, parallel views need the photos or the sign to back them
+TWIN_PHOTO_INLIERS = config.ORB_WEAK_INLIERS  # photo match (plain or zoomed) that backs a twin: support, never proof
 
 
 def _travel_dirs(bundle: MapBundle, node_id: str) -> list[float]:
@@ -1553,79 +1621,328 @@ def _travel_dirs(bundle: MapBundle, node_id: str) -> list[float]:
 def _two_directions(bundle: MapBundle, a: Node, b: Node) -> bool:
     """The walks saw `a` and `b` from different directions: every way a walk went at one is at least TWIN_VIEW_DEG
     from every way a walk went at the other. Two walks going the same way saw the same view: if the photos did
-    not match (earlier steps), they are two places, whatever their positions say."""
+    not match (earlier steps), only _approach evidence makes them one place."""
     da, db = _travel_dirs(bundle, a.id), _travel_dirs(bundle, b.id)
     return bool(da and db) and all(abs(wrap180(x - y)) >= TWIN_VIEW_DEG for x in da for y in db)
 
 
-def _opposite_climbs(ends: dict[str, set[tuple[str, int]]], a: Node, b: Node) -> bool:
-    """Same-flight evidence for two landings each on a walk's stairs: one walk left this floor there and the other
-    arrived on it there, between the same two floors (the flight walked up and walked down: opposite views).
-    Two walks that both left (or both arrived) took two stairwells, or one the photos would have matched."""
-    ea, eb = ends.get(a.id, set()), ends.get(b.id, set())
-    flip = {"leave": "arrive", "arrive": "leave"}
-    return any((flip[way], floor) in eb for way, floor in ea)
+def _plan_dir(heading: float, axis: float) -> tuple[float, float]:
+    """Unit vector on the plan (solve_positions' axes) of a building-frame heading."""
+    r = math.radians(heading - axis)
+    return math.sin(r), math.cos(r)
 
 
-def _twin_views(bundle: MapBundle) -> list[tuple[Node, Node, float, str]]:
-    """Pairs of places that are one place seen from two directions, by kind and plan position:
-    - exits (entrances, restrooms, elevators): both typed so on their own sign (place_type), same floor, seen
-      from different directions (_two_directions);
-    - stair landings: both where a walk went up or down stairs (a stairs edge), to the same other floor, one
-      walk leaving the floor there and the other arriving (_opposite_climbs).
-    Both in one connected piece of the map (positions elsewhere mean nothing), not seconds apart in one walk,
-    within TWIN_VIEW_M of each other and each the other's nearest place of that kind (two exits side by side
-    stay two). Position alone never merges two places each visited by its own walk: two stairwells (exits) a
-    metre apart, each the other's only candidate, are each other's nearest. Positions come from
-    solve_positions, so call this after walks are aligned."""
+def _off_view(n: Node, x: float, y: float, axis: float) -> float:
+    """Degrees between the way photo `n` looks and the plan point (x, y); 0 where the walker stood."""
+    dx, dy = x - (n.x or 0.0), y - (n.y or 0.0)
+    if math.hypot(dx, dy) < 1e-6:
+        return 0.0
+    return abs(wrap180(math.degrees(math.atan2(dx, dy)) - (n.frame_heading - axis)))
+
+
+def _views_meet(a: Node, b: Node, axis: float) -> bool | None:
+    """Whether the photos of `a` and `b` can show one sign: a spot within VIEW_RANGE_M of both walkers, within
+    VIEW_CONE_DEG of both views (or where the other walker stood). None when a view direction is unknown.
+    Exits at the two ends of a short corridor, each faced by its walk, look away from each other: False."""
+    if a.frame_heading is None or b.frame_heading is None:
+        return None
+    ax, ay, bx, by = a.x or 0.0, a.y or 0.0, b.x or 0.0, b.y or 0.0
+    step = 0.25
+    for off in range(-int(VIEW_CONE_DEG), int(VIEW_CONE_DEG) + 1, 5):
+        dx, dy = _plan_dir(a.frame_heading + off, axis)
+        for k in range(int(VIEW_RANGE_M / step) + 1):
+            x, y = ax + dx * k * step, ay + dy * k * step
+            to_b = math.hypot(x - bx, y - by)
+            if to_b <= 0.75 or (to_b <= VIEW_RANGE_M and _off_view(b, x, y, axis) <= VIEW_CONE_DEG):
+                return True
+    return False
+
+
+def _views_cross(a: Node, b: Node, axis: float) -> bool | None:
+    """Whether the two view rays genuinely converge on one spot: at least VIEW_CROSS_DEG apart in direction (and
+    not facing each other head on), crossing in front of both walkers (at most VIEW_BEHIND_M behind one) and within
+    VIEW_RANGE_M of each. None when a view direction is unknown. Parallel views never cross: two doors on one wall
+    each faced by a walk from either end of the corridor look the same way, and _views_meet's cone lets them meet."""
+    if a.frame_heading is None or b.frame_heading is None:
+        return None
+    if not VIEW_CROSS_DEG <= abs(wrap180(a.frame_heading - b.frame_heading)) <= 180.0 - VIEW_CROSS_DEG:
+        return False
+    (ux, uy), (vx, vy) = _plan_dir(a.frame_heading, axis), _plan_dir(b.frame_heading, axis)
+    wx, wy = (b.x or 0.0) - (a.x or 0.0), (b.y or 0.0) - (a.y or 0.0)
+    den = ux * vy - uy * vx  # a + t u = b + s v
+    t, s = (wx * vy - wy * vx) / den, (wx * uy - wy * ux) / den
+    return -VIEW_BEHIND_M <= t <= VIEW_RANGE_M and -VIEW_BEHIND_M <= s <= VIEW_RANGE_M
+
+
+def _one_spot(a: Node, b: Node, d: float) -> bool:
+    """Two photos facing one side (within 90 deg of each other) taken within ONE_SPOT_M: one spot."""
+    return d <= ONE_SPOT_M and a.frame_heading is not None and b.frame_heading is not None and \
+        abs(wrap180(a.frame_heading - b.frame_heading)) <= 90.0
+
+
+def _approach(a: Node, b: Node, axis: float) -> tuple[Node, Node] | None:
+    """(far, near) when both photos face one way (within APPROACH_DEG) and the far one looks at the spot where the
+    near one was taken: a sign read from down the corridor, then the same sign up close. None without view
+    directions. Two doors glanced at side by side along a corridor look the same way, but not at each other."""
+    if a.frame_heading is None or b.frame_heading is None:
+        return None
+    if abs(wrap180(a.frame_heading - b.frame_heading)) > APPROACH_DEG:
+        return None
+    for far, near in ((a, b), (b, a)):
+        if _off_view(far, near.x or 0.0, near.y or 0.0, axis) <= APPROACH_DEG:
+            return far, near
+    return None
+
+
+def _walked_toward(bundle: MapBundle, far: Node, near: Node) -> str | None:
+    """The walk that went from `far` on to `near` the way far's photo looks (every step within APPROACH_DEG of it,
+    at most three corridor connections and APPROACH_M + 1 m in all): it read the sign, then walked up to it.
+    Its video id, else None."""
+    if far.frame_heading is None:
+        return None
+    def along(e: Edge) -> bool:
+        hs = [h for h in (e.heading_out_raw, e.heading_in_raw) if h is not None] or [e.heading_out, e.heading_in]
+        return all(h is not None and abs(wrap180(h - far.frame_heading)) <= APPROACH_DEG for h in hs)
+    walks: dict[str, list[Edge]] = {}
+    for e in bundle.edges:
+        if e.vertical == "none" and e.video_id and along(e):
+            walks.setdefault(e.video_id, []).append(e)
+    for vid in sorted(walks):
+        frontier = [(far.id, 0.0)]
+        for _ in range(3):
+            nxt = []
+            for nid, walked in frontier:
+                for e in walks[vid]:
+                    total = walked + (e.length_m or config.DEFAULT_EDGE_M)
+                    if e.from_node != nid or total > APPROACH_M + 1.0:
+                        continue
+                    if e.to_node == near.id:
+                        return vid
+                    nxt.append((e.to_node, total))
+            frontier = nxt
+    return None
+
+
+def _photo_support(frames: Path | None, a: Node, b: Node) -> int:
+    """Best feature match between the two places' photos, plain either way or zoomed (zoomed_inliers)."""
+    if frames is None or not a.frame_id or not b.frame_id:
+        return 0
+    pa, pb = frames / a.frame_id, frames / b.frame_id
+    return max(orb_match(pa, pb)[0], orb_match(pb, pa)[0], zoomed_inliers(pa, pb))
+
+
+# ---------------------------------------------------------------- what tells two signs of one kind apart
+_IDENTITY_SKIP = GENERIC_WORDS | NOT_WAYFINDING | _KEY_WORDS | _NEGATION | {
+    "AN", "THE", "SIGN", "ONLY", "WAY", "HERE", "THIS", "OF", "IN", "OUT", "AT", "STAIRWAY", "STAIRCASE"}
+_GENDER = {"MEN": "M", "MENS": "M", "GENTLEMEN": "M", "GENTS": "M", "WOMEN": "W", "WOMENS": "W", "LADIES": "W"}
+_FLOOR_SIGN = re.compile(r"\b(?:LEVEL|FLOOR|FLR|LVL)\b\.?\s*[A-Z0-9]*|\b\d+(?:ST|ND|RD|TH)\b")
+
+
+def _sign_of_kind(text: str, kind: str) -> bool:
+    """`text` is a sign of twin kind `kind`: an exit-family (restroom, elevator) sign, a 'NO <kind>' sign, stairs."""
+    if kind == "stairs":
+        return "STAIR" in text.upper()
+    if kind.startswith("no "):
+        return any(k == kind[3:] and neg is not None for _, k, neg in _key_hits(text)[1])
+    return any(names_key(text, k) for k, fam in KEY_FAMILY.items() if fam == kind)
+
+
+def _sign_identity(n: Node, kind: str) -> set[str]:
+    """What tells this place's sign from another of its kind: the other words on it ('EXIT 2', 'NORTH EXIT',
+    'STAIR B', men / women), without floor signs or OCR junk ('ROCW1'). Empty for a plain 'EXIT' or 'STAIRS'."""
+    out: set[str] = set()
+    for t in n.sign_texts or n.texts:
+        if not _sign_of_kind(t, kind):
+            continue
+        for tok in re.findall(r"[A-Z0-9]+", _FLOOR_SIGN.sub(" ", t.upper())):
+            tok = _ocr_letters(tok)
+            for w in (_sign_words(tok) if tok.isalpha() else [tok]):
+                if kind == "restroom" and w in _GENDER:
+                    out.add(_GENDER[w])
+                elif w not in _IDENTITY_SKIP and (w.isalpha() or w.isdigit() or len(w) <= 3):
+                    out.add(w)
+    return out
+
+
+def _identity_relation(a: set[str], b: set[str]) -> str | None:
+    """'same' / 'differ' when both signs say more than their kind ('EXIT 2' / 'EXIT 3'), else None."""
+    if not a or not b:
+        return None
+    same = a & b or any(len(x) >= 4 and len(y) >= 4 and SequenceMatcher(None, x, y).ratio() >= 0.8
+                        for x in a for y in b)
+    return "same" if same else "differ"
+
+
+def _no_sign_kind(n: Node) -> str | None:
+    """'no exit' for a landmark named by a 'NO EXIT' plate ('no entrance' for 'DO NOT ENTER'), else None."""
+    if n.type != "landmark" or _room_ids(n):
+        return None
+    kinds = {k for t in [*(n.sign_texts or n.texts), n.label] for _, k, neg in _key_hits(t)[1] if neg is not None}
+    return f"no {kinds.pop()}" if len(kinds) == 1 else None
+
+
+# ---------------------------------------------------------------- one place seen twice: the evidence
+def _same_sign_place(bundle: MapBundle, a: Node, b: Node, d: float, sign: str | None, photo,
+                     axis: float) -> tuple[str | None, Node | None]:
+    """(why, far): why two exits (restrooms, elevators, NO EXIT plates) of one kind are one place, else None; `far`
+    the photo that only read the sign from afar (Twin.far), if any. Kind and plan position never decide alone:
+    - seen from two directions (_two_directions) within TWIN_VIEW_M, and (when both view directions are known):
+      the view rays converge on one spot (_views_cross), or the photos were taken at one spot (_one_spot), or the
+      same distinctive sign text, or matching photos (TWIN_PHOTO_INLIERS). Parallel views farther apart (two doors
+      on one wall, each faced by a walk from either end of the corridor) are two places without the sign or the
+      photos;
+    - seen facing one way, one photo looking at where the other was taken (_approach), within APPROACH_M, and
+      backed by the walk that read the sign and walked up to it (_walked_toward), the same distinctive sign text,
+      or matching photos (TWIN_PHOTO_INLIERS)."""
+    meet = _views_meet(a, b, axis)
+    if meet is False:
+        return None, None  # the photos look away from each other: two signs
+    same = "; same sign" if sign == "same" else ""
+    if d <= TWIN_VIEW_M and _two_directions(bundle, a, b):
+        if (cross := _views_cross(a, b, axis)) is None:
+            return "seen from two directions" + same, None  # no view direction to check against
+        if cross:
+            return "seen from two directions; the views meet" + same, None
+        if _one_spot(a, b, d):
+            return f"seen from two directions; the views meet at one spot ({d:.1f} m)" + same, None
+        if sign == "same":
+            return "seen from two directions; same sign", None
+        if (n := photo(a, b)) >= TWIN_PHOTO_INLIERS:
+            return f"seen from two directions; photos match ({n} features)", None
+    pair = _approach(a, b, axis)
+    if pair is None:
+        return None, None
+    reader, near = pair
+    far = reader if d > APPROACH_MERGE_M else None  # read from afar: a corridor spot; from one spot: one place
+    if (vid := _walked_toward(bundle, reader, near)):
+        return f"read from afar, then walked up to (walk {vid})" + same, far
+    if sign == "same":
+        return "read from afar, then up close; same sign", far
+    if (n := photo(a, b)) >= TWIN_PHOTO_INLIERS:
+        return f"read from afar, then up close; photos match ({n} features)", far
+    return None, None
+
+
+def _same_flight(flights: dict, a: Node, b: Node, d: float, sign: str | None, photo) -> str | None:
+    """Why two stair landings, each on a walk's flight between the same two floors, are one landing, else None.
+    Both ends of the flights must line up (here and on the other floor):
+    - walked up and walked down (opposite views: the photos never match): within TWIN_TIGHT_M at both ends, or
+      TWIN_VIEW_M with the same distinctive stairs sign. Two stairwells 3 m apart stay two;
+    - walked the same way twice: within TWIN_TIGHT_M at both ends, the flights heading the same way, and the
+      photos at either end match (or the same stairs sign). Position alone is two stairwells side by side."""
+    for way_a, floor_a, end_a, e_a in flights.get(a.id, ()):
+        for way_b, floor_b, end_b, e_b in flights.get(b.id, ()):
+            if floor_a != floor_b:
+                continue
+            d2 = math.hypot((end_a.x or 0.0) - (end_b.x or 0.0), (end_a.y or 0.0) - (end_b.y or 0.0))
+            ends = f"both ends line up ({d:.1f} / {d2:.1f} m)"
+            if way_a != way_b:
+                limit = TWIN_VIEW_M if sign == "same" else TWIN_TIGHT_M
+                if d <= limit and d2 <= limit:
+                    return f"walked up and down; {ends}" + ("; same sign" if sign == "same" else "")
+                continue
+            if d > TWIN_TIGHT_M or d2 > TWIN_TIGHT_M or not all(
+                    x is not None and y is not None and abs(wrap180(x - y)) < TWIN_VIEW_DEG
+                    for x, y in ((e_a.heading_out, e_b.heading_out), (e_a.heading_in, e_b.heading_in))):
+                continue
+            if sign == "same":
+                return f"climbed the same way twice; {ends}; same sign"
+            if (n := max(photo(a, b), photo(end_a, end_b))) >= TWIN_PHOTO_INLIERS:
+                return f"climbed the same way twice; {ends}; photos match ({n} features)"
+    return None
+
+
+@dataclass
+class Twin:
+    """Two map places that show one place (see _twin_candidates). `far`: the one of them where the sign was only read
+    from afar (_approach, more than APPROACH_MERGE_M short of it): that spot is not the place, so consolidate makes
+    it a corridor spot instead of merging it into the place, which would fold the corridor between them."""
+    a: Node
+    b: Node
+    d: float
+    kind: str
+    why: str
+    far: Node | None = None
+
+
+def _twin_views(bundle: MapBundle, frames: Path | None = None) -> list[tuple[Node, Node, float, str]]:
+    """(a, b, plan distance, kind) for places that are one place seen twice; see _twin_candidates."""
+    return [(t.a, t.b, t.d, t.kind) for t in _twin_candidates(bundle, frames)]
+
+
+def _twin_candidates(bundle: MapBundle, frames: Path | None = None) -> list[Twin]:
+    """Pairs of places that are one place seen twice, whose photos did not match well enough for the earlier steps,
+    with the evidence (Twin). Kinds: an exit family by its own sign (place_type: exit and entrance are one), a
+    'NO EXIT' plate, a stair landing (where a walk went up or down stairs).
+
+    Both in one connected piece of the map (positions elsewhere mean nothing), on one floor, not seconds apart in
+    one walk, each the other's nearest place of that kind (two exits side by side stay two), and their sign texts
+    not telling them apart ('EXIT 2' / 'EXIT 3', men / women). Then kind and plan position never decide alone:
+    _same_sign_place and _same_flight name the evidence needed. `frames` (the photo directory) lets matching
+    photos count; without it they never do. Positions come from solve_positions: call this after walks are
+    aligned."""
     solve_positions(bundle)
     by_id = {n.id: n for n in bundle.nodes}
     parent = {n.id: n.id for n in bundle.nodes}
+    axis = bundle.dominant_axis_deg
 
     def find(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-    reach: dict[str, set[int]] = {}
-    ends: dict[str, set[tuple[str, int]]] = {}  # landing -> (leave / arrive, the other floor)
+    # landing -> (leave / arrive, the other floor, the landing at the other end, the stairs connection)
+    flights: dict[str, list[tuple[str, int, Node, Edge]]] = {}
     for e in bundle.edges:
         if e.from_node in parent and e.to_node in parent:
             parent[find(e.from_node)] = find(e.to_node)
             if e.vertical in ("stairs_up", "stairs_down"):
-                f_from, f_to = by_id[e.from_node].floor, by_id[e.to_node].floor
-                reach.setdefault(e.from_node, set()).add(f_to)
-                reach.setdefault(e.to_node, set()).add(f_from)
-                ends.setdefault(e.from_node, set()).add(("leave", f_to))
-                ends.setdefault(e.to_node, set()).add(("arrive", f_from))
+                lo, hi = by_id[e.from_node], by_id[e.to_node]
+                flights.setdefault(lo.id, []).append(("leave", hi.floor, hi, e))
+                flights.setdefault(hi.id, []).append(("arrive", lo.floor, lo, e))
 
     def kind(n: Node) -> str | None:
         if n.type in KEY_FAMILY:
             return KEY_FAMILY[n.type]
-        if _is_vertical(n) == "stairs" and n.id in reach:
+        if _is_vertical(n) == "stairs" and n.id in flights:
             return "stairs"
-        return None
+        return _no_sign_kind(n)
     groups: dict[tuple, list[Node]] = {}
     for n in bundle.nodes:
         if (k := kind(n)) is not None:
             groups.setdefault((k, n.floor, find(n.id)), []).append(n)
+    photos: dict[frozenset, int] = {}
+
+    def photo(x: Node, y: Node) -> int:
+        key = frozenset((x.id, y.id))
+        if key not in photos:
+            photos[key] = _photo_support(frames, x, y)
+        return photos[key]
+
+    def dist(a: Node, b: Node) -> float:
+        return math.hypot((a.x or 0.0) - (b.x or 0.0), (a.y or 0.0) - (b.y or 0.0))
     out = []
     for (k, _, _), members in groups.items():
-        def dist(a: Node, b: Node) -> float:
-            return math.hypot((a.x or 0.0) - (b.x or 0.0), (a.y or 0.0) - (b.y or 0.0))
         def nearest(a: Node) -> Node | None:
             return min((b for b in members if b is not a), key=lambda b: dist(a, b), default=None)
+        reach_m = TWIN_VIEW_M if k == "stairs" else APPROACH_M
         for i, a in enumerate(members):
             for b in members[i + 1:]:
-                if _moments_apart(a, b):
-                    continue
-                if not (_opposite_climbs(ends, a, b) if k == "stairs" else _two_directions(bundle, a, b)):
-                    continue
                 d = dist(a, b)
-                if d <= TWIN_VIEW_M and nearest(a) is b and nearest(b) is a:
-                    out.append((a, b, d, k))
-    out += _stair_views(bundle, groups, find, reach)
-    return sorted(out, key=lambda p: p[2])
+                if _moments_apart(a, b) or d > reach_m or nearest(a) is not b or nearest(b) is not a:
+                    continue
+                sign = _identity_relation(_sign_identity(a, k), _sign_identity(b, k))
+                if sign == "differ":
+                    continue  # 'EXIT 2' / 'EXIT 3': two signs, however close
+                if k == "stairs":
+                    why, far = _same_flight(flights, a, b, d, sign, photo), None
+                else:
+                    why, far = _same_sign_place(bundle, a, b, d, sign, photo, axis)
+                if why:
+                    out.append(Twin(a, b, d, k, why, far))
+    out += [Twin(landing, view, d, k, "stairs seen ahead, climbed there moments later")
+            for landing, view, d, k in _stair_views(bundle, groups, find, flights)]
+    return sorted(out, key=lambda t: t.d)
 
 
 def _stair_views(bundle: MapBundle, groups: dict[tuple, list[Node]], find, reach: dict) -> list:

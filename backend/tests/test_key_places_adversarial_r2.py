@@ -1,5 +1,5 @@
 """Round-2 adversarial checks (sentinel-e2e) on the negation scope, whole-frame negation and the direction / opposite-climb
-merge rules. Known open limits are marked xfail(strict) so a fix shows up as XPASS."""
+merge rules (the open limits once pinned here as strict xfails are fixed)."""
 import pytest
 
 from app import mapper
@@ -34,12 +34,10 @@ def test_separate_positive_exit_beside_no_exit_is_an_exit():
     assert mapper.place_type(_a("exit", ["EXIT", "NO ENTRY"], ocr=["EXIT", "NO ENTRY"])) == "exit"
 
 
-@pytest.mark.xfail(strict=True, reason="known open: 'NOT AN' + 'EXIT' on two lines is not joined (builder-disclosed)")
 def test_not_an_exit_split_over_two_lines():
     assert mapper.place_type(_a("exit", ["NOT AN", "EXIT"], ocr=["NOT AN", "EXIT"])) != "exit"
 
 
-@pytest.mark.xfail(strict=True, reason="OCR reads the O of NO as a zero: 'N0 EXIT' is taken for an exit (minor)")
 def test_ocr_zero_for_o_in_no_exit():
     assert not mapper.names_key("N0 EXIT", "exit")
 
@@ -85,6 +83,5 @@ def test_stairwell_walked_up_twice_is_not_merged_by_position():
     assert _pairs(_stairs(False)) == []
 
 
-@pytest.mark.xfail(strict=True, reason="known open: two different stairwells 3 m apart, one climbed up and one down, merge")
 def test_two_stairwells_3m_apart_up_and_down_stay_two():
     assert _pairs(_stairs(True, sep_b=6.0)) == []

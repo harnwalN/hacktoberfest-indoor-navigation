@@ -63,9 +63,11 @@ perception (Gemma/OCR); an error that is already in the oracle run is in mapping
 | `turns_detected`, `turn_error_deg`, `spurious_turns` | detected turn events vs true changes of walking direction |
 
 How places are matched: each truth visit `(video, t)` is matched to the walk node of that video whose
-`[t_arrive, t_depart]` window is nearest (within 1.5 s for a `look`, 1.0 s for a `pass`). A `pass` by a room
-(no glance) only counts if that map place claims the room's number; otherwise it is a corridor spot that
-happened to see the plaque. `eval/trace.py`
+`[t_arrive, t_depart]` window is nearest (within 1.5 s for a `look` or `see`, 1.0 s for a `pass`). A `pass` by a
+room (no glance) only counts if that map place claims the room's number; otherwise it is a corridor spot that
+happened to see the plaque. A `see` (a sign read from afar, spec `sees`) only counts if the map place claims the
+place: its room number, or not a corridor spot (hallway / intersection) for anything else. So two exits for one
+exit score as a missed merge, while the hallway spot the sign was read from does not. `eval/trace.py`
 follows each walk node to the map place it ended up in, through every later merge (it wraps
 `mapper.walk_nodes`, `mapper.merge_nodes` and `jobs.select_keyframes` for the duration of a run; no app change).
 
@@ -94,7 +96,8 @@ follows each walk node to the map place it ended up in, through every later merg
     "give_start_floor": true,                    // pass it to the pipeline like an uploader would
     "sensors": null,                             // optional phone sensors.json (gyro), relative path
     "visits": [{"place": "r110", "t": 2.5, "kind": "look"},   // ordered places passed, seconds into the video
-               {"place": "stairs_1", "t": 20.5, "kind": "pass"}],
+               {"place": "stairs_1", "t": 20.5, "kind": "pass"},  // kind: look (glance), pass, see (sign read
+               {"place": "exit_w", "t": 53.4, "kind": "see"}],    //   from afar: counts only a map place claiming it)
     "turns": [{"t": 18.8, "delta": -90.0}],      // optional: changes of walking direction (right > 0)
     "path": [[0.0, 1.2, 1.0, 1], [0.5, 1.8, 1.0, 1]]   // optional: [t, x, y, floor|null] every ~0.5 s
   }],
@@ -105,8 +108,9 @@ follows each walk node to the map place it ended up in, through every later merg
 }
 ```
 
-The generator fills `expect_merged` (rooms/stairs/exits visited 2+ times) and `must_not_merge` (all pairs of
-different room numbers, the same stairwell on different floors, plus the spec's own pairs) automatically.
+The generator fills `expect_merged` (rooms, stairs, exits/entrances, elevators, restrooms and landmarks such as a
+NO EXIT door, visited or read from afar 2+ times) and `must_not_merge` (all pairs of different room numbers, the same
+stairwell on different floors, plus the spec's own pairs) automatically.
 
 ## Add a synthetic scenario
 
@@ -122,7 +126,9 @@ different room numbers, the same stairwell on different floors, plus the spec's 
      `top_landing_end`, `bottom`/`top` walk endpoints). `places`: extra places (stairs, junctions).
    - `videos`: start floor/position/heading and a script of steps: `{"go": place|[x, y]}`, `{"look": place}`,
      `{"visit": place}` (go + look), `{"pause": s}`, `{"turn": deg}`, `{"face": heading}`,
-     `{"stairs": id, "dir": "up"|"down"}`. Keep each video 20-60 s.
+     `{"stairs": id, "dir": "up"|"down"}`. Keep each video 20-60 s. Optional `"sees": [place, ...]`: places the
+     walk reads from a distance without going up to them (it stops 3 m short of the EXIT, facing it); truth only, a
+     `see` visit at the closest moment the walker faces the place's sign (within 4 m), the video is unchanged.
    - `routes`, `stair_links`, extra `must_not_merge`.
 2. `.venv/bin/python -m eval.generate <name>` and look at a few frames (`media/<video>.mp4`).
 3. `.venv/bin/python -m eval.run <name> --oracle`, then a live run. Commit `spec.py` and `truth.json`.

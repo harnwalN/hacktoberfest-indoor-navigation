@@ -259,6 +259,11 @@
     },
     {
      "place": "noexit",
+     "t": 29.1,
+     "kind": "see"
+    },
+    {
+     "place": "noexit",
      "t": 31.3,
      "kind": "pass"
     },
@@ -375,7 +380,7 @@
    ]
   }
  ],
- "expect_merged": ["exit_s", "r120", "r122"],
+ "expect_merged": ["exit_s", "noexit", "r120", "r122"],
  "must_not_merge": [
   ["exit_s", "noexit", "a NO EXIT sign is not the exit"],
   ["exit_s", "dead_w", "a dead end is not the exit"],

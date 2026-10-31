@@ -81,6 +81,30 @@ def visits(walker: Walker, radius: float = 1.25, merge_gap: float = 4.0, max_off
     return merged
 
 
+def sightings(walker: Walker, place_ids: list[str], max_m: float = 4.0, max_off_deg: float = 20.0) -> list[dict]:
+    """A `see` visit for each place the walk reads from a distance without going up to it (a video spec's `sees`:
+    the EXIT sign at the end of the corridor where the walk stops): the first moment the walker is nearest the
+    place's standing point while facing its sign within `max_off_deg`, at most `max_m` from that point. Truth
+    only: the walk itself does not change. A place the walk never faces that close is a spec error."""
+    b = walker.b
+    out = []
+    for pid in place_ids:
+        p = b.places[pid]
+        tx, ty = (p.look[0], p.look[1]) if p.look else p.stand
+        best = None
+        for i, f in enumerate(walker.frames):
+            d = round(float(np.hypot(f.pose.x - p.stand[0], f.pose.y - p.stand[1])), 2)
+            if (f.level != p.floor or d > max_m
+                    or abs(wrap180(bearing(f.pose.x, f.pose.y, tx, ty) - f.pose.yaw)) > max_off_deg):
+                continue
+            if best is None or d < best[0]:
+                best = (d, i)
+        if best is None:
+            raise ValueError(f"walk never faces {pid} within {max_m} m (spec 'sees')")
+        out.append({"place": pid, "t": round(best[1] / FPS, 2), "kind": "see"})
+    return out
+
+
 def scenario_names() -> list[str]:
     return sorted(p.parent.name for p in SCENARIOS_DIR.glob("*/spec.py"))
 
@@ -140,7 +164,7 @@ def video_truth(spec: dict, index: int, building: Building) -> dict:
         "start_floor": vspec["start_floor"],
         "give_start_floor": bool(vspec.get("give_start_floor", False)),
         "description": vspec.get("description", ""),
-        "visits": visits(walker),
+        "visits": sorted(visits(walker) + sightings(walker, vspec.get("sees", [])), key=lambda v: v["t"]),
         "turns": walker.turns,
         # where the walker was every 0.5 s: [t, x, y, floor] (floor null on the stairs), for far_merges
         "path": [[round(i / FPS, 1), round(f.pose.x, 2), round(f.pose.y, 2), f.level]
@@ -203,9 +227,11 @@ def build_truth(spec: dict, videos: list[dict], b: Building) -> dict:
             visited.setdefault(vis["place"], set()).add(v["id"])
             count[vis["place"]] = count.get(vis["place"], 0) + 1
     by_id = {p["id"]: p for p in places}
-    # Places walked past more than once should end up as one map place (a revisit / loop closure).
+    # Places walked past (or read from afar, `sees`) more than once should end up as one map place (a revisit / loop
+    # closure). Corridor spots (hallway, intersection) have no identity of their own to merge by.
     expect_merged = spec.get("expect_merged") or sorted(
-        pid for pid, n in count.items() if n >= 2 and by_id[pid]["type"] in ("room", "stairs", "exit", "elevator"))
+        pid for pid, n in count.items() if n >= 2 and by_id[pid]["type"] in (
+            "room", "stairs", "exit", "entrance", "elevator", "restroom", "landmark"))
     must_not = [list(x) for x in spec.get("must_not_merge", [])]
     have = {frozenset(x[:2]) for x in must_not}
     for a, c in itertools.combinations(places, 2):

@@ -6,7 +6,8 @@ One floor. A 20 m east-west corridor (y 0..2) with a 2 m branch going north at x
 - South wall opposite the branch (x 16): the real EXIT (door + green EXIT sign). Walk 1 (west to east) sees it
   obliquely from the corridor, walk 2 straight ahead coming south down the branch: one exit, two directions.
 - North wall at x 7.5: a door with a green 'NO EXIT' plate (the exit sign style): not an exit.
-Rooms 120 / RM 122 (both walks), 124 (walk 1) and 130 (walk 2); walk 2's start floor is not given.
+Rooms 120 / RM 122 (both walks), 124 (walk 1) and 130 (walk 2); walk 2's start floor is not given. Walk 2 reads the
+NO EXIT plate ahead before passing it (`sees`): one door seen by both walks.
 Any exit/entrance/restroom/elevator on the map other than this exit is a false key place.
 """
 
@@ -52,7 +53,8 @@ SPEC = {
                         "(start floor not given)",
          "script": [{"look": "door_n"}, {"pause": 1.0}, {"face": 180}, {"visit": "r130"}, {"go": [16.0, 1.6]},
                     {"look": "exit_s"}, {"face": 270}, {"visit": "r122"}, {"visit": "r120"}, {"go": [1.0, 1.0]},
-                    {"pause": 1.5}]},
+                    {"pause": 1.5}],
+         "sees": ["noexit"]},  # reads the NO EXIT plate ahead on the right before passing it: one door, two walks
     ],
     "must_not_merge": [["exit_s", "noexit", "a NO EXIT sign is not the exit"],
                        ["exit_s", "dead_w", "a dead end is not the exit"],

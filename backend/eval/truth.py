@@ -47,7 +47,9 @@ class BuildingTruth(BaseModel):
 class Visit(BaseModel):
     place: str
     t: float  # seconds into the video when the walker is at (or looking at) the place
-    kind: Literal["look", "pass"] = "pass"
+    # look: a glance at it; pass: walked by it; see: read its sign from afar without going up to it (only a map
+    # place that claims the place counts: the corridor spot the walker stood on is not a copy of the exit)
+    kind: Literal["look", "pass", "see"] = "pass"
 
 
 class Turn(BaseModel):

@@ -5,7 +5,8 @@ Floor 2: corridor y 13..15 m, rooms 210/212/214A, LEVEL 2 sign facing the top of
 Stairwell: x 13..15, y 3..12, entered from floor 1 at its south end and left at its north end on floor 2.
 
 Walks: up (start floor given), down the reverse way (start floor NOT given: must come from rooms/signs),
-and a short floor-1 revisit (start floor not given).
+and a short floor-1 revisit (start floor not given). The down walk stops 3 m short of the west EXIT, facing it
+(`sees`), and the revisit walks up to it: one exit read from afar, then reached.
 """
 
 L1 = [
@@ -79,7 +80,8 @@ SPEC = {
          "description": "floor 2 west to east, down the stairs, floor 1 east to west (start floor not given)",
          "script": [{"visit": "r210"}, {"visit": "r212"}, {"visit": "r214a"}, {"go": [14.0, 14.0]},
                     {"stairs": "A", "dir": "down"}, {"go": [14.0, 1.0]}, {"visit": "r114"}, {"visit": "r112"},
-                    {"go": [5.0, 1.0]}]},
+                    {"go": [5.0, 1.0]}],
+         "sees": ["exit_w"]},  # stops 3 m short of the exit, facing its sign: the exit read from afar
         {"id": "f1_revisit", "start_floor": 1, "give_start_floor": False, "start": [11.0, 1.0], "heading": 270,
          "description": "short floor-1 walk east to west ending at the exit (start floor not given)",
          "script": [{"visit": "r114"}, {"visit": "r112"}, {"visit": "r110"}, {"visit": "exit_w"}]},

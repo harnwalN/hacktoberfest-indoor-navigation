@@ -360,6 +360,11 @@
      "place": "r112",
      "t": 50.1,
      "kind": "look"
+    },
+    {
+     "place": "exit_w",
+     "t": 53.4,
+     "kind": "see"
     }
    ],
    "turns": [
@@ -563,7 +568,7 @@
    ]
   }
  ],
- "expect_merged": ["r110", "r112", "r114", "r210", "r212", "r214a", "stairs_1", "stairs_2"],
+ "expect_merged": ["exit_w", "r110", "r112", "r114", "r210", "r212", "r214a", "stairs_1", "stairs_2"],
  "must_not_merge": [
   ["r110", "r112", "different rooms 110 / 112"],
   ["r110", "r114", "different rooms 110 / 114"],

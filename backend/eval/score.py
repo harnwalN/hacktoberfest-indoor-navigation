@@ -67,23 +67,27 @@ def claimed_rooms(node) -> set[str]:
     return out | set(_LABEL_ROOM.findall(label))
 
 
-def associate(truth: Truth, obs: dict[str, list[dict]],
-              claims: dict[str, set[str]] | None = None) -> tuple[dict[str, Counter], list[dict]]:
+def associate(truth: Truth, obs: dict[str, list[dict]], claims: dict[str, set[str]] | None = None,
+              spots: set[str] | None = None) -> tuple[dict[str, Counter], list[dict]]:
     """place id -> Counter(map node id), and per-visit match records.
 
     A walker merely passing a room (no glance) is matched to a map place only if that place claims the room's
-    number: otherwise the nearby place is a junction or corridor spot that saw the plaque, not the room."""
+    number: otherwise the nearby place is a junction or corridor spot that saw the plaque, not the room. Likewise
+    a sign read from afar (`see`) is matched only to a map place that claims the place: its room number, or for
+    any other place not a corridor spot (`spots`: hallway / intersection places), where the walker merely stood."""
     assoc: dict[str, Counter] = defaultdict(Counter)
     records = []
     rooms = {p.id: p.room.upper() for p in truth.building.places if p.room}
     for video in truth.videos:
         walk = [o for o in obs.get(video.id, []) if o.get("node")]
         for v in video.visits:
-            tol = LOOK_TOL_S if v.kind == "look" else PASS_TOL_S
+            tol = PASS_TOL_S if v.kind == "pass" else LOOK_TOL_S
             best = min(walk, key=lambda o: (_gap(v.t, o), abs(v.t - o["t"])), default=None)
             hit = best is not None and _gap(v.t, best) <= tol
-            if hit and v.kind == "pass" and v.place in rooms and claims is not None:
+            if hit and v.kind in ("pass", "see") and v.place in rooms and claims is not None:
                 hit = rooms[v.place] in claims.get(best["node"], set())
+            elif hit and v.kind == "see" and spots is not None:
+                hit = best["node"] not in spots
             if hit:
                 assoc[v.place][best["node"]] += 1
             records.append({"video": video.id, "place": v.place, "t": v.t, "kind": v.kind,
@@ -201,7 +205,8 @@ def score(truth: Truth, bundle: MapBundle, obs: dict[str, list[dict]],
     """`events`: per truth video, the motion events the pipeline detected (track.json), for turn metrics."""
     nodes = {n.id: n for n in bundle.nodes}
     claims = {nid: claimed_rooms(n) for nid, n in nodes.items()}
-    assoc, records = associate(truth, obs, claims)
+    spots = {nid for nid, n in nodes.items() if n.type in ("hallway", "intersection") and not n.vertical}
+    assoc, records = associate(truth, obs, claims, spots)
     node_places: dict[str, set[str]] = defaultdict(set)
     for pid, cnt in assoc.items():
         for nid in cnt:
