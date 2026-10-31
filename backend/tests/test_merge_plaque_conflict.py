@@ -82,7 +82,8 @@ def test_find_match_ocr_only_conflict_without_gemma(monkeypatch, tmp_path, inl):
 
 
 # ---------------------------------------------------------------- consolidate
-def cons(monkeypatch, tmp_path, inliers, verdict, rooms=("ROOM 121", "ROOM 305"), floors=(1, 1), gemma_on=True):
+def cons(monkeypatch, tmp_path, inliers, verdict, rooms=("ROOM 121", "ROOM 305"), floors=(1, 1), gemma_on=True,
+         type_="hallway"):
     monkeypatch.setattr(ocr, "available", lambda: False)
     monkeypatch.setattr(mapper, "orb_match", lambda a, b: (inliers, 0.0))
     calls = []
@@ -91,7 +92,8 @@ def cons(monkeypatch, tmp_path, inliers, verdict, rooms=("ROOM 121", "ROOM 305")
         calls.append(1)
         return verdict
     monkeypatch.setattr(gemma, "same_place", sp)
-    nodes = [Node(id=f"n00{i + 1}", label=f"P{i}", frame_id=f"{i}.jpg", texts=[rooms[i]] if rooms[i] else [],
+    nodes = [Node(id=f"n00{i + 1}", label=f"P{i}", type=type_, frame_id=f"{i}.jpg",
+                  texts=[rooms[i]] if rooms[i] else [],
                   sign_texts=[rooms[i]] if rooms[i] else [], floor=floors[i], floor_source="user", video_id=f"v{i}")
              for i in range(2)]
     b = MapBundle(building_id="b", nodes=nodes, videos=[VideoInfo(id="v0", filename="a", status="done"),
@@ -145,7 +147,8 @@ def test_consolidate_false_strong_still_merges_without_plaques(monkeypatch, tmp_
 
 
 def test_consolidate_same_room_any_spelling_merges(monkeypatch, tmp_path):
-    b, _ = cons(monkeypatch, tmp_path, 0, None, rooms=("ROOM-118", "RM 118"))
+    # door places (type room): a hallway spot labelled 'P0' with the plaque in view is a corridor view, not 118
+    b, _ = cons(monkeypatch, tmp_path, 0, None, rooms=("ROOM-118", "RM 118"), type_="room")
     assert len(b.nodes) == 1
 
 

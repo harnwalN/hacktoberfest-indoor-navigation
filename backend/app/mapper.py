@@ -26,7 +26,7 @@ from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep w
     _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, room_floor, set_walk_floor,
     stair_rel_floors, stair_states,
 )
-from .matching import _next_id, place_tokens, room_ids
+from .matching import PLAQUE_PREFIX, ROOM_ID, _next_id, place_tokens, room_ids
 from .motion import focal_px, median_heading
 from .schemas import (
     FLIP_VERTICAL, Edge, FrameAnalysis, Keyframe, MapBundle, Node, SuggestedMerge,
@@ -961,8 +961,23 @@ def _room_ids(node: Node) -> set[str]:
 
 def _corridor_view(node: Node) -> bool:
     """A hallway spot or junction (not a door, stairwell or exit): any room number on its photo is a plaque in
-    view, not the place where the walker stood."""
-    return node.type in ("hallway", "intersection") and not node.vertical
+    view, not the place where the walker stood. A place whose own label names one of its room numbers
+    ('Room 208', 'RM 118') is that room, whatever its type says: hand-edited maps leave room nodes at the
+    default type."""
+    if node.type not in ("hallway", "intersection") or node.vertical:
+        return False
+    return not (_label_room(node.label) & _room_ids(node))
+
+
+_LABEL_ROOM = re.compile(rf"\s*(?:{PLAQUE_PREFIX}\b\.?)?[\s.:#-]*(?:NO\b\.?[\s.:#-]*)?({ROOM_ID})\b"
+                         rf"|\s*{PLAQUE_PREFIX}({ROOM_ID})\b")
+
+
+def _label_room(label: str) -> set[str]:
+    """The room a label is named after: 'Room 208', 'RM-118 door', '208 Lab'. A label that merely mentions a
+    plaque further in ('Hallway with ROOM 101') names a corridor, not that room."""
+    m = _LABEL_ROOM.match((label or "").upper())
+    return {m.group(1) or m.group(2)} if m else set()
 
 
 def _rooms_conflict(ra: set[str], rb: set[str]) -> bool:
