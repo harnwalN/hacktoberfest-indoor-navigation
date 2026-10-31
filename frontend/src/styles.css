@@ -805,3 +805,73 @@ html, body { overflow-x: clip; }
 .invite-row.is-revoked .invite-main b { color: var(--muted); text-decoration: line-through; }
 .revoke-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 0.92rem; }
 .revoke-confirm > span { flex-basis: 100%; }
+
+/* ---------- "Something's wrong?" on a direction step ---------- */
+.report-issue { display: grid; gap: 8px; justify-items: start; margin: 8px 16px 0; min-width: 0; }
+@media (min-width: 720px) { .report-issue { margin: 12px 0 0; } }
+.report-toggle { min-height: var(--tap); padding: 8px 6px; border: 0; background: none; color: var(--text-2); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+@media (hover: hover) { .report-toggle:hover:not(:disabled) { background: none; color: var(--text); } }
+.report-panel { display: grid; gap: 10px; width: 100%; box-sizing: border-box; padding: 14px; border-radius: var(--r-md); background: var(--well); }
+.report-kinds { border: 0; margin: 0; padding: 0; display: grid; gap: 2px; min-width: 0; }
+.report-kinds legend { font-weight: 700; color: var(--text-2); padding: 0; margin-bottom: 4px; }
+.report-choice { min-height: var(--tap); margin: 0; }
+.report-choice > span { padding: 10px 0; }
+.report-choice input[type='radio'], .role-choice input[type='radio'] { width: 22px; height: 22px; min-height: 0; padding: 0; accent-color: var(--accent); flex: none; }
+.report-note { margin: 0; }
+.report-note textarea, .report-fix textarea {
+  width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 14px; border-radius: var(--r-md); border: 1.5px solid var(--control);
+  background: var(--surface); color: var(--text); font: 1rem var(--font); resize: vertical;
+}
+.report-note > small, .report-fix small { font-size: 0.85rem; text-align: right; }
+.report-panel > .notice { margin: 0; }
+.report-actions { justify-content: flex-start; }
+.report-thanks { margin: 0; font-weight: 700; color: var(--accent-deep); }
+.trip-view .report-panel :is(button, input, textarea) { scroll-margin-bottom: calc(var(--step-nav-h) + var(--strip-h) + 8px); }
+
+/* ---------- the editors' reports list (Map tab) ---------- */
+.reports { display: grid; gap: 12px; }
+.reports-head { align-items: flex-start; }
+.reports h3 { margin: 0; flex-wrap: wrap; }
+.reports-help, .reports-empty { margin: 0; }
+.count-badge { display: inline-flex; align-items: center; min-height: 24px; padding: 2px 10px; border-radius: 999px; font: 700 0.8rem var(--font); background: var(--well); color: var(--muted); white-space: nowrap; }
+.count-badge.has-open { background: var(--noexit-bg); color: var(--noexit-fg); }
+.report-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.report-item { display: grid; gap: 8px; padding: 14px; border-radius: var(--r-md); background: var(--well); min-width: 0; }
+.report-item.is-resolved { background: transparent; box-shadow: inset 0 0 0 1px var(--border); }
+.report-kind { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.report-place { margin: 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text-2); overflow-wrap: anywhere; }
+.report-note-text { margin: 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--border); color: var(--text-2); overflow-wrap: anywhere; }
+.report-meta { margin: 0; font-size: 0.85rem; }
+.report-who { overflow-wrap: anywhere; }
+.report-resolution { margin: 0; color: var(--accent-deep); overflow-wrap: anywhere; }
+.report-fix { display: grid; gap: 6px; }
+.report-fix .field { margin: 0; }
+.report-history { font-size: 0.88rem; color: var(--muted); }
+.report-history summary { min-height: var(--tap); display: flex; align-items: center; cursor: pointer; font-weight: 700; color: var(--text-2); }
+.report-history ol { margin: 0 0 4px; padding-left: 20px; display: grid; gap: 4px; }
+.report-history li { overflow-wrap: anywhere; }
+.tab-badge { position: absolute; top: 2px; left: calc(50% + 14px); min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font: 800 0.72rem var(--font); display: inline-flex; align-items: center; justify-content: center; }
+
+/* ---------- entrance poster (owner, from the share panel) ---------- */
+.poster-offer { display: grid; gap: 6px; justify-items: start; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--border); }
+.poster-offer > p { margin: 0; }
+.field-help { margin: 0; font-size: 0.88rem; }
+.field > label > span { font-size: 0.92rem; font-weight: 700; color: var(--text-2); }
+.poster-root { position: fixed; inset: 0; z-index: 100; overflow: auto; background: var(--ground); display: grid; justify-items: center; align-content: start; gap: 16px; padding: 16px; box-sizing: border-box; }
+.poster-bar { width: min(100%, 560px); box-sizing: border-box; display: grid; gap: 10px; padding: 14px; border-radius: var(--r-lg); background: var(--surface); }
+.poster-bar > p { margin: 0; color: var(--text-2); }
+.poster-sheet { width: min(100%, 560px); box-sizing: border-box; display: grid; justify-items: center; gap: 12px; padding: 32px 24px 28px; border-radius: var(--r-lg); background: #ffffff; color: #111111; text-align: center; }
+.poster-name { margin: 0; font: 800 2.2rem var(--display); color: #111111; overflow-wrap: anywhere; }
+.poster-qr { display: block; width: min(100%, 380px); height: auto; }
+.poster-cta { margin: 0; font: 800 1.6rem var(--display); color: #111111; }
+.poster-link { margin: 0; max-width: 100%; font: 0.9rem ui-monospace, Menlo, Consolas, monospace; color: #333333; overflow-wrap: anywhere; }
+.poster-error { width: 100%; margin: 0; }
+
+@media print {
+  @page { margin: 16mm; }
+  body > :not(.poster-root) { display: none !important; }
+  .poster-root { position: static; display: block; padding: 0; overflow: visible; background: #ffffff; }
+  .no-print { display: none !important; }
+  .poster-sheet { width: 100%; max-width: none; padding: 0; border-radius: 0; box-shadow: none; }
+  .poster-qr { width: 120mm; }
+}

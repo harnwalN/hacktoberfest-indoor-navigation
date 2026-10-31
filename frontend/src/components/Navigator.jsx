@@ -8,6 +8,7 @@ import ErrorBoundary from './ErrorBoundary'
 import ServerPhoto from './ServerPhoto'
 import SignGlyph, { PlaceChip, glyphKind, isWaypoint, placeKind } from './ArrowOverlay'
 import { Confetti, EmptyArt, PlannerArt, PlannerSkeleton } from './Motion'
+import ReportIssue from './ReportIssue'
 
 const TYPE_RANK = { entrance: 0, room: 1, restroom: 2, elevator: 3, stairs: 4, exit: 5, landmark: 6 }
 // Short, glanceable headline for the sign; the full sentence sits underneath.
@@ -597,6 +598,16 @@ function NavigatorInner({ building }) {
           {s.floorChange && <p className="floor-callout"><strong>{s.floorChange}</strong></p>}
         </div>
       </div>
+
+      {/* The trip's ends are the trip as asked (it may have been re-routed from here); the step's own place and raw index go too. */}
+      <ReportIssue
+        key={`${trip.current?.from}|${trip.current?.to}|${idx}`}
+        building={building}
+        nodeId={s.node_id}
+        stepIndex={Number.isInteger(s.step_index) ? s.step_index : idx}
+        fromNode={trip.current?.from || steps[0].node_id}
+        toNode={trip.current?.to || destination.node_id}
+      />
 
       <StepList steps={steps} index={idx} onPick={goTo} />
       {/* strip sits right above the controls and docks with them, so its dots are never under the sticky nav */}

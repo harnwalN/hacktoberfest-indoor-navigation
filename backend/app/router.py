@@ -12,7 +12,7 @@ import networkx as nx
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from PIL import Image
 
-from . import auth, config, gemma, jobs, mapper, reports, routing, store
+from . import auth, config, gemma, jobs, mapper, ocr, reports, routing, store
 from .schemas import (
     CreateBuilding, EdgeOut, FrameAnalysis, InviteCreate, ManualMerge, MapBundle, MapEdit, MapOut, MergeDecision, Node,
     NodeOut, ReportCreate, ReportStatusUpdate, RouteRequest, RouteResponse, VideoUpdate,
@@ -92,7 +92,7 @@ def health():
     ffmpeg = shutil.which("ffmpeg")
     version = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True).stdout.split("\n")[0] if ffmpeg else None
     return {"ffmpeg": version, "gemma": gemma.health(), "hosted": gemma.hosted_health(),
-            "vision_provider": gemma.vision_provider()}
+            "vision_provider": gemma.vision_provider(), "ocr": {"engine": ocr.engine(), "available": ocr.available()}}
 
 
 # ---------- buildings & map ----------

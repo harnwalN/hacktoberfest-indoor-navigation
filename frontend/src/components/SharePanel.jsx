@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { Copy, Link2 } from 'lucide-react'
+import { Copy, Link2, Printer } from 'lucide-react'
 import { api, detail } from '../api'
+import Poster from './Poster'
 
 const ROLES = [
   { id: 'viewer', label: 'Viewer', hint: 'can get directions' },
@@ -60,7 +61,9 @@ export default function SharePanel({ building, name }) {
   const [confirmId, setConfirmId] = useState(null)
   const [revokingId, setRevokingId] = useState(null)
   const [notice, setNotice] = useState('')
+  const [poster, setPoster] = useState(false)
   const linkRef = useRef(null)
+  const posterBtn = useRef(null)
 
   const reload = () =>
     api
@@ -140,8 +143,10 @@ export default function SharePanel({ building, name }) {
             </label>
           ))}
         </fieldset>
-        <label className="field" htmlFor={labelId}>
-          <span>Label (optional)</span>
+        <div className="field">
+          <label htmlFor={labelId}>
+            <span>Label (optional)</span>
+          </label>
           <input
             id={labelId}
             type="text"
@@ -150,8 +155,14 @@ export default function SharePanel({ building, name }) {
             placeholder="e.g. Alex's phone"
             onChange={(e) => setLabel(e.target.value)}
             autoComplete="off"
+            aria-describedby={role === 'viewer' ? `${labelId}-help` : undefined}
           />
-        </label>
+          {role === 'viewer' && (
+            <small id={`${labelId}-help`} className="field-help muted">
+              For an entrance poster, label it &ldquo;Entrance poster&rdquo; so you can find it later.
+            </small>
+          )}
+        </div>
         {err && <p role="alert" className="notice error">{err}</p>}
         <button type="submit" className="primary" disabled={busy}>
           {busy ? 'Creating…' : 'Create link'}
@@ -172,12 +183,25 @@ export default function SharePanel({ building, name }) {
             <button type="button" className="primary" onClick={copy}>
               <Copy size={16} aria-hidden="true" /> Copy link
             </button>
-            <button type="button" className="ghost" onClick={() => { setMade(null); setCopied('') }}>
+            <button type="button" className="ghost" onClick={() => { setMade(null); setCopied(''); setPoster(false) }}>
               Done
             </button>
           </div>
           <p role="status" className="muted">{copied}</p>
+          {made.role === 'viewer' && (
+            <div className="poster-offer">
+              <p className="muted">
+                <b>Anyone who scans the poster gets viewer access.</b> Revoking this invite in the list switches the poster off.
+              </p>
+              <button type="button" className="ghost" ref={posterBtn} onClick={() => setPoster(true)}>
+                <Printer size={16} aria-hidden="true" /> Make a poster
+              </button>
+            </div>
+          )}
         </div>
+      )}
+      {poster && made && (
+        <Poster name={name} link={made.link} onClose={() => setPoster(false)} returnFocusTo={posterBtn} />
       )}
 
       {notice && <p role="status" className="notice">{notice}</p>}

@@ -106,6 +106,29 @@ export default function App() {
     latest.current = effBuilding
   }, [effBuilding])
 
+  // The open "something's wrong" count: editors and owners only (the server leaves it out for viewers). It is kept with the
+  // building it was read for, so a count from one building never shows on another. Fetched again when the Map tab opens
+  // and after the editors resolve or reopen a report.
+  const canEdit = role === 'owner' || role === 'editor'
+  const [openInfo, setOpenInfo] = useState(null)
+  const refreshOpen = useCallback(() => {
+    const b = effBuilding
+    if (!b || !canEdit) return
+    api
+      .myAccess(b)
+      .then((r) => {
+        if (latest.current === b && typeof r?.open_reports === 'number') setOpenInfo({ building: b, count: r.open_reports })
+      })
+      .catch(() => {})
+  }, [effBuilding, canEdit])
+  useEffect(() => {
+    refreshOpen()
+  }, [refreshOpen])
+  useEffect(() => {
+    if (shownTab === 'review') refreshOpen()
+  }, [shownTab, refreshOpen])
+  const openCount = openInfo && openInfo.building === effBuilding && canEdit ? openInfo.count : null
+
   const refresh = useCallback(
     () =>
       api
@@ -295,7 +318,9 @@ export default function App() {
             {hasBuilding && shownTab === 'build' && role === 'owner' && (
               <SharePanel key={effBuilding} building={effBuilding} name={current?.name} />
             )}
-            {hasBuilding && shownTab === 'review' && <MapReview building={effBuilding} onChanged={refresh} />}
+            {hasBuilding && shownTab === 'review' && (
+              <MapReview building={effBuilding} onChanged={refresh} openCount={openCount} onOpenChanged={refreshOpen} />
+            )}
             {hasBuilding && shownTab === 'navigate' && <Navigator building={effBuilding} />}
             {hasBuilding && shownTab === 'record' && <Recorder building={effBuilding} onUploaded={() => setTab('build')} />}
           </>
@@ -304,13 +329,22 @@ export default function App() {
 
       {!needed && (
         <nav className="tabbar" aria-label="Main">
-          {TABS.filter((t) => allowed.includes(t.id)).map(({ id, label, icon: Icon }) => (
-            <button key={id} className={shownTab === id ? 'active' : ''} aria-current={shownTab === id ? 'page' : undefined}
-              disabled={noBuildings && id !== 'build'} onClick={() => setTab(id)}>
-              <Icon size={20} />
-              <span>{label}</span>
-            </button>
-          ))}
+          {TABS.filter((t) => allowed.includes(t.id)).map(({ id, label, icon: Icon }) => {
+            const count = id === 'review' && openCount > 0 ? openCount : 0
+            return (
+              <button key={id} className={shownTab === id ? 'active' : ''} aria-current={shownTab === id ? 'page' : undefined}
+                disabled={noBuildings && id !== 'build'} onClick={() => setTab(id)}>
+                <Icon size={20} />
+                <span>{label}</span>
+                {count > 0 && (
+                  <>
+                    <b className="tab-badge" aria-hidden="true">{count}</b>
+                    <span className="sr-only">, {count} open {count === 1 ? 'report' : 'reports'}</span>
+                  </>
+                )}
+              </button>
+            )
+          })}
         </nav>
       )}
     </div>

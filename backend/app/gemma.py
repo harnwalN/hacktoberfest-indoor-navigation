@@ -686,8 +686,17 @@ def _cache_first(cache: GemmaCache, key_for, model_cls, model: str | None, compu
     return result
 
 
+def _ocr_mode() -> str:
+    """The OCR part of the cache keys: 'plain' (OCR off), 'ocr' (Apple Vision, the key every macOS answer has
+    always had) or 'ocr-<engine>'. Lines from another engine can ground a different answer, so they never share a key."""
+    if not ocr.available():
+        return "plain"
+    eng = ocr.engine()
+    return "ocr" if eng == "vision" else f"ocr-{eng}"
+
+
 def _frame_key(path: Path):
-    mode = "ocr" if ocr.available() else "plain"
+    mode = _ocr_mode()
     sha = _sha(path)
     return lambda m: f"analyze:{PROMPT_VERSION}:{m}:{mode}:{sha}"
 
@@ -726,7 +735,7 @@ def _refresh_ocr(path: Path, result: FrameAnalysis, cache: GemmaCache, key_for) 
         return result
     try:
         st = Path(path).stat()
-        lines = list(_ocr_lines(str(path), st.st_mtime_ns, st.st_size))
+        lines = list(_ocr_lines(str(path), st.st_mtime_ns, st.st_size, ocr.engine()))
     except (OSError, ValueError) as exc:
         log.debug("OCR refresh skipped for %s: %s", path, exc)
         return result
@@ -774,7 +783,8 @@ def _room_conflict(path_a: Path, path_b: Path) -> SamePlace | None:
 
 
 @functools.lru_cache(maxsize=1024)
-def _ocr_lines(path: str, mtime_ns: int, size: int) -> tuple[str, ...]:
+def _ocr_lines(path: str, mtime_ns: int, size: int, engine: str) -> tuple[str, ...]:
+    """OCR lines of a photo, memoized per engine too (the same photo read by another engine is other lines)."""
     return tuple(ocr.read_text_with_crops(Path(path)))
 
 
@@ -787,7 +797,7 @@ def plaque_conflict(path_a: Path, path_b: Path) -> SamePlace | None:
         lines = []
         for p in (Path(path_a), Path(path_b)):
             st = p.stat()
-            lines.append(list(_ocr_lines(str(p), st.st_mtime_ns, st.st_size)))
+            lines.append(list(_ocr_lines(str(p), st.st_mtime_ns, st.st_size, ocr.engine())))
     except (OSError, ValueError) as exc:  # missing / unreadable image: no evidence either way
         log.debug("plaque check skipped: %s", exc)
         return None
@@ -806,6 +816,10 @@ def _plaque_verdict(la: list[str], lb: list[str]) -> SamePlace | None:
 def _compare(kind: str, prompt: str, path_a: Path, path_b: Path, cache: GemmaCache, model: str | None) -> SamePlace:
     sa, sb = _sha(path_a), _sha(path_b)
     (ha, first), (hb, second) = sorted(((sa, path_a), (sb, path_b)))  # Image 1 = smaller hash: either order
+    # A 'same' verdict can be decided by OCR (_room_conflict), so its key carries the OCR mode too. Apple Vision keeps
+    # the key every macOS answer has; other engines (and OCR off) get a suffix. 'stairs' never reads OCR.
+    mode = _ocr_mode() if kind == "same" else "ocr"
+    tag = "" if mode == "ocr" else f":{mode}"
 
     def compute(m: str) -> SamePlace:  # gives the same (cached) question
         if kind == "same" and (conflict := _room_conflict(first, second)) is not None:
@@ -815,7 +829,7 @@ def _compare(kind: str, prompt: str, path_a: Path, path_b: Path, cache: GemmaCac
         result.confidence = max(0.0, min(1.0, float(result.confidence)))
         return result
 
-    return _cache_first(cache, lambda m: f"{kind}:{PROMPT_VERSION}:{m}:{ha}:{hb}", SamePlace, model, compute,
+    return _cache_first(cache, lambda m: f"{kind}:{PROMPT_VERSION}:{m}:{ha}:{hb}{tag}", SamePlace, model, compute,
                         mark_offline=True)
 
 

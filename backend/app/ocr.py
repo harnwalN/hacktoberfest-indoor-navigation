@@ -1,39 +1,111 @@
-"""On-device OCR (Apple Vision framework) used to ground Gemma's sign reading.
+"""On-device OCR used to ground Gemma's sign reading.
 
-Small vision-language models confidently invent room numbers. Vision's text recognizer is offline,
-~50 ms per frame, and only reports strings that are really there, so Gemma is told which strings
-exist and anything it reports outside that list is dropped. Gemma still does all the understanding:
-labels, place types, stairs, landmark phrases and same-place checks.
+Small vision-language models confidently invent room numbers. An OCR engine is offline and only reports
+strings that are really there, so Gemma is told which strings exist and anything it reports outside that
+list is dropped. Gemma still does all the understanding: labels, place types, stairs, landmark phrases and
+same-place checks.
 
-Not on macOS (or pyobjc missing)? `available()` is False and Gemma runs ungrounded.
+Engines (config.OCR_ENGINE): Apple Vision on macOS; RapidOCR (PP-OCRv5 ONNX models on onnxruntime, no
+PyTorch) elsewhere, when installed with `uv sync --extra linux-ocr`. Both return the same lines:
+(text, x_min, x_max) with x normalized to 0..1, top to bottom. No engine (or OCR_ENABLED=0): `available()`
+is False and Gemma runs ungrounded.
 """
+import importlib.util
 import io
+import logging
 import re
+import sys
+import threading
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageOps
 
 from . import config
 from .matching import ROOM_ID, complete_room_id, cut_number, directional, notice, phone_like, room_id
+
+log = logging.getLogger(__name__)
 
 try:
     import objc
     import Vision
     from Foundation import NSURL, NSData
 
-    _AVAILABLE = True
+    _AVAILABLE = True  # Apple Vision can be used
 except ImportError:  # Linux/Windows, or pyobjc not installed
     _AVAILABLE = False
+
+RAPID_INSTALL = "uv sync --extra linux-ocr"
+ENGINES = ("auto", "vision", "rapidocr", "none")  # the values of config.OCR_ENGINE
+
+
+def select_engine(requested: str, platform: str, vision_ok: bool, rapid_ok: bool) -> tuple[str, str]:
+    """The engine that runs ('vision', 'rapidocr' or 'none') and the reason. Pure, so the matrix is testable.
+
+    auto: Apple Vision on macOS, else RapidOCR if installed, else none. An explicit engine wins over auto; when
+    it is not available here the result is none (the caller logs why)."""
+    if requested not in ENGINES:
+        raise ValueError(f"OCR_ENGINE must be one of {', '.join(ENGINES)} (got {requested!r})")
+    if requested == "none":
+        return "none", "OCR_ENGINE=none"
+    if requested == "vision":
+        if vision_ok:
+            return "vision", "OCR_ENGINE=vision"
+        return "none", "OCR_ENGINE=vision, but Apple Vision (macOS with pyobjc-framework-vision) is not available here"
+    if requested == "rapidocr":
+        if rapid_ok:
+            return "rapidocr", "OCR_ENGINE=rapidocr"
+        return "none", f"OCR_ENGINE=rapidocr, but RapidOCR is not installed ({RAPID_INSTALL})"
+    if vision_ok and platform == "darwin":
+        return "vision", "auto: Apple Vision on macOS"
+    if rapid_ok:
+        return "rapidocr", "auto: RapidOCR (Apple Vision is not available here)"
+    return "none", f"auto: neither Apple Vision (macOS) nor RapidOCR is available ({RAPID_INSTALL} installs RapidOCR)"
+
+
+def _rapid_installed() -> bool:
+    """RapidOCR and onnxruntime can be imported. Checked without importing them: they load on first use.
+    A folder left behind by an uninstall (rapidocr/models) is a namespace package with no origin: not installed."""
+    try:
+        specs = [importlib.util.find_spec(m) for m in ("rapidocr", "onnxruntime")]
+    except (ImportError, ValueError):
+        return False
+    return all(spec is not None and spec.origin is not None for spec in specs)
+
+
+def _resolve() -> tuple[str, str]:
+    return select_engine(config.OCR_ENGINE, sys.platform, _AVAILABLE, _rapid_installed())
+
+
+def _announce(eng: str, why: str) -> None:
+    """The one-time startup log: which engine runs, or why none does (Gemma then runs without OCR grounding)."""
+    if not config.OCR_ENABLED:
+        log.info("OCR disabled (OCR_ENABLED=0): Gemma runs without OCR grounding")
+    elif eng == "none":
+        log.warning("OCR off (%s): Gemma's room numbers and sign texts are not checked against sign text", why)
+    else:
+        log.info("OCR engine: %s (%s)", eng, why)
+
+
+_ENGINE, _WHY = _resolve()  # once per process
+_announce(_ENGINE, _WHY)
 
 
 # Version of what read_text_with_crops keeps. Bump it whenever that changes (e.g. the image-edge filter, rev 2):
 # a cached frame analysis stores the OCR lines it was grounded on, and one from an older revision has its lines
 # re-read from the photo (no Gemma call) so stale lines ('110' of a 110A plaque cut at the edge) cannot ground.
-REVISION = 2
+# rev 3: several engines (RapidOCR lines and their own threshold). The engine is part of the Gemma cache key
+# (gemma._ocr_mode); answers stored at rev 2 keep their key and get their lines re-read once, OCR only.
+REVISION = 3
+
+
+def engine() -> str:
+    """The OCR engine in use: 'vision', 'rapidocr' or 'none' (none when OCR_ENABLED=0 or nothing is available)."""
+    return _ENGINE if config.OCR_ENABLED else "none"
 
 
 def available() -> bool:
-    return _AVAILABLE and config.OCR_ENABLED
+    return engine() != "none"
 
 
 def _handler(source):
@@ -46,7 +118,7 @@ def _handler(source):
     return Vision.VNImageRequestHandler.alloc().initWithData_options_(NSData.dataWithBytes_length_(data, len(data)), None)
 
 
-def _observations(source) -> list[tuple[str, float, float]]:
+def _vision_observations(source) -> list[tuple[str, float, float]]:
     """(text, x_min, x_max) per recognized line with confidence >= OCR_MIN_CONFIDENCE; x normalized to 0..1."""
     with objc.autorelease_pool():
         handler = _handler(source)
@@ -67,8 +139,88 @@ def _observations(source) -> list[tuple[str, float, float]]:
         return out
 
 
+class OCRUnavailable(RuntimeError):
+    """The chosen engine cannot read the image (its models did not load). Nothing is cached for the frame,
+    so it is tried again on the next run."""
+
+
+_rapid = None  # the RapidOCR instance, built on the first image
+_rapid_lock = threading.Lock()  # guards the load and every call: RapidOCR.__call__ updates the instance's settings
+
+
+def _load_rapid():
+    try:
+        from rapidocr import RapidOCR  # lazy: only a machine that uses this engine needs the package
+        from rapidocr.utils.typings import ModelType, OCRVersion
+
+        # PP-OCRv5 mobile det + rec (ONNX). The first use downloads the models (ModelScope, checksummed) into the
+        # rapidocr package. Its own text_score filter is set to our threshold, and the library's logs are quiet.
+        return RapidOCR(params={
+            "Global.text_score": config.OCR_MIN_CONFIDENCE_RAPIDOCR,
+            "Global.log_level": "error",
+            "Det.ocr_version": OCRVersion.PPOCRV5, "Det.model_type": ModelType.MOBILE,
+            "Rec.ocr_version": OCRVersion.PPOCRV5, "Rec.model_type": ModelType.MOBILE,
+        })
+    except Exception as exc:  # not installed, or the models could not be fetched or loaded
+        raise OCRUnavailable(f"RapidOCR could not start ({exc}); install it with {RAPID_INSTALL}") from exc
+
+
+def _upright_rgb(source) -> Image.Image:
+    """An RGB PIL image with the phone's EXIF rotation applied (a path is opened as read_text_with_crops opens it)."""
+    if isinstance(source, (str, Path)):
+        with Image.open(source) as opened:
+            img = ImageOps.exif_transpose(opened)
+            img.load()
+    else:
+        img = source
+    return img.convert("RGB")
+
+
+def _rapid_lines(raw, width: int) -> list[tuple[str, float, float]]:
+    """A RapidOCR result (boxes (N,4,2) in pixels, txts, scores) as (text, x_min, x_max) lines like Vision's,
+    x normalized by the image width and clamped to 0..1. Blank lines and lines under
+    OCR_MIN_CONFIDENCE_RAPIDOCR are dropped. The detector's order (top to bottom, left to right) is kept."""
+    boxes, txts, scores = getattr(raw, "boxes", None), getattr(raw, "txts", None), getattr(raw, "scores", None)
+    if boxes is None or not txts or not scores or width <= 0:
+        return []
+    out = []
+    for box, txt, score in zip(boxes, txts, scores):
+        text = str(txt).strip()
+        if not text or float(score) < config.OCR_MIN_CONFIDENCE_RAPIDOCR:
+            continue
+        xs = np.asarray(box, dtype=float)[:, 0]
+        x0 = min(max(float(xs.min()) / width, 0.0), 1.0)
+        x1 = min(max(float(xs.max()) / width, 0.0), 1.0)
+        out.append((text, x0, x1))
+    return out
+
+
+def _rapid_observations(source) -> list[tuple[str, float, float]]:
+    """The RapidOCR lines of an image file or a PIL image (same shape as _vision_observations)."""
+    global _rapid
+    img = _upright_rgb(source)
+    w, h = img.size
+    if w == 0 or h == 0:
+        return []
+    with _rapid_lock:
+        if _rapid is None:
+            _rapid = _load_rapid()
+        raw = _rapid(img)
+    return _rapid_lines(raw, w)
+
+
+def _observations(source) -> list[tuple[str, float, float]]:
+    """(text, x_min, x_max) per line of the engine in use (see _vision_observations and _rapid_observations)."""
+    eng = engine()
+    if eng == "vision":
+        return _vision_observations(source)
+    if eng == "rapidocr":
+        return _rapid_observations(source)
+    return []
+
+
 def read_text(source: Path | Image.Image) -> list[str]:
-    """Return recognized text lines (confidence >= OCR_MIN_CONFIDENCE) of an image file or a PIL image."""
+    """Return recognized text lines of an image file or a PIL image (above the engine's confidence threshold)."""
     if not available():
         return []
     return [t for t, _, _ in _observations(source)]

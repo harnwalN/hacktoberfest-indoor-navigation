@@ -66,9 +66,17 @@ HOSTED_RETRY_MAX_SEC = _f("HOSTED_RETRY_MAX_SEC", 10)  # longest Retry-After wai
 HOSTED_CONCURRENCY = int(os.getenv("HOSTED_CONCURRENCY", 4))  # frames in flight for a hosted walk
 HOSTED_MAX_CALLS_PER_DAY = int(os.getenv("HOSTED_MAX_CALLS_PER_DAY", 5000))  # cost guard, per server, UTC day
 
-# On-device OCR (macOS Vision) grounds Gemma's sign text so it cannot invent room numbers.
-OCR_ENABLED = os.getenv("OCR_ENABLED", "1") != "0"
-OCR_MIN_CONFIDENCE = _f("OCR_MIN_CONFIDENCE", 0.5)
+# On-device OCR grounds Gemma's sign text so it cannot invent room numbers (ocr.py).
+# auto: Apple Vision on macOS, else RapidOCR when installed (uv sync --extra linux-ocr), else none (OCR skipped, logged).
+# vision / rapidocr: that engine only; none, with a log, when it is not available here. none: OCR off.
+OCR_ENGINE = os.getenv("OCR_ENGINE", "auto").strip().lower()
+if OCR_ENGINE not in ("auto", "vision", "rapidocr", "none"):
+    raise ValueError(f"OCR_ENGINE must be auto, vision, rapidocr or none (got {OCR_ENGINE!r})")
+OCR_ENABLED = os.getenv("OCR_ENABLED", "1") != "0"  # master switch: 0 turns OCR off whatever the engine
+OCR_MIN_CONFIDENCE = _f("OCR_MIN_CONFIDENCE", 0.5)  # Apple Vision lines
+# RapidOCR scores on its own scale (not Vision's): on the 10-frame check real sign text scored 0.90 and up, and the
+# noise lines 0.62 and below. Tune on real footage (eval/README "Real or Habitat data") before changing it.
+OCR_MIN_CONFIDENCE_RAPIDOCR = _f("OCR_MIN_CONFIDENCE_RAPIDOCR", 0.7)
 
 # --- Video normalization ---
 ANALYSIS_FPS = int(os.getenv("ANALYSIS_FPS", 10))

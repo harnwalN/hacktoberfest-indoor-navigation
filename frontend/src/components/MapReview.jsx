@@ -5,6 +5,7 @@ import ErrorBoundary from './ErrorBoundary'
 import Map3D from './Map3D'
 import ServerPhoto from './ServerPhoto'
 import { EmptyArt } from './Motion'
+import ReportsSection from './ReportsSection'
 import { PlaceChip, isMinorNode, placeKind } from './ArrowOverlay'
 
 // Fill in optional fields the backend may omit (older maps, partial edits) so the screens never crash on them.
@@ -359,15 +360,16 @@ function DirSelect({ value, onChange }) {
   )
 }
 
-export default function MapReview({ building, onChanged }) {
+// openCount: the open "something's wrong" reports (from the app, which fetches it for editors and owners only).
+export default function MapReview({ building, onChanged, openCount, onOpenChanged }) {
   return (
     <ErrorBoundary key={building} title="The map hit a problem">
-      <MapReviewInner building={building} onChanged={onChanged} />
+      <MapReviewInner building={building} onChanged={onChanged} openCount={openCount} onOpenChanged={onOpenChanged} />
     </ErrorBoundary>
   )
 }
 
-function MapReviewInner({ building, onChanged }) {
+function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
   const [map, setMap] = useState(null)
   const [dirty, setDirty] = useState(false)
   const [selected, setSelected] = useState(null)
@@ -482,6 +484,15 @@ function MapReviewInner({ building, onChanged }) {
     }
   }
 
+  // "Show on map" from the reports list: select the place and bring the map into view.
+  const showNode = (id) => {
+    const n = byId[id]
+    if (!n) return
+    setSelected(id)
+    setFloor(n.floor)
+    document.querySelector('.map-panel')?.scrollIntoView({ block: 'start' })
+  }
+
   const sel = selected ? byId[selected] : null
   const selEdges = sel ? map.edges.filter((e) => e.from_node === sel.id || e.to_node === sel.id) : []
 
@@ -578,6 +589,8 @@ function MapReviewInner({ building, onChanged }) {
           ))}
         </section>
       )}
+
+      <ReportsSection building={building} nodes={map.nodes} openCount={openCount} onCountChanged={onOpenChanged} onShowNode={showNode} />
 
       {sel && (
         <section className="card node-editor">

@@ -139,6 +139,14 @@ export const api = {
     http
       .post(`/buildings/${b}/route`, { start_node_id: start, target_node_id: target, avoid_stairs: avoidStairs === true })
       .then((r) => r.data),
+  // "Something's wrong" from Directions (any role that can read the building).
+  report: (b, body) => http.post(`/buildings/${enc(b)}/reports`, body).then((r) => r.data),
+  // Editors and owners. status: open | resolved | all.
+  reports: (b, { status = 'open', limit = 100 } = {}) =>
+    http.get(`/buildings/${enc(b)}/reports`, { params: { status, limit } }).then((r) => r.data),
+  updateReport: (b, id, body) => http.patch(`/buildings/${enc(b)}/reports/${enc(id)}`, body).then((r) => r.data),
+  // The caller's role; editors and owners also get open_reports (the count shown as a badge).
+  myAccess: (b) => http.get(`/buildings/${enc(b)}/access`).then((r) => r.data),
 }
 
 // The message to show for a failed call. It never includes request headers, so a token cannot leak through an error.

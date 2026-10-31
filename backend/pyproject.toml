@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.162.0",
+    "httpx>=0.28.1",
     "imagehash>=4.3.2",
     "networkx>=3.7",
     "numpy>=2.5.4",
@@ -11,13 +12,26 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pillow>=13.0.0",
     "pydantic>=2.14.1",
-    "pyobjc-framework-vision>=12.2.2",
+    "pyobjc-framework-vision>=12.2.2; sys_platform == 'darwin'",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.54.0",
 ]
 
+# OCR off macOS (ocr.py): RapidOCR runs PP-OCRv5 ONNX models on onnxruntime; no PyTorch.
+# uv sync --extra linux-ocr  (macOS users keep Apple Vision and need not install it)
+[project.optional-dependencies]
+linux-ocr = [
+    "onnxruntime>=1.31.1",
+    "rapidocr>=3.10.0",
+]
+
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]
+
+[tool.uv]
+# rapidocr asks for opencv-python-headless, which installs the same cv2 package as opencv-python (a dependency of
+# this project). Both installed: removing either one deletes cv2. RapidOCR only needs cv2's image functions, which
+# opencv-python has, so the headless copy is never installed.
+override-dependencies = ["opencv-python-headless; sys_platform == 'never'"]
