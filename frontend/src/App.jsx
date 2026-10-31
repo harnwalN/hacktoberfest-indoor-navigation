@@ -113,7 +113,7 @@ export default function App() {
           <section className="card new-building">
             <h3>New building</h3>
             <div className="row">
-              <input placeholder="e.g. Engineering Hall" value={newName} onChange={(e) => setNewName(e.target.value)}
+              <input aria-label="New building name" placeholder="e.g. Engineering Hall" value={newName} onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && create()} />
               <button onClick={create}>Create</button>
             </div>

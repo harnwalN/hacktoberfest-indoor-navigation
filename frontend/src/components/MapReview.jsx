@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Check, GitMerge, ImagePlus, Link2, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { ArrowRight, Check, GitMerge, ImagePlus, Link2, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
 import { api, detail, frameUrl } from '../api'
 import ErrorBoundary from './ErrorBoundary'
 import Map3D from './Map3D'
+import { EmptyArt } from './Motion'
 import { PlaceChip, isMinorNode, placeKind } from './ArrowOverlay'
 
 // Fill in optional fields the backend may omit (older maps, partial edits) so the screens never crash on them.
@@ -264,27 +265,28 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
         <button className="icon-btn fit" aria-label="Fit floor" onClick={() => setView(null)}>Fit</button>
       </div>
       {!nodes.length ? (
-        <p className="map-empty">Nothing mapped on floor {floor} yet.</p>
+        <div className="map-empty"><EmptyArt /><p>Nothing mapped on floor {floor} yet.</p></div>
       ) : (
         <svg ref={svgRef} className="schematic" viewBox={`${v.x} ${v.y} ${v.w} ${v.h}`} preserveAspectRatio="xMidYMid meet"
           onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}>
-          {sameFloor.map((e) => {
+          {sameFloor.map((e, k) => {
             const a = pos[e.from_node]
             const b = pos[e.to_node]
             if (!a || !b) return null
-            return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]}
+            return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} pathLength="1" style={{ '--i': Math.min(k, 30) }}
               className={`edge ${(e.vertical || 'none') !== 'none' ? 'vertical' : ''} ${selEdges.has(e.id) ? 'active' : ''}`} />
           })}
-          {nodes.map((n) => {
+          {nodes.map((n, k) => {
             const p = pos[n.id]
             if (!p) return null
             const other = links[n.id] ? [...links[n.id]].sort((x, y) => x - y) : []
             const cls = glyphClass(n)
             const r = cls === 'minor' ? 0.09 : 0.2
             return (
-              <g key={n.id} className={`snode ${cls} ${selected === n.id ? 'sel' : ''}`} onClick={() => pick(n.id)}>
+              <g key={n.id} className={`snode ${cls} ${selected === n.id ? 'sel' : ''}`} style={{ '--i': Math.min(k, 30) }} onClick={() => pick(n.id)}>
                 <title>{`${n.label} (floor ${n.floor})${placeKind(n) === 'noexit' ? ', NOT an exit' : ''}`}</title>
                 <circle cx={p[0]} cy={p[1]} r={0.5} className="hit" />
+                {selected === n.id && <circle cx={p[0]} cy={p[1]} r={r + 0.04} className="sel-ring" />}
                 {cls === 'vertical'
                   ? <rect x={p[0] - r} y={p[1] - r} width={r * 2} height={r * 2} rx={0.06} />
                   : <circle cx={p[0]} cy={p[1]} r={r} />}
@@ -312,6 +314,34 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
         {measured && <li>Distances estimated from walking time in the videos</li>}
       </ul>
     </div>
+  )
+}
+
+// A sideways-scrolling region that says so: the caption shows only while the content is wider than the box.
+function SideScroll({ label, children }) {
+  const ref = useRef(null)
+  const [wide, setWide] = useState(false)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return undefined
+    const check = () => setWide(el.scrollWidth > el.clientWidth + 1)
+    const ro = new ResizeObserver(check)
+    ro.observe(el)
+    if (el.firstElementChild) ro.observe(el.firstElementChild)
+    check()
+    return () => ro.disconnect()
+  }, [])
+  return (
+    <>
+      {wide && (
+        <p className="scroll-hint" aria-hidden="true">
+          Scroll sideways for more <ArrowRight size={14} />
+        </p>
+      )}
+      <div ref={ref} className="table-scroll" tabIndex={0} role="region" aria-label={label}>
+        {children}
+      </div>
+    </>
   )
 }
 
@@ -482,7 +512,7 @@ function MapReviewInner({ building, onChanged }) {
             </button>
             <label className="ghost file-btn">
               <ImagePlus size={16} /> Add photo
-              <input type="file" accept="image/*" hidden onChange={(e) => addPhoto(e.target.files[0])} />
+              <input type="file" accept="image/*" className="file-input" onChange={(e) => addPhoto(e.target.files[0])} />
             </label>
             <button className="primary" disabled={!dirty || busy} onClick={save}>
               <Save size={16} /> {dirty ? 'Save changes' : 'Saved'}
@@ -552,7 +582,7 @@ function MapReviewInner({ building, onChanged }) {
             <span>Landmark phrase (used in "Turn left at …")</span>
             <input value={sel.description} onChange={(e) => patchNode(sel.id, { description: e.target.value })} />
           </label>
-          <div className="row">
+          <div className="row fields">
             <label className="field">
               <span>Type</span>
               <select value={sel.type} onChange={(e) => patchNode(sel.id, { type: e.target.value })}>
@@ -569,7 +599,7 @@ function MapReviewInner({ building, onChanged }) {
             </label>
           </div>
           {sel.texts.length > 0 && <p className="muted">Gemma read: {sel.texts.join(' · ')}</p>}
-          <div className="row">
+          <div className="row merge-row">
             <select value={mergeWith} onChange={(e) => setMergeWith(e.target.value)}>
               <option value="">Merge another node into this one…</option>
               {sortedNodes.filter((n) => n.id !== sel.id).map((n) => <option key={n.id} value={n.id}>{n.label || n.id} (floor {n.floor})</option>)}
@@ -579,6 +609,7 @@ function MapReviewInner({ building, onChanged }) {
             </button>
           </div>
           <h4>Connections</h4>
+          <SideScroll label="Connections, scrolls sideways">
           <table className="edges">
             <thead>
               <tr><th>From</th><th>To</th><th>Leave</th><th>Arrive</th><th>Level</th><th /></tr>
@@ -601,6 +632,7 @@ function MapReviewInner({ building, onChanged }) {
               ))}
             </tbody>
           </table>
+          </SideScroll>
         </section>
       )}
 
@@ -634,8 +666,8 @@ function MapReviewInner({ building, onChanged }) {
         </label>
         {map.nodes.length === 0 && <p className="muted">No places yet. Upload a walk or add a photo to start the map.</p>}
         <div className="node-grid">
-          {sortedNodes.filter((n) => !hideWaypoints || n.id === selected || !isMinorNode(n)).map((n) => (
-            <button key={n.id} className={`node-card ${selected === n.id ? 'sel' : ''}`} onClick={() => setSelected(n.id)}>
+          {sortedNodes.filter((n) => !hideWaypoints || n.id === selected || !isMinorNode(n)).map((n, k) => (
+            <button key={n.id} className={`node-card ${selected === n.id ? 'sel' : ''}`} style={{ '--i': Math.min(k, 12) }} onClick={() => setSelected(n.id)}>
               {n.frame_id ? <img src={frameUrl(building, n.frame_id)} loading="lazy" alt="" /> : <div className="nophoto" />}
               <span>{n.label || 'Unnamed place'}</span>
               <PlaceChip node={n} />

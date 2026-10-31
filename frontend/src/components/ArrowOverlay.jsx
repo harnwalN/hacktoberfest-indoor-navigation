@@ -109,11 +109,14 @@ function UTurn() {
 }
 
 function Stairs({ up }) {
+  // The steps draw themselves, then the arrow climbs (or descends) them: the floor change gets its own moment.
   return (
     <g>
-      <path d="M14 84 H32 V68 H50 V52 H68 V36 H86" {...STROKE} className="glyph-stroke" />
-      <path d={up ? 'M26 48 L50 24' : 'M50 24 L26 48'} {...STROKE} strokeWidth={7} className="glyph-stroke" />
-      <Head x={up ? 53 : 23} y={up ? 21 : 51} angle={up ? 45 : 225} />
+      <path d="M14 84 H32 V68 H50 V52 H68 V36 H86" {...STROKE} pathLength="1" className="glyph-stroke glyph-steps" />
+      <g className={`glyph-climb ${up ? 'up' : 'down'}`}>
+        <path d={up ? 'M26 48 L50 24' : 'M50 24 L26 48'} {...STROKE} strokeWidth={7} className="glyph-stroke" />
+        <Head x={up ? 53 : 23} y={up ? 21 : 51} angle={up ? 45 : 225} />
+      </g>
     </g>
   )
 }
@@ -122,7 +125,8 @@ function Elevator() {
   return (
     <g>
       <rect x="24" y="16" width="52" height="70" rx="8" {...STROKE} strokeWidth={7} className="glyph-stroke" />
-      <path d="M50 30 L62 44 H38 Z M50 72 L62 58 H38 Z" className="glyph-fill" />
+      <path d="M50 30 L62 44 H38 Z" className="glyph-fill glyph-car glyph-car--up" />
+      <path d="M50 72 L62 58 H38 Z" className="glyph-fill glyph-car glyph-car--down" />
     </g>
   )
 }
@@ -130,8 +134,13 @@ function Elevator() {
 function Arrive() {
   return (
     <g>
-      <path d="M50 90 C50 90 22 58 22 40 A28 28 0 0 1 78 40 C78 58 50 90 50 90 Z" className="glyph-fill" />
-      <circle cx="50" cy="40" r="10" className="glyph-hole" />
+      <ellipse cx="50" cy="90" rx="14" ry="5" fill="none" strokeWidth="3" className="glyph-stroke glyph-ripple" />
+      <ellipse cx="50" cy="90" rx="14" ry="5" fill="none" strokeWidth="3" className="glyph-stroke glyph-ripple glyph-ripple--2" />
+      <g className="glyph-drop">
+        <path d="M50 90 C50 90 22 58 22 40 A28 28 0 0 1 78 40 C78 58 50 90 50 90 Z" className="glyph-fill" />
+        <circle cx="50" cy="40" r="14" className="glyph-hole" />
+        <path d="M43 40.5 L48.5 46 L58 34.5" fill="none" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" pathLength="1" className="glyph-stroke glyph-check" />
+      </g>
     </g>
   )
 }
@@ -158,7 +167,7 @@ export function glyphKind(action, vertical) {
   return 'turn'
 }
 
-export default function SignGlyph({ action, vertical, title }) {
+export default function SignGlyph({ action, vertical, title, style }) {
   let body
   if (action === 'stairs_up' || action === 'stairs_down') body = <Stairs up={action === 'stairs_up'} />
   else if (action === 'ramp_up' || action === 'ramp_down') body = <Slight />
@@ -167,7 +176,7 @@ export default function SignGlyph({ action, vertical, title }) {
     body = <g transform={mirror ? 'translate(100 0) scale(-1 1)' : undefined}><Glyph /></g>
   }
   return (
-    <svg className={`glyph ${glyphKind(action, vertical)}`} viewBox="0 0 100 100" role="img" aria-label={title || action}>
+    <svg className={`glyph ${glyphKind(action, vertical)}`} style={style} viewBox="0 0 100 100" role="img" aria-label={title || action}>
       {body}
     </svg>
   )

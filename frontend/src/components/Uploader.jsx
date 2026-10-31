@@ -87,8 +87,9 @@ export default function Uploader({ building, onDone }) {
           <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
           Process next (pauses the current video; it resumes afterwards)
         </label>
-        {error && <div className="banner error">{error}</div>}
-        <button className="primary" disabled={!file || uploadPct !== null} onClick={upload}>
+        {error && <div className="banner error" role="alert">{error}</div>}
+        <button className={`primary upload-btn ${uploadPct !== null ? 'is-uploading' : ''}`} disabled={!file || uploadPct !== null} onClick={upload}>
+          {uploadPct !== null && <span className="btn-fill" aria-hidden="true" style={{ transform: `translateX(${Math.round((uploadPct - 1) * 100)}%)` }} />}
           <UploadCloud size={18} />
           {uploadPct !== null ? `Uploading ${Math.round(uploadPct * 100)}%` : 'Upload & process'}
         </button>

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowUp, ArrowUpDown, ArrowUpLeft, ArrowUpRight, ChevronLeft, ChevronRight, CornerUpLeft, CornerUpRight, Footprints,
+  ArrowRight, ArrowUp, ArrowUpDown, ArrowUpLeft, ArrowUpRight, ChevronLeft, ChevronRight, CornerUpLeft, CornerUpRight, Footprints,
   MapPin, RefreshCw, Search, TrendingDown, TrendingUp, Undo2, X,
 } from 'lucide-react'
 import { api, detail } from '../api'
 import ErrorBoundary from './ErrorBoundary'
 import SignGlyph, { PlaceChip, glyphKind, isWaypoint, placeKind } from './ArrowOverlay'
+import { Confetti, EmptyArt, PlannerArt, PlannerSkeleton } from './Motion'
 
 const TYPE_RANK = { entrance: 0, room: 1, restroom: 2, elevator: 3, stairs: 4, exit: 5, landmark: 6 }
 // Short, glanceable headline for the sign; the full sentence sits underneath.
@@ -20,6 +21,10 @@ const STEP_ICON = {
   turn_right: CornerUpRight, u_turn: Undo2, stairs_up: TrendingUp, stairs_down: TrendingDown, elevator: ArrowUpDown,
   ramp_up: TrendingUp, ramp_down: TrendingDown, destination_reached: MapPin,
 }
+
+// Heading of each action in degrees (0 = straight on); the sign's arrow swings from the previous step's heading.
+const ANGLE = { slight_right: 45, turn_right: 90, u_turn: 180, slight_left: -45, turn_left: -90 }
+const headingOf = (s) => ANGLE[s?.action] || 0
 
 const naturalSort = (a, b) => (a.label || '').localeCompare(b.label || '', undefined, { numeric: true, sensitivity: 'base' })
 
@@ -123,13 +128,13 @@ function PlacePicker({ id, label, value, onChange, nodes, allNodes }) {
       onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false) }}>
       <label htmlFor={id}><span>{label}</span></label>
       {selected && !open && (
-        <p className="place-picked">
+        <p className="place-picked" key={value}>
           <b>{selected.label}</b> <small>floor {selected.floor}</small> <PlaceChip node={selected} />
         </p>
       )}
       <div className="place-search">
         <Search size={16} aria-hidden="true" />
-        <input id={id} type="search" autoComplete="off" value={query} placeholder={selected ? 'Change: search room number or name' : 'Search room number or name'}
+        <input id={id} type="search" autoComplete="off" value={query} placeholder={selected ? 'Search to change' : 'Search places'}
           aria-expanded={open} aria-controls={`${id}-list`}
           onFocus={() => setOpen(true)} onClick={() => setOpen(true)}
           onChange={(e) => { setQuery(e.target.value); setOpen(true) }} onKeyDown={onKeyDown} />
@@ -195,7 +200,7 @@ function StepList({ steps, index, onPick }) {
       {steps.map((s, k) => {
         const Icon = STEP_ICON[s.action] || ArrowUp
         return (
-          <li key={k} className={`step ${k === index ? 'step--current' : ''}`}>
+          <li key={k} className={`step ${k === index ? 'step--current' : ''}`} style={{ '--i': Math.min(k, 8) }}>
             <button type="button" onClick={() => onPick(k)} aria-current={k === index ? 'step' : undefined}>
               <span className="step-icon"><Icon size={22} aria-hidden="true" /></span>
               <span className="step-text">
@@ -221,6 +226,8 @@ const normalizeMap = (m) => ({
   videos: m?.videos || [],
 })
 
+const TRK0 = { i: 0, dir: 1, prev: null }
+
 export default function Navigator({ building }) {
   return (
     <ErrorBoundary key={building} title="Directions hit a problem">
@@ -241,6 +248,10 @@ function NavigatorInner({ building }) {
   const [showAll, setShowAll] = useState(false)
   const [reload, setReload] = useState(0)
   const touch = useRef(null)
+  // Which way the last step change went (for the slide direction) and the step we came from. Derived while
+  // rendering with the React "adjust state on prop change" pattern, so no ref is mutated during render.
+  const [trk, setTrk] = useState(TRK0)
+  const [swapTurn, setSwapTurn] = useState(0)
 
   useEffect(() => {
     let live = true
@@ -328,18 +339,27 @@ function NavigatorInner({ building }) {
         <button onClick={() => setReload((n) => n + 1)}><RefreshCw size={16} /> Try again</button>
       </div>
     )
-  if (!map) return <div className="quiet-state" role="status" aria-live="polite">Loading the building map…</div>
+  if (!map)
+    return (
+      <div className="loading-state" role="status" aria-live="polite">
+        <PlannerSkeleton />
+        <p className="muted">Loading the building map…</p>
+      </div>
+    )
   if (candidates.length < 2)
     return (
       <div className="quiet-state">
+        <EmptyArt />
         <h2>No map yet</h2>
         <p>Record or upload a walk through the building in Build, and directions will appear here.</p>
       </div>
     )
 
   if (!steps) {
+    if (trk !== TRK0) setTrk(TRK0)
     return (
       <section className="planner">
+        <PlannerArt />
         <h1>Where are you going?</h1>
         <div className="trip">
           <div className="trip-line" aria-hidden="true">
@@ -351,8 +371,8 @@ function NavigatorInner({ building }) {
             <PlacePicker id="from" label="From" value={start} onChange={setStart} nodes={choices} allNodes={allNodes} />
             <PlacePicker id="to" label="To" value={target} onChange={setTarget} nodes={choices} allNodes={allNodes} />
           </div>
-          <button className="icon-btn swap" aria-label="Swap start and destination" onClick={() => { setStart(target); setTarget(start) }}>
-            <ArrowUpDown size={18} />
+          <button className="icon-btn swap" aria-label="Swap start and destination" onClick={() => { setStart(target); setTarget(start); setSwapTurn((n) => n + 1) }}>
+            <ArrowUpDown size={18} style={{ transform: `rotate(${swapTurn * 180}deg)` }} className="swap-icon" />
           </button>
         </div>
         <label className="check">
@@ -360,8 +380,8 @@ function NavigatorInner({ building }) {
           Show unverified places too
         </label>
         {error && <p className="notice error" role="alert">{error}</p>}
-        <button className="go" disabled={!start || !target || start === target || routing} onClick={go}>
-          {routing ? 'Finding your route…' : 'Start directions'}
+        <button className={`go ${start && target && start !== target ? 'ready' : ''} ${routing ? 'busy' : ''}`} disabled={!start || !target || start === target || routing} onClick={go}>
+          {routing ? 'Finding your route…' : <>Start directions <ArrowRight size={22} aria-hidden="true" /></>}
         </button>
         {start && start === target && <p className="planner-meta" role="status">Pick two different places.</p>}
         <p className="planner-meta">
@@ -373,6 +393,11 @@ function NavigatorInner({ building }) {
 
   const idx = Math.min(i, last)
   const s = steps[idx]
+  const t = trk.i === idx ? trk : { i: idx, dir: idx > trk.i ? 1 : -1, prev: steps[trk.i] || null }
+  if (t !== trk) setTrk(t)
+  const { dir, prev } = t
+  const swing = Math.max(-45, Math.min(45, Math.round((headingOf(prev) - headingOf(s)) * 0.5)))
+  const floorMoved = prev && prev.floor !== s.floor ? (s.floor > prev.floor ? 'up' : 'down') : ''
   const destination = steps[last]
   const kind = glyphKind(s.action, s.vertical)
   const onTouchEnd = (e) => {
@@ -385,7 +410,7 @@ function NavigatorInner({ building }) {
   const showDistance = s.distance && s.action !== 'destination_reached'
 
   return (
-    <section className="trip-view">
+    <section className="trip-view" style={{ '--dir': dir }}>
       <header className="trip-head">
         <button className="icon-btn" aria-label="End directions" onClick={() => setRaw(null)}>
           <X size={20} />
@@ -400,13 +425,14 @@ function NavigatorInner({ building }) {
 
       <figure className="scene" onTouchStart={(e) => (touch.current = e.touches[0].clientX)} onTouchEnd={onTouchEnd}>
         {s.frame_url ? <img key={s.frame_url} src={s.frame_url} alt={`View at ${s.label}`} /> : <div className="no-photo">No photo for this spot</div>}
-        <span className="floor-chip">Floor {s.floor}</span>
+        <span className={`floor-chip ${floorMoved ? `moved moved--${floorMoved}` : ''}`} key={`fc${idx}`}>Floor {s.floor}</span>
         {s.view_note && <figcaption>{s.view_note}</figcaption>}
       </figure>
 
       <div className={`sign ${kind}`} role="status" aria-live="polite" aria-atomic="true">
-        <SignGlyph action={s.action} vertical={s.vertical} title={HEADLINE[s.action]} />
-        <div className="sign-copy">
+        {kind === 'arrive' && <Confetti />}
+        <SignGlyph key={`g${idx}`} action={s.action} vertical={s.vertical} title={HEADLINE[s.action]} style={{ '--swing': `${swing}deg` }} />
+        <div className="sign-copy" key={`c${idx}`}>
           <span className="sr-only">Step {idx + 1} of {steps.length}. </span>
           <h2>{HEADLINE[s.action] || 'Continue'}</h2>
           <p>{s.instruction_text}</p>
@@ -415,8 +441,9 @@ function NavigatorInner({ building }) {
         </div>
       </div>
 
-      <RouteStrip steps={steps} index={idx} onPick={goTo} />
       <StepList steps={steps} index={idx} onPick={goTo} />
+      {/* strip sits right above the controls and docks with them, so its dots are never under the sticky nav */}
+      <RouteStrip steps={steps} index={idx} onPick={goTo} />
 
       <nav className="step-nav" aria-label="Step controls">
         <button disabled={idx === 0} onClick={() => goTo(idx - 1)}>
