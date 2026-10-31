@@ -27,8 +27,9 @@ from .floors import (  # noqa: F401  (re-exported: mapper.room_floor etc. keep w
     _link_floors, _merge_floor_conflict, _shift_guessed_walk, assign_floors, mark_climbs, room_floor,
     set_walk_floor, stair_rel_floors, stair_states,
 )
-from .matching import PLAQUE_PREFIX, ROOM_ID, _next_id, place_tokens, room_ids
+from .matching import PLAQUE_PREFIX, ROOM_ID, _next_id, directional, place_tokens, room_ids
 from .motion import detect_climbs, focal_px, median_heading
+from .ocr import sign_line
 from .schemas import (
     FLIP_VERTICAL, Edge, FrameAnalysis, Keyframe, MapBundle, Node, SuggestedMerge,
 )
@@ -37,6 +38,9 @@ from .schemas import (
 NODE_KINDS = {"start", "end", "turn_start", "dwell"}
 IMPORTANT_TYPES = {"intersection", "entrance", "stairs", "elevator", "exit", "restroom", "room", "landmark"}
 KEY_TYPES = {"entrance", "stairs", "elevator", "exit", "restroom"}  # always worth a node + auto-verify
+# Key places a visitor routes to, by family: an exit door is also a way in, so exit and entrance are one family
+# (one place seen twice may be typed either; eval/score.py counts false key places by the same table).
+KEY_FAMILY = {"exit": "exit", "entrance": "exit", "restroom": "restroom", "elevator": "elevator"}
 KIND_PRIORITY = {"turn_start": 0, "glance": 1, "start": 2, "end": 2, "dwell": 3}
 
 
@@ -189,21 +193,156 @@ def _has_sign(a: FrameAnalysis | None) -> bool:
     return bool(wayfinding_texts(a))
 
 
+# ---------------------------------------------------------------- key places need their own sign
+# A place is an exit / entrance / restroom / elevator only if a sign on ITS frame says so. Gemma's place_type
+# alone is a guess: small models call the end wall of a corridor, a door at a corridor end, a 'LEVEL 1' sign or
+# a green 'NO EXIT' plate an exit or entrance. Staircases are recognizable from the picture (no sign needed).
+SIGNED_TYPES = ("exit", "entrance", "restroom", "elevator")
+KEY_SIGN_WORDS = {
+    "exit": {"EXIT", "EXITS"},
+    "entrance": {"ENTRANCE", "ENTRANCES", "ENTRY", "ENTER"},
+    "restroom": {"RESTROOM", "RESTROOMS", "TOILET", "TOILETS", "WC", "LAVATORY", "BATHROOM", "BATHROOMS", "MEN",
+                 "MENS", "WOMEN", "WOMENS", "LADIES", "GENTLEMEN", "GENTS"},
+    "elevator": {"ELEVATOR", "ELEVATORS", "LIFT", "LIFTS"},
+}
+_NEGATION = {"NO", "NOT", "NON"}  # 'NO EXIT', 'NOT AN EXIT', 'NON-EXIT', 'DO NOT ENTER', 'NO ENTRY'
+_NEG_SCOPE = 2  # a negation reaches the next word or the one after ('NOT AN EXIT', 'NO THROUGH EXIT')
+_KEY_WORDS = set().union(*KEY_SIGN_WORDS.values())
+
+
+def _sign_words(text: str) -> list[str]:
+    """Upper-case words, with a negation OCR glued on split off again ('NOEXIT' -> 'NO', 'EXIT')."""
+    out = []
+    for w in re.findall(r"[A-Z]+", text.upper()):
+        neg = next((n for n in ("NOT", "NON", "NO") if w.startswith(n) and w[len(n):] in _KEY_WORDS), None)
+        out += [neg, w[len(neg):]] if neg else [w]
+    return out
+
+
+def _negation_of(words: list[str], i: int) -> int | None:
+    """Index of the negation word that negates key word `words[i]`, else None. Its scope is the next one or two
+    words, and it negates only the first key word in it: 'NO ENTRY EXIT ONLY', 'DO NOT ENTER EXIT ONLY' negate
+    the entry, not the exit. 'DO NOT <verb>' negates the verb: 'DO NOT BLOCK EXIT' is an exit."""
+    for j in range(i - 1, max(-1, i - 1 - _NEG_SCOPE), -1):
+        if words[j] not in _NEGATION:
+            continue
+        between = words[j + 1:i]
+        if any(w in _KEY_WORDS for w in between) or (between and j > 0 and words[j - 1] == "DO"):
+            return None
+        return j
+    return None
+
+
+def _key_hits(text: str) -> tuple[list[str], list[tuple[int, str, int | None]]]:
+    """The text's words, and (index, kind, index of its negation or None) for each key word in it."""
+    words = _sign_words(text)
+    hits = [(i, k, _negation_of(words, i)) for i, w in enumerate(words)
+            for k, kw in KEY_SIGN_WORDS.items() if w in kw]
+    return words, hits
+
+
+def names_key(text: str, kind: str) -> bool:
+    """The sign text says this is a `kind` place: one of its words, not negated by the one or two words before it
+    ('EMERGENCY EXIT', 'EXIT ONLY', 'NO ENTRY EXIT ONLY', 'DO NOT BLOCK EXIT' yes; 'NO EXIT', 'NOEXIT', 'NON-EXIT',
+    'NOT AN EXIT', 'DO NOT ENTER' no). A text that negates the kind anywhere never names it ('NOT AN EXIT. EXIT
+    AHEAD'): which word is right is unknown, and a false exit is worse than a missed one."""
+    negs = [neg is not None for _, k, neg in _key_hits(text)[1] if k == kind]
+    return bool(negs) and not any(negs)
+
+
+def negated_key(text: str) -> bool:
+    """A sign that says a place is NOT a key place ('NO EXIT', 'DO NOT ENTER')."""
+    return any(neg is not None for _, _, neg in _key_hits(text)[1])
+
+
+def _negated_spans(text: str, kind: str) -> list[list[str]]:
+    """The words of each negated `kind` sign in the text: from the negation to the key word, plus the word after
+    ('NO EXIT DOOR')."""
+    words, hits = _key_hits(text)
+    return [words[neg:i + 2] for i, k, neg in hits if k == kind and neg is not None]
+
+
+def _split_signs(lines: list[str]) -> list[str]:
+    """Neighbouring lines read as one sign where a line ends in a negation: OCR splits a 'NO EXIT' plate into
+    'NO' + 'EXIT' (a bare 'NO' line may come after the line it belongs to). 'NO SMOKING' + 'EXIT' stays two."""
+    out = []
+    for i, line in enumerate(lines):
+        words = _sign_words(line)
+        if not words or words[-1] not in _NEGATION:
+            continue
+        if i + 1 < len(lines):
+            out.append(f"{line} {lines[i + 1]}")
+        if i > 0 and len(words) == 1:
+            out.append(f"{line} {lines[i - 1]}")
+    return out
+
+
+def _within(words: list[str], span: list[str]) -> bool:
+    return any(span[i:i + len(words)] == words for i in range(len(span) - len(words) + 1))
+
+
+def key_sign(a: FrameAnalysis | None, kind: str) -> bool:
+    """A sign naming `kind` on this frame: in Gemma's texts (OCR-checked when grounded), or an OCR line of the frame
+    that Gemma left out. Without OCR, Gemma's texts are the only reading, but its place_type is still not enough.
+
+    Negation is read over the whole frame, not one line at a time: OCR splits a 'NO EXIT' plate into the lines
+    'NO', 'EXIT', or Gemma reads 'NO EXIT' where OCR only caught 'EXIT'. A frame carrying a negated `kind` sign is
+    that kind only through a separate positive sign, one that is not a piece of the negated one ('NO EXIT' +
+    'FIRE EXIT'); a bare 'EXIT' next to 'NO EXIT' is taken for a piece of it (a false exit is worse than a missed
+    one)."""
+    if a is None:
+        return False
+    lines = list(a.texts)
+    if a.grounded:
+        lines += [line for line in a.ocr if sign_line(line)]
+    positive = [t for t in lines if names_key(t, kind)]
+    if not positive:
+        return False
+    sources = [*a.texts, *a.ocr, *_split_signs(list(a.texts)), *_split_signs(list(a.ocr))]
+    spans = [s for src in sources for s in _negated_spans(src, kind)]
+    return any(not any(_within(_sign_words(t), s) for s in spans) for t in positive)
+
+
+def place_type(a: FrameAnalysis | None) -> str:
+    """Gemma's place_type, grounded: an exit/entrance/restroom/elevator without its sign on the frame is the room
+    whose plaque the frame shows, else a hallway spot."""
+    if a is None:
+        return "hallway"
+    t = a.place_type
+    if t in SIGNED_TYPES and not key_sign(a, t):
+        return "room" if room_ids(a.room_numbers) else "hallway"
+    return t
+
+
+def _unsigned_key(a: FrameAnalysis | None) -> str | None:
+    """The key type Gemma claimed but no sign on the frame confirms (see place_type), else None."""
+    return a.place_type if a is not None and a.place_type in SIGNED_TYPES and place_type(a) != a.place_type else None
+
+
 def _key_place(a: FrameAnalysis | None) -> bool:
-    """Entrances/restrooms/exits/elevators need sign evidence when OCR grounding is on;
+    """Entrances/restrooms/exits/elevators need their own sign on the frame (place_type);
     a staircase is recognizable from the picture alone."""
     if a is None:
         return False
     if a.place_type == "stairs" or a.stairs in ("ahead_up", "ahead_down"):
         return True
-    return a.place_type in KEY_TYPES and (_has_sign(a) or not a.grounded)
+    return place_type(a) in KEY_TYPES
 
 
 def _worthy(kf: Keyframe) -> bool:
     a = kf.analysis
     if kf.kind in NODE_KINDS:
         return True
-    return bool(a and (a.room_numbers or _key_place(a) or (a.place_type == "room" and _has_sign(a))))
+    return bool(a and (a.room_numbers or _key_place(a) or (place_type(a) == "room" and _has_sign(a))
+                       or _no_entry_sign(a)))
+
+
+def _no_entry_sign(a: FrameAnalysis | None) -> str | None:
+    """A 'NO EXIT' / 'DO NOT ENTER' sign that Gemma took for an exit/entrance: the door is worth a place (a
+    landmark named by its sign), but it is not a key place."""
+    if _unsigned_key(a) is None:
+        return None
+    return next((t for t in a.texts if negated_key(t)), None)
 
 
 ROOM_LIKE = {"room", "restroom", "exit"}  # places with their own identity, never a stair landing
@@ -216,7 +355,7 @@ def _walk_vertical(a: FrameAnalysis, boundary: bool) -> str | None:
     flagged node on each of two floors would be enough for _link_floors to guess a floor link."""
     if boundary or a.place_type == "stairs":
         return "stairs"
-    if a.place_type == "elevator":
+    if place_type(a) == "elevator":  # an elevator needs its sign, like any key place (place_type)
         return "elevator"
     return None
 
@@ -275,7 +414,15 @@ def _absorbs(kfs, states, prev: WalkNode, wn: WalkNode) -> bool:
     same_spot = gap < config.SAME_PLACE_WINDOW_SEC and _same_spot(prev, wn)
     if prev.glances and wn.glances:
         return same_spot
-    return gap < config.NODE_MIN_GAP_SEC or same_spot
+    return gap < config.NODE_MIN_GAP_SEC or same_spot or (gap < config.STAIR_APPROACH_SEC and _stair_turn(prev, wn))
+
+
+def _stair_turn(a: WalkNode, b: WalkNode) -> bool:
+    """A plain corridor turn right before / after a stair boundary: the walker turned onto (or off) the flight there,
+    so it is the landing, not a junction of its own (two nodes would split the stair place between walks)."""
+    stairs, other = (a, b) if a.vertical == "stairs" else (b, a)
+    return (stairs.vertical == "stairs" and not other.vertical and other.kf.kind == "turn_start"
+            and place_type(other.analysis) in ("hallway", "intersection") and not _walk_rooms(other))
 
 
 def _walk_rooms(wn: WalkNode) -> set[str]:
@@ -295,7 +442,7 @@ def _keep_apart(a: WalkNode, b: WalkNode) -> bool:
         return True
     # A stair landing and the door beside it are two places: one node would either be a "room" that is
     # stairs (and then never merges with the same room seen on another walk) or lose the stairs.
-    return bool(a.vertical) != bool(b.vertical) and bool({a.analysis.place_type, b.analysis.place_type} & ROOM_LIKE)
+    return bool(a.vertical) != bool(b.vertical) and bool({place_type(a.analysis), place_type(b.analysis)} & ROOM_LIKE)
 
 
 def _same_spot(a: WalkNode, b: WalkNode) -> bool:
@@ -310,7 +457,14 @@ def _same_spot(a: WalkNode, b: WalkNode) -> bool:
     la, lb = _norm_label(a.analysis.suggested_label), _norm_label(b.analysis.suggested_label)
     if la and la == lb:
         return True
-    return a.analysis.place_type == b.analysis.place_type and a.analysis.place_type in {"entrance", "stairs", "elevator", "exit", "restroom"}
+    if _stairish(a) and _stairish(b):
+        return True  # the landing and the stairs seen from it ('Level 1' sign, then the 'STAIRS' sign)
+    ta = place_type(a.analysis)
+    return ta == place_type(b.analysis) and ta in {"entrance", "stairs", "elevator", "exit", "restroom"}
+
+
+def _stairish(w: WalkNode) -> bool:
+    return w.vertical == "stairs" or place_type(w.analysis) == "stairs"
 
 
 def _crosses_stairs(kfs, states, a: WalkNode, b: WalkNode) -> bool:
@@ -326,43 +480,146 @@ def _absorb(keep: WalkNode, other: WalkNode) -> None:
     def rank(w: WalkNode):
         # a frame of the place itself (the glance at the door) describes it better than a corridor view of
         # its plaque: a turn that also glanced at Room 105 is Room 105, a corner merely in view of it is not
-        corridor = w.analysis.place_type in ("hallway", "intersection")
+        corridor = place_type(w.analysis) in ("hallway", "intersection")
         return (0 if _has_sign(w.analysis) else 1, int(corridor), KIND_PRIORITY.get(w.kf.kind, 9))
     mine = _walk_rooms(keep)
-
-    def own(texts: list[str]) -> list[str]:
-        return [t for t in texts if not mine or room_ids([t]) <= mine]
-
+    rooms_k, rooms_o = room_ids(wayfinding_texts(keep.analysis)), room_ids(wayfinding_texts(other.analysis))
     # rank before the frame swap below: the glance's "Room 101" must win over the start's "Hallway with ROOM 101"
-    takes_analysis = rank(other) < rank(keep) and (not mine or room_ids(wayfinding_texts(other.analysis)) <= mine)
+    takes_analysis = rank(other) < rank(keep) and (not mine or rooms_o <= mine)
+    # A numbered door and an exit (entrance...) sign seen from it are one stop: the door, where the walker stood.
+    # The exit is down the hall; as one node it would be an 'Exit' claiming the plaques ('EXIT, ROOM 114, RM 112').
+    if rooms_k and place_type(other.analysis) in SIGNED_TYPES and not rooms_o:
+        takes_analysis = False
+    elif rooms_o and place_type(keep.analysis) in SIGNED_TYPES and not rooms_k:
+        takes_analysis = not mine or rooms_o <= mine
+    final = other.analysis if takes_analysis else keep.analysis
+    key = place_type(final) in SIGNED_TYPES and not room_ids(wayfinding_texts(final))
+
+    def no_key(texts: list[str]) -> list[str]:  # a room keeps no exit sign seen from its door
+        return texts if key else [t for t in texts if not any(names_key(t, k) for k in SIGNED_TYPES)]
+
+    def own(texts: list[str]) -> list[str]:  # a plaqueless exit takes no plaque from the frames it absorbs
+        return no_key([t for t in texts if (room_ids([t]) <= mine if mine else not (key and room_ids([t])))])
+
     if KIND_PRIORITY.get(other.kf.kind, 9) < KIND_PRIORITY.get(keep.kf.kind, 9):
         keep.kf, keep.depart_frame = other.kf, other.depart_frame or keep.depart_frame
     if takes_analysis:
-        keep.extra_texts += wayfinding_texts(keep.analysis) + own(other.extra_texts)
+        keep.extra_texts += no_key(wayfinding_texts(keep.analysis)) + own(other.extra_texts)
         keep.analysis = other.analysis
     else:
         keep.extra_texts += own(other.texts)
+    keep.extra_texts = list(dict.fromkeys(t for t in no_key(keep.extra_texts) if not (key and room_ids([t]))))
     keep.t_arrive, keep.t_depart = min(keep.t_arrive, other.t_arrive), max(keep.t_depart, other.t_depart)
     keep.vertical = keep.vertical or other.vertical  # stair-ness survives even when the other frame's analysis wins
     keep.glances += other.glances
 
 
 # ---------------------------------------------------------------- labels
+_VERTICAL_WORDS = {"stairs": ("STAIR",), "elevator": ("ELEVATOR", "LIFT")}
+_FLOOR_WORDS = re.compile(r"\b(?:LEVEL|FLOOR|FLR|LVL)\b|\b\d+(?:ST|ND|RD|TH)\b|\bL\d+\b")
+_BARE_LABELS = {"room", "hallway", "intersection", "landmark", "corridor", "door"}  # a type, not a name
+
+
 def _label(wn: WalkNode) -> tuple[str, str]:
+    label, ptype = _raw_label(wn)
+    return tidy_label(label, wn.texts, ptype), ptype
+
+
+def _raw_label(wn: WalkNode) -> tuple[str, str]:
     a = wn.analysis
-    ptype = a.place_type
+    ptype = place_type(a)
     if wn.vertical and ptype in ("hallway", "intersection"):
         ptype = wn.vertical  # the walk climbed here: it is the stairwell, not a corridor
-        word = "STAIR" if wn.vertical == "stairs" else "ELEVATOR"
-        if not _has_sign(a) and word not in a.suggested_label.upper():
-            return ("Stairs" if wn.vertical == "stairs" else "Elevator"), ptype
+    if ptype in _VERTICAL_WORDS:
+        # named for what it is: a floor sign in view ('Level 1 Corridor', 'Level 2 Entrance') does not name stairs,
+        # and a floor number in the name ('Level 2 Stairwell') is often the sign at the other end of the flight
+        up = a.suggested_label.upper()
+        if any(w in up for w in _VERTICAL_WORDS[ptype]) and not _FLOOR_WORDS.search(up):
+            return a.suggested_label.strip(), ptype
+        return ("Stairs" if ptype == "stairs" else "Elevator"), ptype
+    label = a.suggested_label.strip()
+    if (ptype in ("room", "hallway", "intersection", "landmark") and a.texts and all(map(negated_key, a.texts))
+            and not _walk_rooms(wn)):
+        return _sign_name(a.texts[0]), "landmark"  # a door whose only sign is 'NO EXIT', whatever Gemma typed it
+    if (claimed := _unsigned_key(a)) and ptype in ("hallway", "intersection"):
+        # Gemma called it an exit/entrance/... but no sign on the frame says so
+        if (no := _no_entry_sign(a) or next((t for t in wn.texts if negated_key(t)), None)):
+            return _sign_name(no), "landmark"  # 'NO EXIT': a sign worth showing, not an exit
+        if claimed in ("exit", "entrance"):
+            # the wall or door at the end of a corridor (a side glance: a door along it)
+            return ("Doorway" if wn.kf.kind == "glance" else "Hallway end"), "hallway"
+        if any(names_key(label, k) for k in SIGNED_TYPES):
+            label = ""  # 'Restroom' / 'Elevator lobby' without the sign
     if wn.kf.kind == "turn_start" and ptype == "hallway":
         ptype = "intersection"
-    if a.suggested_label and (_has_sign(a) or ptype != "hallway"):
-        return a.suggested_label.strip(), ptype
+    if _norm_label(label) in _BARE_LABELS:
+        # 'Room' is a type, not a name: named by its own plaque or sign ('SEMINAR' -> 'Seminar'); with no sign
+        # read at all, no name (a floor sign alone leaves the type)
+        own = [t for t in wayfinding_texts(a)
+               if not directional(t) and not negated_key(t) and not _FLOOR_WORDS.search(t.upper())]
+        rooms = sorted(room_ids(own))
+        if ptype == "room" and rooms:
+            label = f"Room {rooms[0]}"
+        elif (named := next((t for t in own if not room_ids([t])), None)):
+            label = _sign_name(named)
+        elif not _has_sign(a):
+            label = ""
+    if label and (_has_sign(a) or ptype != "hallway"):
+        return label, ptype
     defaults = {"start": "Walk start", "end": "Walk end", "turn_start": "Hallway junction",
                 "glance": "Doorway", "dwell": "Hallway point"}
-    return defaults.get(wn.kf.kind, a.suggested_label or "Hallway point"), ptype
+    return defaults.get(wn.kf.kind, label or "Hallway point"), ptype
+
+
+def _sign_name(text: str) -> str:
+    """A sign's text as a place name: title case, a negation OCR glued on split off ('NOEXIT' -> 'No Exit')."""
+    return re.sub(r"[A-Za-z]+", lambda m: " ".join(_sign_words(m.group())), text.strip()).title()
+
+
+_LABEL_PLAQUE = re.compile(rf"(?:ROOM|RM)\b\.?\s*(?:NO\b\.?\s*)?#?\s*({ROOM_ID})\b", re.I)
+_PLAQUE_WORDS = {"ROOM", "ROOMS", "RM", "OFFICE", "LAB", "SUITE", "STE"}
+
+
+def _complete_words(label: str, texts: list[str]) -> str:
+    """A label word cut where OCR or the crop cut the sign ('Ker Space 107' of 'MAKER SPACE', 'Maker Sp'), completed
+    from a longer reading of the same sign among the place's texts."""
+    for m in re.finditer(r"[A-Za-z]+(?:\s+[A-Za-z]+)*", label):
+        run = m.group()
+        words = run.upper().split()
+        if len(run.replace(" ", "")) < 4 or set(words) & _PLAQUE_WORDS:
+            continue
+        for t in texts:
+            if directional(t) or not sign_line(t):
+                continue
+            up = re.sub(r"\s+", " ", t.upper())
+            if (i := up.find(" ".join(words))) < 0:
+                continue
+            j = i + len(" ".join(words))
+            a0, b0 = i, j
+            while a0 > 0 and up[a0 - 1].isalpha():
+                a0 -= 1
+            while b0 < len(up) and up[b0].isalpha():
+                b0 += 1
+            if (i - a0) + (b0 - j) < 2:
+                continue  # whole words already (or one stray letter)
+            full = up[a0:b0]
+            return label[:m.start()] + (full if run.isupper() else full.title()) + label[m.end():]
+    return label
+
+
+def tidy_label(label: str, texts: list[str], ptype: str) -> str:
+    """One spelling per thing: 'RM 112' / 'ROOM 112' -> 'Room 112', cut words completed from the place's own sign
+    texts, and no stray OCR token in a key place's name ('Exit - ROCW1' -> 'Exit')."""
+    label = _LABEL_PLAQUE.sub(lambda m: f"Room {m.group(1).upper()}", label.strip())
+    label = _complete_words(label, texts)
+    if ptype in SIGNED_TYPES:
+        # 'Exit Door' / 'Exit sign' / 'Exit' are one thing: spelled 'Exit' ('Emergency Exit Door' -> 'Emergency Exit')
+        label = re.sub(r"(?i)\s+(?:door|doors|doorway|sign|signs)$", "", label) or label
+        rooms = room_ids(texts)
+        kept = [w for w in label.split()
+                if not any(ch.isdigit() for ch in w) or re.sub(r"[^A-Z0-9]", "", w.upper()) in rooms]
+        label = " ".join(kept).strip(" -,:") or label
+    return label
 
 
 # ---------------------------------------------------------------- loop closure
@@ -1253,6 +1510,16 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         if not progress:
             break
 
+    # 3b. one place seen from opposite sides: an exit faced from two corridors, the bottom (or top) of a staircase
+    #     seen walking up and walking down. The photos share no features, so kind and position decide.
+    for a, b, d, kind in _twin_views(bundle):
+        a, b = current(a.id), current(b.id)
+        if a is None or b is None or a.id == b.id:
+            continue
+        merge(a, b, f"Same {kind} seen from two directions ({d:.1f} m apart on the plan)", 0.8,
+              {"distance_m": round(d, 1), "kind": kind}, strong=False)
+    settle()
+
     # 4. connect floors: the same stairwell / elevator bank seen on adjacent floors
     linked = _link_floors(bundle, frames, cache, use_gemma, log)
 
@@ -1263,6 +1530,119 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
         f"{len(bundle.nodes)} places on floors {floors} in {g_components} connected piece(s)")
     return {"merged": merged, "suggested": suggested, "aligned": aligned, "floor_links": linked,
             "components": g_components}
+
+
+TWIN_VIEW_M = 4.0  # an exit / stair landing seen twice this close on the plan is one place (if nothing closer)
+TWIN_VIEW_DEG = 45.0  # ... seen from directions at least this far apart (else the photos would have matched)
+
+
+def _travel_dirs(bundle: MapBundle, node_id: str) -> list[float]:
+    """Directions the walks were going at a place (arriving and leaving along its corridor connections), in the
+    frame solve_positions uses."""
+    out = []
+    for e in bundle.edges:
+        if e.vertical != "none":
+            continue
+        if e.from_node == node_id and e.heading_out is not None:
+            out.append(e.heading_out)
+        if e.to_node == node_id and e.heading_in is not None:
+            out.append(e.heading_in)
+    return out
+
+
+def _two_directions(bundle: MapBundle, a: Node, b: Node) -> bool:
+    """The walks saw `a` and `b` from different directions: every way a walk went at one is at least TWIN_VIEW_DEG
+    from every way a walk went at the other. Two walks going the same way saw the same view: if the photos did
+    not match (earlier steps), they are two places, whatever their positions say."""
+    da, db = _travel_dirs(bundle, a.id), _travel_dirs(bundle, b.id)
+    return bool(da and db) and all(abs(wrap180(x - y)) >= TWIN_VIEW_DEG for x in da for y in db)
+
+
+def _opposite_climbs(ends: dict[str, set[tuple[str, int]]], a: Node, b: Node) -> bool:
+    """Same-flight evidence for two landings each on a walk's stairs: one walk left this floor there and the other
+    arrived on it there, between the same two floors (the flight walked up and walked down: opposite views).
+    Two walks that both left (or both arrived) took two stairwells, or one the photos would have matched."""
+    ea, eb = ends.get(a.id, set()), ends.get(b.id, set())
+    flip = {"leave": "arrive", "arrive": "leave"}
+    return any((flip[way], floor) in eb for way, floor in ea)
+
+
+def _twin_views(bundle: MapBundle) -> list[tuple[Node, Node, float, str]]:
+    """Pairs of places that are one place seen from two directions, by kind and plan position:
+    - exits (entrances, restrooms, elevators): both typed so on their own sign (place_type), same floor, seen
+      from different directions (_two_directions);
+    - stair landings: both where a walk went up or down stairs (a stairs edge), to the same other floor, one
+      walk leaving the floor there and the other arriving (_opposite_climbs).
+    Both in one connected piece of the map (positions elsewhere mean nothing), not seconds apart in one walk,
+    within TWIN_VIEW_M of each other and each the other's nearest place of that kind (two exits side by side
+    stay two). Position alone never merges two places each visited by its own walk: two stairwells (exits) a
+    metre apart, each the other's only candidate, are each other's nearest. Positions come from
+    solve_positions, so call this after walks are aligned."""
+    solve_positions(bundle)
+    by_id = {n.id: n for n in bundle.nodes}
+    parent = {n.id: n.id for n in bundle.nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    reach: dict[str, set[int]] = {}
+    ends: dict[str, set[tuple[str, int]]] = {}  # landing -> (leave / arrive, the other floor)
+    for e in bundle.edges:
+        if e.from_node in parent and e.to_node in parent:
+            parent[find(e.from_node)] = find(e.to_node)
+            if e.vertical in ("stairs_up", "stairs_down"):
+                f_from, f_to = by_id[e.from_node].floor, by_id[e.to_node].floor
+                reach.setdefault(e.from_node, set()).add(f_to)
+                reach.setdefault(e.to_node, set()).add(f_from)
+                ends.setdefault(e.from_node, set()).add(("leave", f_to))
+                ends.setdefault(e.to_node, set()).add(("arrive", f_from))
+
+    def kind(n: Node) -> str | None:
+        if n.type in KEY_FAMILY:
+            return KEY_FAMILY[n.type]
+        if _is_vertical(n) == "stairs" and n.id in reach:
+            return "stairs"
+        return None
+    groups: dict[tuple, list[Node]] = {}
+    for n in bundle.nodes:
+        if (k := kind(n)) is not None:
+            groups.setdefault((k, n.floor, find(n.id)), []).append(n)
+    out = []
+    for (k, _, _), members in groups.items():
+        def dist(a: Node, b: Node) -> float:
+            return math.hypot((a.x or 0.0) - (b.x or 0.0), (a.y or 0.0) - (b.y or 0.0))
+        def nearest(a: Node) -> Node | None:
+            return min((b for b in members if b is not a), key=lambda b: dist(a, b), default=None)
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                if _moments_apart(a, b):
+                    continue
+                if not (_opposite_climbs(ends, a, b) if k == "stairs" else _two_directions(bundle, a, b)):
+                    continue
+                d = dist(a, b)
+                if d <= TWIN_VIEW_M and nearest(a) is b and nearest(b) is a:
+                    out.append((a, b, d, k))
+    out += _stair_views(bundle, groups, find, reach)
+    return sorted(out, key=lambda p: p[2])
+
+
+def _stair_views(bundle: MapBundle, groups: dict[tuple, list[Node]], find, reach: dict) -> list:
+    """(landing, view) pairs: a place typed stairs where no walk climbed (the 'STAIRS' sign seen ahead down the
+    corridor, a walk passing the stairwell) is the landing of the flight next to it - the nearest stairs-edge
+    place on its floor, in the same map piece, within TWIN_VIEW_M, with no second landing that close (two
+    stairwells side by side stay apart). The same walk may see the stairs and then climb them a few seconds on."""
+    out = []
+    for n in bundle.nodes:
+        if n.id in reach or n.type != "stairs" or _is_vertical(n) != "stairs" or _room_ids(n):
+            continue
+        landings = sorted(((math.hypot((n.x or 0.0) - (m.x or 0.0), (n.y or 0.0) - (m.y or 0.0)), m)
+                           for m in groups.get(("stairs", n.floor, find(n.id)), [])), key=lambda p: p[0])
+        close = [p for p in landings if p[0] <= TWIN_VIEW_M]
+        if len(close) == 1:
+            out.append((close[0][1], n, close[0][0], "stairs"))
+    return out
 
 
 def _components(bundle: MapBundle) -> int:

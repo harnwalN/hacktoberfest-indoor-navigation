@@ -72,6 +72,8 @@ SOFT_SCORE = _f("SOFT_SCORE", 0.6)
 # --- Mapping ---
 NODE_MIN_GAP_SEC = _f("NODE_MIN_GAP_SEC", 1.2)
 SAME_PLACE_WINDOW_SEC = _f("SAME_PLACE_WINDOW_SEC", 8.0)  # collapse consecutive frames of one place
+# A corridor turn this close to the first/last frame of a climb is the turn onto (or off) the flight: the landing
+STAIR_APPROACH_SEC = _f("STAIR_APPROACH_SEC", 3.0)
 ORB_STRONG_INLIERS = int(os.getenv("ORB_STRONG_INLIERS", 40))
 ORB_WEAK_INLIERS = int(os.getenv("ORB_WEAK_INLIERS", 20))
 AUTO_MERGE_CONFIDENCE = _f("AUTO_MERGE_CONFIDENCE", 0.8)

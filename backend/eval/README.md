@@ -58,6 +58,7 @@ perception (Gemma/OCR); an error that is already in the oracle run is in mapping
 | `stair_links` | `stair_links` pairs joined by a stairs/elevator edge (at the places or a neighbour) |
 | `route_success` | `routes` that the app can route, with the expected number of floor changes |
 | `far_merges` **[gate]** | map places whose observations (any walk node, incl. starts and corridor spots) were > 5 m apart or on two floors, from the truth `path`s (not scored without paths) |
+| `false_key_places` **[gate]** | map places typed exit/entrance/restroom/elevator with no such truth place behind them: not matched through a visit, and the walker was never within 5 m of one (on its floor, from the truth `path`s) when the place was observed. A dead end, a door at a corridor end or a NO EXIT sign typed `exit` counts; exit and entrance are one family |
 | `extra_places` | map places matching no visit (walk start/end, hallway points, duplicates) - informational |
 | `turns_detected`, `turn_error_deg`, `spurious_turns` | detected turn events vs true changes of walking direction |
 

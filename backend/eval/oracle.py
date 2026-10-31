@@ -89,7 +89,9 @@ class Oracle:
         elif prominent_room:
             ptype, label = "room", f"Room {prominent_room}"
         elif prominent_exit:
-            ptype, label = "exit", "Exit"
+            # place_type follows the plate's look, like a vision model: a green 'NO EXIT' plate is typed an exit
+            # too, and the mapper must check what the sign says (its label/texts are read correctly)
+            ptype, label = "exit", prominent_exit.title()
         else:
             ptype, label = "hallway", ("Hallway with " + texts[0]) if texts else "Hallway"
         return FrameAnalysis(texts=texts, room_numbers=rooms, has_sign=bool(texts), suggested_label=label,

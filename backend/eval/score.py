@@ -4,7 +4,8 @@ Inputs: a Truth (eval/truth.py), the final MapBundle, and observations: per trut
 that video with the map place each one ended up in (eval/trace.py). Truth visits are matched to walk nodes by
 time; map places are matched to truth places through those visits, and also by the room numbers they claim.
 
-Hard safety metrics (a non-zero exit in eval.run): wrong merges, far merges and invented room numbers.
+Hard safety metrics (a non-zero exit in eval.run): wrong merges, far merges, invented room numbers and false key
+places (an exit/entrance/restroom/elevator that is not there).
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from collections import Counter, defaultdict
 import networkx as nx
 
 from app import routing
+from app.mapper import KEY_FAMILY
 from app.matching import room_ids
 from app.schemas import MapBundle
 
@@ -37,12 +39,16 @@ METRICS = {
     "route_success": (True, False),
     "extra_places": (False, False),
     "far_merges": (False, True),
+    "false_key_places": (False, True),
     "turns_detected": (True, False),
     "turn_error_deg": (False, False),
     "spurious_turns": (False, False),
 }
 FAR_MERGE_M = 5.0  # one map place whose observations were this far apart (or on two floors) is a bad merge
 TURN_MATCH_S = 3.0  # a detected turn this close to a true one (centre to centre) is that turn
+# Key places a visitor routes to: a map place of a KEY_FAMILY type (app.mapper: exit and entrance are one family)
+# claims "there is an exit/restroom/... here".
+KEY_NEAR_M = 5.0  # a key place seen from up to this far away (a walk ending facing the EXIT door) is that place
 
 
 def _gap(t: float, o: dict) -> float:
@@ -150,6 +156,34 @@ def far_merges(truth: Truth, obs: dict[str, list[dict]]) -> list[dict]:
                                        "distance_m": round(d, 1)})
         if worst:
             out.append(worst[1])
+    return out
+
+
+def false_key_places(truth: Truth, bundle: MapBundle, obs: dict[str, list[dict]],
+                     node_places: dict[str, set[str]]) -> list[dict]:
+    """Map places typed exit/entrance/restroom/elevator with no true place of that kind behind them: matched
+    neither through a visit (the place's visits landed on it) nor by position (the walker was within KEY_NEAR_M
+    of such a place, on its floor, when the map place was observed; needs truth `path`s). A dead end, a door at
+    a corridor end or a NO EXIT sign typed 'exit' is one."""
+    places = {p.id: p for p in truth.building.places}
+    out = []
+    for n in bundle.nodes:
+        fam = KEY_FAMILY.get(n.type)
+        if fam is None:
+            continue
+        if any(KEY_FAMILY.get(places[pid].type) == fam for pid in node_places.get(n.id, ())):
+            continue
+        near = False
+        for v in truth.videos:
+            for o in obs.get(v.id, []):
+                if o.get("node") != n.id or (pos := _where(v.path, o["t"])) is None:
+                    continue
+                near = near or any(KEY_FAMILY.get(p.type) == fam and p.floor == pos[2] and p.x is not None
+                                   and ((p.x - pos[0]) ** 2 + (p.y - pos[1]) ** 2) ** 0.5 <= KEY_NEAR_M
+                                   for p in places.values())
+        if not near:
+            out.append({"node": n.id, "label": n.label, "type": n.type, "floor": n.floor,
+                        "places": sorted(node_places.get(n.id, ())), "video": n.video_id, "t": n.t})
     return out
 
 
@@ -267,6 +301,7 @@ def score(truth: Truth, bundle: MapBundle, obs: dict[str, list[dict]],
     extra = sorted(nid for nid in nodes if nid not in node_places)
     turns = score_turns(truth, events)
     far = far_merges(truth, obs)
+    false_keys = false_key_places(truth, bundle, obs, node_places)
     has_paths = any(v.path for v in truth.videos)
 
     def frac(a, b):
@@ -286,6 +321,7 @@ def score(truth: Truth, bundle: MapBundle, obs: dict[str, list[dict]],
         "route_success": frac(sum(r["ok"] for r in routes), len(routes)),
         "extra_places": len(extra),
         "far_merges": len(far) if has_paths else None,
+        "false_key_places": len(false_keys),
         "turns_detected": frac(turns["matched"], turns["total"]),
         "turn_error_deg": turns["mean_error"],
         "spurious_turns": turns["spurious"] if turns["total"] else None,
@@ -320,6 +356,7 @@ def score(truth: Truth, bundle: MapBundle, obs: dict[str, list[dict]],
             "routes": routes,
             "turns": turns["rows"],
             "far_merges": far,
+            "false_key_places": false_keys,
             "extra_places": [{"node": nid, "label": nodes[nid].label, "floor": nodes[nid].floor,
                               "video": nodes[nid].video_id, "t": nodes[nid].t} for nid in extra],
             "visits": records,

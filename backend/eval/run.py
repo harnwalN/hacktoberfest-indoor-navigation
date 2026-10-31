@@ -12,8 +12,8 @@ video, through app.jobs exactly as an upload. The scorecard is printed and saved
 eval/results/<timestamp>-<scenario>-<mode>.json (+ .log with every job log line), and compared with the
 previous result of the same scenario and mode.
 
-Exit code: 0 ok, 1 a hard safety metric failed (wrong merge, far merge or invented room number), 2 setup/pipeline
-error (including a refused --data-dir).
+Exit code: 0 ok, 1 a hard safety metric failed (wrong merge, far merge, invented room number or false key place),
+2 setup/pipeline error (including a refused --data-dir).
 """
 from __future__ import annotations
 
@@ -259,11 +259,11 @@ def print_scorecard(res: dict, prev: dict | None) -> None:
     m = res["map"]
     print(f"map: {m['places']} places, {m['edges']} edges ({m['vertical_edges']} vertical), floors {m['floors']}, "
           f"{m['suggested_merges']} suggested merges")
-    print(f"{'metric':<22}{'value':>8}{'':>8}  {'prev':>6}  ")
+    print(f"{'metric':<26}{'value':>8}{'':>8}  {'prev':>6}  ")
     for r in compare(res, prev):
         mark = " [GATE]" if r["gate"] else ""
         cnt = f"({r['count']})" if r["count"] else ""
-        print(f"{r['metric'] + mark:<22}{_fmt(r['value']):>8}{cnt:>8}  {_fmt(r['prev']):>6}  {r['flag']}")
+        print(f"{r['metric'] + mark:<26}{_fmt(r['value']):>8}{cnt:>8}  {_fmt(r['prev']):>6}  {r['flag']}")
     d = res["details"]
     for w in d["wrong_merges"]:
         print(f"  WRONG MERGE: {w['places'][0]} + {w['places'][1]} in {', '.join(w['nodes'])} ({w['why']})")
@@ -276,6 +276,9 @@ def print_scorecard(res: dict, prev: dict | None) -> None:
     for f in d.get("far_merges", []):
         print(f"  far merge: {f['node']} joins {f['a'][0]}@{f['a'][1]:.0f}s (floor {f['a'][2]}) and "
               f"{f['b'][0]}@{f['b'][1]:.0f}s (floor {f['b'][2]}), {f['distance_m']} m apart")
+    for k in d.get("false_key_places", []):
+        print(f"  FALSE KEY PLACE: {k['node']} '{k['label']}' ({k['type']}, floor {k['floor']}) is no "
+              f"{k['type']}" + (f"; it is at {', '.join(k['places'])}" if k["places"] else ""))
     for mm in d["missed_merges"]:
         print(f"  missed merge: {mm['place']} split over {', '.join(mm['nodes'])}")
     for f in d["floor_errors"]:
@@ -396,11 +399,12 @@ def _main(args: argparse.Namespace, root: Path) -> int:
         if res["hard_fail"] and code == 0:
             code = 1
     if len(summary) > 1:
-        print("\nscenario            rooms  invent  wrongM  mergeR  floors  stairs  routes   wall")
+        print("\nscenario            rooms  invent  wrongM  falseK  mergeR  floors  stairs  routes   wall")
         for r in summary:
             m = r["metrics"]
             print(f"{r['scenario']:<18}{_fmt(m['rooms_found']):>7}{m['invented_rooms']:>8}{m['wrong_merges']:>8}"
-                  f"{_fmt(m['merge_recall']):>8}{_fmt(m['floor_accuracy']):>8}{_fmt(m['stair_links']):>8}"
+                  f"{_fmt(m.get('false_key_places')):>8}{_fmt(m['merge_recall']):>8}{_fmt(m['floor_accuracy']):>8}"
+                  f"{_fmt(m['stair_links']):>8}"
                   f"{_fmt(m['route_success']):>8}{r['timings']['total_wall_s']:>7.0f}s")
     return code
 
