@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Building2, Compass, Map as MapIcon, Upload, Video } from 'lucide-react'
+import { Building2, Compass, Map as MapIcon, Upload, Video, X } from 'lucide-react'
 import { api, detail } from './api'
 import Uploader from './components/Uploader'
 import MapReview from './components/MapReview'
@@ -83,12 +83,12 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <Compass size={22} />
+          <span className="brand-mark"><Compass size={20} /></span>
           <span>Waypoint</span>
         </div>
         <div className="building-picker">
           <Building2 size={16} />
-          <select value={building} onChange={(e) => setBuilding(e.target.value)}>
+          <select aria-label="Building" value={building} onChange={(e) => setBuilding(e.target.value)}>
             {!buildings.length && <option value="">No buildings yet</option>}
             {buildings.map((b) => (
               <option key={b.id} value={b.id}>
@@ -100,8 +100,11 @@ export default function App() {
       </header>
 
       {error && (
-        <div className="banner error" onClick={() => setError('')}>
-          {error}
+        <div className="banner error banner-dismiss" role="alert">
+          <span>{error}</span>
+          <button type="button" className="ghost icon-btn" onClick={() => setError('')} aria-label="Dismiss error">
+            <X size={18} aria-hidden="true" />
+          </button>
         </div>
       )}
 
@@ -122,9 +125,9 @@ export default function App() {
         {building && tab === 'record' && <Recorder building={building} onUploaded={() => setTab('build')} />}
       </main>
 
-      <nav className="tabbar">
+      <nav className="tabbar" aria-label="Main">
         {TABS.map(({ id, label, icon: Icon }) => (
-          <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>
+          <button key={id} className={tab === id ? 'active' : ''} aria-current={tab === id ? 'page' : undefined} onClick={() => setTab(id)}>
             <Icon size={20} />
             <span>{label}</span>
           </button>

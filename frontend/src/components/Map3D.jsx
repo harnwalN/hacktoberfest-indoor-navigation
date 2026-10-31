@@ -1,19 +1,39 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { isMinorNode, placeKind } from './ArrowOverlay'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 
 // 3D view of the solved building map: every place at its estimated position in metres, floors stacked,
 // stairs/elevators as vertical links. Useful for judging how well the walks line up.
 const FLOOR_H = 6 // metres between floors (exaggerated a little for readability)
-const COLORS = { place: 0xc9d2e3, key: 0x5b83ff, vertical: 0xf2c230, minor: 0x677189, selected: 0xff7a6e }
 
-const isMinor = (n) =>
-  !n.verified && !(n.sign_texts || []).length && ['hallway', 'intersection', 'landmark'].includes(n.type)
+// Colours come from the CSS custom properties (styles.css) so the 3D view follows the theme, light or dark.
+const cssVar = (name, fallback) => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
+function readPalette() {
+  return {
+    place: cssVar('--room-fg', '#0b3a78'), key: cssVar('--accent', '#0b7a5e'), vertical: cssVar('--stairs', '#f2c230'),
+    minor: cssVar('--control', '#8c847c'), noexit: cssVar('--danger', '#b42318'), selected: cssVar('--landmark-fg', '#7a2a08'),
+    line: cssVar('--control', '#8c847c'), signBg: cssVar('--sign-bg', '#2a2420'), signFg: cssVar('--sign-fg', '#ffffff'),
+    noexitBg: cssVar('--noexit-bg', '#ffdde6'), noexitFg: cssVar('--noexit-fg', '#800f33'),
+  }
+}
+function useColorScheme() {
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const mq = window.matchMedia?.('(prefers-color-scheme: dark)')
+    const bump = () => setTick((t) => t + 1)
+    mq?.addEventListener?.('change', bump)
+    return () => mq?.removeEventListener?.('change', bump)
+  }, [])
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+const isMinor = isMinorNode
 const kind = (n) =>
-  isMinor(n) ? 'minor' : n.type === 'stairs' || n.type === 'elevator' ? 'vertical'
-    : ['entrance', 'exit', 'restroom'].includes(n.type) ? 'key' : 'place'
+  placeKind(n) === 'noexit' ? 'noexit' : isMinor(n) ? 'minor' : n.type === 'stairs' || n.type === 'elevator' ? 'vertical'
+    : placeKind(n) === 'exit' || ['entrance', 'restroom'].includes(n.type) ? 'key' : 'place'
 
-function labelSprite(text, color = '#eef2f8') {
+function labelSprite(text, color, bg) {
   const c = document.createElement('canvas')
   const ctx = c.getContext('2d')
   const font = '600 44px "Atkinson Hyperlegible", system-ui, sans-serif'
@@ -22,7 +42,7 @@ function labelSprite(text, color = '#eef2f8') {
   c.width = w
   c.height = 64
   ctx.font = font
-  ctx.fillStyle = 'rgba(10,18,34,0.72)'
+  ctx.fillStyle = bg
   ctx.beginPath()
   ctx.roundRect(0, 4, w, 56, 14)
   ctx.fill()
@@ -39,12 +59,14 @@ function labelSprite(text, color = '#eef2f8') {
 
 export default function Map3D({ map, selected, onSelect }) {
   const host = useRef(null)
+  const scheme = useColorScheme()
 
   useEffect(() => {
     const el = host.current
     const nodes = map.nodes.filter((n) => n.x != null && n.y != null)
     if (!el || !nodes.length) return undefined
 
+    const COLORS = readPalette()
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     el.appendChild(renderer.domElement)
@@ -68,16 +90,16 @@ export default function Map3D({ map, selected, onSelect }) {
       const [minX, maxX, minZ, maxZ] = [Math.min(...xs) - 5, Math.max(...xs) + 5, Math.min(...zs) - 5, Math.max(...zs) + 5]
       const slab = new THREE.Mesh(
         new THREE.PlaneGeometry(maxX - minX, maxZ - minZ),
-        new THREE.MeshBasicMaterial({ color: 0x2357f2, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false }),
+        new THREE.MeshBasicMaterial({ color: COLORS.key, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false }),
       )
       slab.rotation.x = -Math.PI / 2
       slab.position.set((minX + maxX) / 2, (f - f0) * FLOOR_H - 0.3, (minZ + maxZ) / 2)
       scene.add(slab)
-      const edge = new THREE.LineSegments(new THREE.EdgesGeometry(slab.geometry), new THREE.LineBasicMaterial({ color: 0x5b83ff, transparent: true, opacity: 0.35 }))
+      const edge = new THREE.LineSegments(new THREE.EdgesGeometry(slab.geometry), new THREE.LineBasicMaterial({ color: COLORS.key, transparent: true, opacity: 0.4 }))
       edge.rotation.copy(slab.rotation)
       edge.position.copy(slab.position)
       scene.add(edge)
-      const tag = labelSprite(`Floor ${f}`, '#f2c230')
+      const tag = labelSprite(`Floor ${f}`, COLORS.vertical, COLORS.signBg)
       tag.position.set(minX + 4, (f - f0) * FLOOR_H + 1, maxZ)
       scene.add(tag)
     }
@@ -90,7 +112,7 @@ export default function Map3D({ map, selected, onSelect }) {
       const vertical = e.vertical !== 'none'
       const line = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints([a, b]),
-        new THREE.LineBasicMaterial({ color: vertical ? COLORS.vertical : 0x93a0b8, transparent: true, opacity: vertical ? 0.95 : 0.6 }),
+        new THREE.LineBasicMaterial({ color: vertical ? COLORS.vertical : COLORS.line, transparent: true, opacity: vertical ? 0.95 : 0.6 }),
       )
       scene.add(line)
     }
@@ -100,14 +122,14 @@ export default function Map3D({ map, selected, onSelect }) {
     for (const n of nodes) {
       const k = kind(n)
       const r = k === 'minor' ? 0.35 : 0.8
-      const geo = k === 'vertical' ? new THREE.BoxGeometry(r * 1.8, r * 1.8, r * 1.8) : new THREE.SphereGeometry(r, 20, 14)
+      const geo = k === 'noexit' ? new THREE.OctahedronGeometry(r * 1.3) : k === 'vertical' ? new THREE.BoxGeometry(r * 1.8, r * 1.8, r * 1.8) : new THREE.SphereGeometry(r, 20, 14)
       const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: n.id === selected ? COLORS.selected : COLORS[k] }))
       mesh.position.copy(pos[n.id])
       mesh.userData.id = n.id
       scene.add(mesh)
       pickables.push(mesh)
       if ((n.verified && k !== 'minor') || n.id === selected) {
-        const s = labelSprite(n.label.length > 26 ? `${n.label.slice(0, 25)}…` : n.label)
+        const s = labelSprite((n.label || '').length > 26 ? `${n.label.slice(0, 25)}…` : n.label || '', k === 'noexit' ? COLORS.noexitFg : COLORS.signFg, k === 'noexit' ? COLORS.noexitBg : COLORS.signBg)
         s.position.copy(pos[n.id]).add(new THREE.Vector3(0, 2.2, 0))
         scene.add(s)
       }
@@ -160,7 +182,24 @@ export default function Map3D({ map, selected, onSelect }) {
       renderer.dispose()
       el.removeChild(renderer.domElement)
     }
-  }, [map, selected])
+  }, [map, selected, scheme])
 
-  return <div ref={host} className="map3d" aria-label="3D view of the building map" />
+  const places = (map.nodes || []).filter((n) => n.x != null && n.y != null && n.label)
+  // The canvas is pointer-only; this visually hidden list is the keyboard / screen-reader path to the same selection.
+  return (
+    <>
+      <div ref={host} className="map3d" role="img" aria-label="3D view of the building map. Pointer only; use the place list or the 2D map to select places by keyboard." />
+      {places.length > 0 && (
+        <ul aria-label="Places in the 3D view" className="sr-only">
+          {places.map((n) => (
+            <li key={n.id}>
+              <button type="button" onClick={() => onSelect?.(n.id)} aria-pressed={n.id === selected}>
+                {n.label}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  )
 }

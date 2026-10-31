@@ -1,7 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Check, GitMerge, ImagePlus, Link2, Plus, Save, Trash2, X } from 'lucide-react'
+import { Check, GitMerge, ImagePlus, Link2, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
 import { api, detail, frameUrl } from '../api'
+import ErrorBoundary from './ErrorBoundary'
 import Map3D from './Map3D'
+import { PlaceChip, isMinorNode, placeKind } from './ArrowOverlay'
+
+// Fill in optional fields the backend may omit (older maps, partial edits) so the screens never crash on them.
+const normalize = (m) => ({
+  ...m,
+  nodes: (m?.nodes || []).map((n) => ({
+    ...n, label: n.label ?? '', type: n.type || 'hallway', description: n.description ?? '', floor: Number.isFinite(n.floor) ? n.floor : 1,
+    texts: n.texts || [], sign_texts: n.sign_texts || [], verified: !!n.verified,
+  })),
+  edges: (m?.edges || []).map((e) => ({ ...e, vertical: e.vertical || 'none', heading_out: e.heading_out ?? 0, heading_in: e.heading_in ?? e.heading_out ?? 0 })),
+  suggested_merges: m?.suggested_merges || [],
+  videos: m?.videos || [],
+})
+const TYPE_NAMES = { intersection: 'junction' }
 
 const TYPES = ['room', 'intersection', 'hallway', 'entrance', 'stairs', 'elevator', 'exit', 'restroom', 'landmark']
 const VERTICALS = ['none', 'stairs_up', 'stairs_down', 'elevator', 'ramp_up', 'ramp_down']
@@ -130,15 +145,15 @@ function metricLayout(nodes) {
 }
 
 // Minor waypoints (walk ends, unnamed hallway points) render as quiet dots without labels.
-const isMinor = (n) =>
-  !n.verified && !(n.sign_texts || []).length && ['hallway', 'intersection', 'landmark'].includes(n.type)
+const isMinor = isMinorNode
 const glyphClass = (n) =>
   isMinor(n) ? 'minor'
+    : placeKind(n) === 'noexit' ? 'noexit'
     : n.type === 'stairs' || n.type === 'elevator' ? 'vertical'
       : ['entrance', 'exit', 'restroom'].includes(n.type) ? 'key' : 'place'
 
 const LABEL_H = 0.42
-const labelW = (text) => 0.2 * Math.min(text.length, 22) + 0.2
+const labelW = (text) => 0.2 * Math.min((text || '').length, 22) + 0.2
 
 function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
   const floorOf = Object.fromEntries(map.nodes.map((n) => [n.id, n.floor]))
@@ -152,7 +167,10 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
     if (b === floor) (links[e.to_node] ||= new Set()).add(a)
   }
   const measured = nodes.length > 0 && nodes.every((n) => n.x != null && n.y != null)
-  const pos = useMemo(() => (measured ? metricLayout(nodes) : layout(nodes, sameFloor, map.dominant_axis_deg || 0)), [map, floor])
+  // Re-solve only when the geometry changes, not on every label keystroke.
+  const geomKey = `${floor}|${nodes.map((n) => `${n.id}:${n.x}:${n.y}`).join(',')}|${sameFloor.map((e) => `${e.id}:${e.heading_out}`).join(',')}`
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const pos = useMemo(() => (measured ? metricLayout(nodes) : layout(nodes, sameFloor, map.dominant_axis_deg || 0)), [geomKey])
   const [view, setView] = useState(null)
   const drag = useRef(null)
   const svgRef = useRef(null)
@@ -171,12 +189,12 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
     const placed = []
     const out = {}
     const order = [...nodes].sort((a, b) =>
-      (b.id === selected) - (a.id === selected) || isMinor(a) - isMinor(b) || b.verified - a.verified)
+      (b.id === selected) - (a.id === selected) || isMinor(a) - isMinor(b) || !!b.verified - !!a.verified)
     for (const n of order) {
       if (isMinor(n) && n.id !== selected) continue
       const p = pos[n.id]
       if (!p) continue
-      const text = n.label.length > 22 ? `${n.label.slice(0, 21)}…` : n.label
+      const text = (n.label || '').length > 22 ? `${n.label.slice(0, 21)}…` : n.label || ''
       const w = labelW(text)
       for (const side of ['right', 'left', 'below', 'above']) {
         const x = side === 'right' ? p[0] + 0.32 : side === 'left' ? p[0] - 0.32 - w : p[0] - w / 2
@@ -195,7 +213,7 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
       }
     }
     return out
-  }, [pos, selected, floor])
+  }, [pos, selected, floor, map.nodes])
 
   const toSvg = (e) => {
     const r = svgRef.current.getBoundingClientRect()
@@ -234,7 +252,7 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
       {floors.length > 1 && (
         <div className="floor-panel" role="group" aria-label="Floor">
           {[...floors].reverse().map((f) => (
-            <button key={f} className={f === floor ? 'active' : ''} onClick={() => onFloor(f)} aria-pressed={f === floor}>
+            <button key={f} className={f === floor ? 'active' : ''} onClick={() => onFloor(f)} aria-pressed={f === floor} aria-label={`Floor ${f}`}>
               {f}
             </button>
           ))}
@@ -255,7 +273,7 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
             const b = pos[e.to_node]
             if (!a || !b) return null
             return <line key={e.id} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]}
-              className={`edge ${e.vertical !== 'none' ? 'vertical' : ''} ${selEdges.has(e.id) ? 'active' : ''}`} />
+              className={`edge ${(e.vertical || 'none') !== 'none' ? 'vertical' : ''} ${selEdges.has(e.id) ? 'active' : ''}`} />
           })}
           {nodes.map((n) => {
             const p = pos[n.id]
@@ -265,11 +283,12 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
             const r = cls === 'minor' ? 0.09 : 0.2
             return (
               <g key={n.id} className={`snode ${cls} ${selected === n.id ? 'sel' : ''}`} onClick={() => pick(n.id)}>
-                <title>{`${n.label} (floor ${n.floor})`}</title>
+                <title>{`${n.label} (floor ${n.floor})${placeKind(n) === 'noexit' ? ', NOT an exit' : ''}`}</title>
                 <circle cx={p[0]} cy={p[1]} r={0.5} className="hit" />
                 {cls === 'vertical'
                   ? <rect x={p[0] - r} y={p[1] - r} width={r * 2} height={r * 2} rx={0.06} />
                   : <circle cx={p[0]} cy={p[1]} r={r} />}
+                {cls === 'noexit' && <text x={p[0]} y={p[1] + 0.075} className="floor-mark" textAnchor="middle">×</text>}
                 {other.length > 0 && (
                   <text x={p[0]} y={p[1] + 0.075} className="floor-mark" textAnchor="middle">{other.length === 1 ? other[0] : '↕'}</text>
                 )}
@@ -288,7 +307,8 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
         <li><i className="place" /> Room</li>
         <li><i className="key" /> Entrance, exit or restroom</li>
         <li><i className="vertical" /> Stairs or elevator (number = floor it reaches)</li>
-        <li><i className="minor" /> Waypoint</li>
+        <li><i className="minor" /> Waypoint (hallway point, hallway end, doorway)</li>
+        <li><b aria-hidden="true">×</b> No Exit sign (a dead end, not a way out)</li>
         {measured && <li>Distances estimated from walking time in the videos</li>}
       </ul>
     </div>
@@ -309,6 +329,14 @@ function DirSelect({ value, onChange }) {
 }
 
 export default function MapReview({ building, onChanged }) {
+  return (
+    <ErrorBoundary key={building} title="The map hit a problem">
+      <MapReviewInner building={building} onChanged={onChanged} />
+    </ErrorBoundary>
+  )
+}
+
+function MapReviewInner({ building, onChanged }) {
   const [map, setMap] = useState(null)
   const [dirty, setDirty] = useState(false)
   const [selected, setSelected] = useState(null)
@@ -323,13 +351,29 @@ export default function MapReview({ building, onChanged }) {
   const [note, setNote] = useState('')
   const [view3d, setView3d] = useState(() => new URLSearchParams(window.location.hash.split('?')[1] || '').get('view') === '3d')
 
-  const load = () => api.getMap(building).then((m) => { setMap(m); setDirty(false) }).catch((e) => setError(detail(e)))
+  const [hideWaypoints, setHideWaypoints] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
+  const load = () => api.getMap(building)
+    .then((m) => { setMap(normalize(m)); setDirty(false); setLoadFailed(false) })
+    .catch((e) => { setError(detail(e)); setLoadFailed(true) })
   useEffect(() => {
-    load()
+    let live = true
+    setMap(null); setSelected(null); setError(''); setNote(''); setDirty(false); setLoadFailed(false)
+    api.getMap(building)
+      .then((m) => { if (live) setMap(normalize(m)) })
+      .catch((e) => { if (live) { setError(detail(e)); setLoadFailed(true) } })
+    return () => { live = false }
   }, [building])
 
-  if (!map) return <div className="card">Loading…</div>
+  if (!map)
+    return loadFailed ? (
+      <div className="card" role="alert">
+        <p className="notice error">Could not load the map: {error}</p>
+        <button onClick={() => { setError(''); setLoadFailed(false); load() }}><RefreshCw size={16} /> Try again</button>
+      </div>
+    ) : <div className="card" role="status" aria-live="polite">Loading the map…</div>
   const floors = [...new Set(map.nodes.map((n) => n.floor))].sort((a, b) => a - b)
+  const sortedNodes = [...map.nodes].sort((a, b) => a.floor - b.floor || a.label.localeCompare(b.label, undefined, { numeric: true }))
   const shownFloor = floors.includes(floor) ? floor : floors[0] ?? 0
   const byId = Object.fromEntries(map.nodes.map((n) => [n.id, n]))
 
@@ -342,6 +386,7 @@ export default function MapReview({ building, onChanged }) {
     setDirty(true)
   }
   const deleteNode = (id) => {
+    if (!confirm('Delete this place and its connections?')) return
     setMap({ ...map, nodes: map.nodes.filter((n) => n.id !== id), edges: map.edges.filter((e) => e.from_node !== id && e.to_node !== id) })
     setSelected(null)
     setDirty(true)
@@ -360,7 +405,7 @@ export default function MapReview({ building, onChanged }) {
   const save = async () => {
     setBusy(true)
     try {
-      setMap(await api.saveMap(building, map))
+      setMap(normalize(await api.saveMap(building, map)))
       setDirty(false)
       onChanged?.()
     } catch (e) {
@@ -372,7 +417,7 @@ export default function MapReview({ building, onChanged }) {
   const act = async (fn) => {
     if (dirty && !confirm('Discard unsaved edits?')) return
     try {
-      setMap(await fn())
+      setMap(normalize(await fn()))
       setDirty(false)
       onChanged?.()
     } catch (e) {
@@ -419,14 +464,16 @@ export default function MapReview({ building, onChanged }) {
                   for (;;) {
                     const j = await api.job(job_id)
                     if (j.status === 'done' || j.status === 'error') {
-                      setError(j.status === 'error' ? j.error : '')
-                      setNote(j.log.filter((l) => /Same|Aligned|Consolidated|Floor link|placed/.test(l)).map((l) => l.slice(11)).join('\n'))
+                      setError(j.status === 'error' ? j.error || 'Linking failed' : '')
+                      setNote((j.log || []).filter((l) => /Same|Aligned|Consolidated|Floor link|placed/.test(l)).map((l) => l.slice(11)).join('\n'))
                       break
                     }
                     await new Promise((r) => setTimeout(r, 1000))
                   }
                   await load()
                   onChanged?.()
+                } catch (e) {
+                  setError(detail(e))
                 } finally {
                   setBusy(false)
                 }
@@ -442,7 +489,7 @@ export default function MapReview({ building, onChanged }) {
             </button>
           </div>
         </header>
-        {error && <p className="notice error" onClick={() => setError('')}>{error}</p>}
+        {error && <p className="notice error" role="alert" title="Click to dismiss" onClick={() => setError('')}>{error}</p>}
         {note && <pre className="log" onClick={() => setNote('')}>{note}</pre>}
         {view3d ? (
           <div className="map-stage">
@@ -464,16 +511,16 @@ export default function MapReview({ building, onChanged }) {
             <div key={s.id} className="merge">
               <div className="pair">
                 <figure>
-                  <img src={frameUrl(building, byId[s.keep]?.frame_id)} alt="" />
+                  {byId[s.keep]?.frame_id && <img src={frameUrl(building, byId[s.keep].frame_id)} alt="" />}
                   <figcaption>{byId[s.keep]?.label}</figcaption>
                 </figure>
                 <figure>
-                  <img src={frameUrl(building, byId[s.remove]?.frame_id)} alt="" />
+                  {byId[s.remove]?.frame_id && <img src={frameUrl(building, byId[s.remove].frame_id)} alt="" />}
                   <figcaption>{byId[s.remove]?.label}</figcaption>
                 </figure>
               </div>
               <p>
-                <b>{Math.round(s.confidence * 100)}%</b> · {s.reason}
+                <b>{Math.round((s.confidence || 0) * 100)}%</b> · {s.reason}
               </p>
               <div className="row">
                 <button className="primary" onClick={() => act(() => api.resolveMerge(building, s.id, true))}>
@@ -491,12 +538,12 @@ export default function MapReview({ building, onChanged }) {
       {sel && (
         <section className="card node-editor">
           <div className="row spread">
-            <h3>{sel.label}</h3>
+            <h3>{sel.label || 'Unnamed place'} <PlaceChip node={sel} /></h3>
             <button className="ghost danger" onClick={() => deleteNode(sel.id)}>
               <Trash2 size={16} /> Delete
             </button>
           </div>
-          {sel.frame_id && <img className="node-photo" src={frameUrl(building, sel.frame_id)} alt="" />}
+          {sel.frame_id && <img className="node-photo" src={frameUrl(building, sel.frame_id)} alt={`Photo of ${sel.label}`} />}
           <label className="field">
             <span>Label</span>
             <input value={sel.label} onChange={(e) => patchNode(sel.id, { label: e.target.value })} />
@@ -509,12 +556,12 @@ export default function MapReview({ building, onChanged }) {
             <label className="field">
               <span>Type</span>
               <select value={sel.type} onChange={(e) => patchNode(sel.id, { type: e.target.value })}>
-                {TYPES.map((t) => <option key={t}>{t}</option>)}
+                {(TYPES.includes(sel.type) ? TYPES : [...TYPES, sel.type]).map((t) => <option key={t} value={t}>{TYPE_NAMES[t] || t}</option>)}
               </select>
             </label>
             <label className="field">
               <span>Floor</span>
-              <input type="number" value={sel.floor} onChange={(e) => patchNode(sel.id, { floor: Number(e.target.value) })} />
+              <input type="number" value={sel.floor} onChange={(e) => e.target.value !== '' && patchNode(sel.id, { floor: Math.round(Number(e.target.value)) })} />
             </label>
             <label className="check">
               <input type="checkbox" checked={sel.verified} onChange={(e) => patchNode(sel.id, { verified: e.target.checked })} />
@@ -525,7 +572,7 @@ export default function MapReview({ building, onChanged }) {
           <div className="row">
             <select value={mergeWith} onChange={(e) => setMergeWith(e.target.value)}>
               <option value="">Merge another node into this one…</option>
-              {map.nodes.filter((n) => n.id !== sel.id).map((n) => <option key={n.id} value={n.id}>{n.label}</option>)}
+              {sortedNodes.filter((n) => n.id !== sel.id).map((n) => <option key={n.id} value={n.id}>{n.label || n.id} (floor {n.floor})</option>)}
             </select>
             <button disabled={!mergeWith} onClick={() => act(() => api.mergeNodes(building, sel.id, mergeWith)).then(() => setMergeWith(''))}>
               <GitMerge size={16} /> Merge
@@ -539,8 +586,8 @@ export default function MapReview({ building, onChanged }) {
             <tbody>
               {selEdges.map((e) => (
                 <tr key={e.id}>
-                  <td>{byId[e.from_node]?.label}</td>
-                  <td>{byId[e.to_node]?.label}</td>
+                  <td>{byId[e.from_node]?.label || e.from_node}</td>
+                  <td>{byId[e.to_node]?.label || e.to_node}</td>
                   <td><DirSelect value={e.heading_out} onChange={(v) => patchEdge(e.id, { heading_out: v })} /></td>
                   <td><DirSelect value={e.heading_in} onChange={(v) => patchEdge(e.id, { heading_in: v })} /></td>
                   <td title={e.inferred_floor_change ? 'Floor change inferred from room numbers; no stairs seen' : ''}>
@@ -549,7 +596,7 @@ export default function MapReview({ building, onChanged }) {
                       {VERTICALS.map((v) => <option key={v}>{v}</option>)}
                     </select>
                   </td>
-                  <td><button className="ghost danger" onClick={() => deleteEdge(e.id)}><Trash2 size={14} /></button></td>
+                  <td><button className="ghost danger" aria-label="Delete connection" onClick={() => deleteEdge(e.id)}><Trash2 size={14} /></button></td>
                 </tr>
               ))}
             </tbody>
@@ -565,29 +612,35 @@ export default function MapReview({ building, onChanged }) {
         <div className="row wrap">
           <select value={newEdge.from_node} onChange={(e) => setNewEdge({ ...newEdge, from_node: e.target.value })}>
             <option value="">From…</option>
-            {map.nodes.map((n) => <option key={n.id} value={n.id}>{n.label}</option>)}
+            {sortedNodes.map((n) => <option key={n.id} value={n.id}>{n.label || n.id} (floor {n.floor})</option>)}
           </select>
           <DirSelect value={newEdge.heading_out} onChange={(v) => setNewEdge({ ...newEdge, heading_out: v })} />
           <select value={newEdge.to_node} onChange={(e) => setNewEdge({ ...newEdge, to_node: e.target.value })}>
             <option value="">To…</option>
-            {map.nodes.map((n) => <option key={n.id} value={n.id}>{n.label}</option>)}
+            {sortedNodes.map((n) => <option key={n.id} value={n.id}>{n.label || n.id} (floor {n.floor})</option>)}
           </select>
           <select value={newEdge.vertical} onChange={(e) => setNewEdge({ ...newEdge, vertical: e.target.value })}>
             {VERTICALS.map((v) => <option key={v}>{v}</option>)}
           </select>
-          <button onClick={addEdge}>Add</button>
+          <button disabled={!newEdge.from_node || !newEdge.to_node || newEdge.from_node === newEdge.to_node} onClick={addEdge}>Add</button>
         </div>
       </section>
 
       <section className="card">
         <h3>All places</h3>
+        <label className="check">
+          <input type="checkbox" checked={hideWaypoints} onChange={(e) => setHideWaypoints(e.target.checked)} />
+          Hide hallway points, hallway ends and doorways
+        </label>
+        {map.nodes.length === 0 && <p className="muted">No places yet. Upload a walk or add a photo to start the map.</p>}
         <div className="node-grid">
-          {map.nodes.map((n) => (
+          {sortedNodes.filter((n) => !hideWaypoints || n.id === selected || !isMinorNode(n)).map((n) => (
             <button key={n.id} className={`node-card ${selected === n.id ? 'sel' : ''}`} onClick={() => setSelected(n.id)}>
               {n.frame_id ? <img src={frameUrl(building, n.frame_id)} loading="lazy" alt="" /> : <div className="nophoto" />}
-              <span>{n.label}</span>
+              <span>{n.label || 'Unnamed place'}</span>
+              <PlaceChip node={n} />
               <small>
-                {n.type}, floor {n.floor}
+                floor {n.floor}
                 {n.verified ? ', verified' : ''}
                 {n.soft ? ', blurry photo' : ''}
               </small>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ListOrdered, Pause, Play, SkipForward } from 'lucide-react'
+import { ListOrdered, Pause, Play, SkipForward, X } from 'lucide-react'
 import { api, detail } from '../api'
 
 // Processing queue: one video runs at a time. Pause/resume any job, or "Run next" to jump the queue
@@ -41,20 +41,27 @@ export default function QueuePanel({ building, selected, onSelect }) {
       <h3>
         <ListOrdered size={18} /> Queue <small className="muted">{active.length} active</small>
       </h3>
-      {error && <div className="banner error">{error}</div>}
+      {error && (
+        <div className="banner error banner-dismiss" role="alert">
+          <span>{error}</span>
+          <button type="button" className="ghost icon-btn" onClick={() => setError('')} aria-label="Dismiss error">
+            <X size={18} aria-hidden="true" />
+          </button>
+        </div>
+      )}
       <ul className="queue">
         {[...active, ...finished].map((j, k) => (
-          <li key={j.id} className={`${j.status} ${selected === j.id ? 'sel' : ''}`} onClick={() => onSelect?.(j.id)}>
-            <div className="q-main">
+          <li key={j.id} className={`${j.status} ${selected === j.id ? 'sel' : ''}`}>
+            <button type="button" className="ghost q-main" onClick={() => onSelect?.(j.id)} aria-pressed={selected === j.id}>
               <span className="q-name">{j.filename || j.kind}</span>
               <span className={`pill ${j.status}`}>{j.status === 'running' ? `${j.stage} ${Math.round(j.pct)}%` : j.status}</span>
-            </div>
+            </button>
             {j.status === 'running' && (
               <div className="bar slim">
                 <div style={{ width: `${j.pct}%` }} />
               </div>
             )}
-            <div className="q-actions" onClick={(e) => e.stopPropagation()}>
+            <div className="q-actions">
               {(j.status === 'running' || j.status === 'queued') && (
                 <button className="ghost" onClick={() => act(j.id, 'pause')} title="Pause">
                   <Pause size={14} /> Pause

@@ -1,3 +1,69 @@
+import { ArrowUpDown, Ban, DoorClosed, DoorOpen, Footprints, LogIn, LogOut, MapPin, Toilet, TrendingUp } from 'lucide-react'
+
+// ---- Place types: one classifier shared by the review and navigation screens ----
+// Kinds map to the CSS modifier `place-chip--{kind}`: room | exit | noexit | stairs | hallway | landmark.
+const NO_EXIT = /\bno[\s_-]*exit\b/i
+const MINOR_LABEL = /^(hallway|corridor)\b|^doorway\b|^junction\b|^intersection\b/i
+
+// A "No Exit" sign is never an exit, whatever type the backend filed it under.
+export function placeKind(node) {
+  const label = node?.label || ''
+  const type = node?.type || ''
+  if (NO_EXIT.test(label)) return 'noexit'
+  if (type === 'exit') return 'exit'
+  if (type === 'room') return 'room'
+  if (type === 'stairs' || type === 'elevator' || node?.vertical) return 'stairs'
+  if (type === 'hallway' || type === 'intersection' || MINOR_LABEL.test(label)) return 'hallway'
+  return 'landmark' // entrance, restroom, landmark, anything new
+}
+
+// Hallway point / Hallway end / Doorway: minor waypoints rather than destinations.
+export const isWaypoint = (node) => placeKind(node) === 'hallway' && (MINOR_LABEL.test(node?.label || '') || !node?.verified)
+
+// Quiet dot on the maps: waypoints and unverified, unnamed hallway/landmark nodes. A No Exit sign is never quiet.
+export function isMinorNode(n) {
+  if (placeKind(n) === 'noexit') return false
+  if (MINOR_LABEL.test(n?.label || '')) return true
+  return !n?.verified && !(n?.sign_texts || []).length && ['hallway', 'intersection', 'landmark'].includes(n?.type)
+}
+
+const KIND_TEXT = { room: 'Room', exit: 'Exit', noexit: 'No exit', stairs: 'Stairs', hallway: 'Hallway', landmark: 'Landmark' }
+
+export function placeLabel(node) {
+  const kind = placeKind(node)
+  const type = node?.type
+  if (kind === 'stairs') return type === 'elevator' || node?.vertical === 'elevator' ? 'Elevator' : 'Stairs'
+  if (kind === 'hallway' && /^doorway/i.test(node?.label || '')) return 'Doorway'
+  if (kind === 'hallway' && /\bend\b/i.test(node?.label || '')) return 'Hallway end'
+  if (kind === 'hallway') return 'Hallway point'
+  if (kind === 'landmark') return type === 'entrance' ? 'Entrance' : type === 'restroom' ? 'Restroom' : 'Landmark'
+  return KIND_TEXT[kind]
+}
+
+export function PlaceIcon({ node, size = 14 }) {
+  const kind = placeKind(node)
+  const type = node?.type
+  const props = { size, 'aria-hidden': true, focusable: 'false' }
+  if (kind === 'noexit') return <Ban {...props} />
+  if (kind === 'exit') return <LogOut {...props} />
+  if (kind === 'room') return <DoorClosed {...props} />
+  if (kind === 'stairs') return type === 'elevator' || node?.vertical === 'elevator' ? <ArrowUpDown {...props} /> : <TrendingUp {...props} />
+  if (kind === 'hallway') return /^doorway/i.test(node?.label || '') ? <DoorOpen {...props} /> : <Footprints {...props} />
+  if (type === 'entrance') return <LogIn {...props} />
+  if (type === 'restroom') return <Toilet {...props} />
+  return <MapPin {...props} />
+}
+
+// Icon + words (never colour alone), so No exit cannot be mistaken for Exit.
+export function PlaceChip({ node, className = '' }) {
+  return (
+    <span className={`place-chip place-chip--${placeKind(node)} ${className}`.trim()}>
+      <PlaceIcon node={node} />
+      <span>{placeLabel(node)}</span>
+    </span>
+  )
+}
+
 // Wayfinding pictograms. Turns are bent arrows (straight approach, then the turn) like building and
 // road signage, so the shape itself says "go this far, then turn". Left turns mirror the right ones.
 const STROKE = { fill: 'none', strokeWidth: 9, strokeLinecap: 'round', strokeLinejoin: 'round' }
