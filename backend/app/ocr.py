@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from . import config
-from .matching import directional, phone_like
+from .matching import ROOM_ID, complete_room_id, cut_number, directional, notice, phone_like, room_id
 
 try:
     import objc
@@ -71,16 +71,28 @@ def read_text(source: Path | Image.Image) -> list[str]:
 CROP_EDGE = 0.02  # a line this close to a crop's cut edge may be cut in half: the full view or other crop has it
 
 
+def _edge_cut(text: str, x0: float, x1: float, left_edge: bool, right_edge: bool) -> bool:
+    """A line touching the image's left/right edge with a number at that end: the plaque runs off the frame,
+    so the number may be missing digits ('ROOM 21' of ROOM 216, '14A' of 214A). Words cut there are harmless
+    ('OM 220' still says 220)."""
+    toks = text.split()
+    if not toks:
+        return False
+    return ((right_edge and x1 >= 1 - CROP_EDGE and any(ch.isdigit() for ch in toks[-1]))
+            or (left_edge and x0 <= CROP_EDGE and any(ch.isdigit() for ch in toks[0])))
+
+
 def read_text_with_crops(path: Path) -> list[str]:
     """OCR of the full (EXIF-upright) image plus zoomed LEFT/RIGHT crops (the same 55% halves Gemma sees), so
     small corner plaques that the full view misses are read too. Lines are deduplicated; a crop line touching
-    the cut edge (possibly half a word) or contained in an already-read line is dropped."""
+    the cut edge (possibly half a word) or contained in an already-read line is dropped, and so is any line
+    whose number touches the image edge (possibly cut, see _edge_cut)."""
     if not available():
         return []
     img = ImageOps.exif_transpose(Image.open(path))
     img.load()
     w, h = img.size
-    out = [t for t, _, _ in _observations(img)]
+    out = [t for t, x0, x1 in _observations(img) if not _edge_cut(t, x0, x1, True, True)]
     seen = [_norm(t) for t in out]
     for box, cut_left, cut_right in (((0, 0, int(w * 0.55), h), False, True),
                                      ((int(w * 0.45), 0, w, h), True, False)):
@@ -89,6 +101,8 @@ def read_text_with_crops(path: Path) -> list[str]:
             crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
         for text, x0, x1 in _observations(crop):
             if (cut_left and x0 <= CROP_EDGE) or (cut_right and x1 >= 1 - CROP_EDGE):
+                continue
+            if _edge_cut(text, x0, x1, not cut_left, not cut_right):  # the crop's outer side is the image edge
                 continue
             n = _norm(text)
             if not n or any(n in s for s in seen):
@@ -252,16 +266,57 @@ def long_sentence(text: str) -> bool:
 
 
 def sign_line(text: str) -> bool:
-    return not phone_like(text) and not long_sentence(text)
+    """Could be a sign: not a phone number, running text or notice text ('4PM ROOM 305', 'FRIDAY 10AM')."""
+    return not phone_like(text) and not long_sentence(text) and not notice(text)
+
+
+def _plaque_shape(line: str) -> bool:
+    s = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9&' ]", " ", line.upper())).strip()
+    return any(p.fullmatch(s) for p in _PLAQUE)
 
 
 def plaque_like(line: str) -> bool:
     """A door plaque line: a number alone, ROOM/RM/OFFICE/LAB/STE + number, or number + short name.
-    A directional sign ('ROOMS 120-130 ->', 'ROOM 121 →') is not a plaque."""
+    A directional sign ('ROOMS 120-130 ->', 'ROOM 121 →'), notice text and a partial read ('ROOM 21',
+    'ROOM 10?') are not plaques."""
     if directional(line):
         return False
-    s = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9&' ]", " ", line.upper())).strip()
-    return sign_line(line) and any(p.fullmatch(s) for p in _PLAQUE)
+    return sign_line(line) and _plaque_shape(line) and not partial_plaque(line)
+
+
+def partial_plaque(line: str) -> bool:
+    """A plaque read only in part: a number followed by '?' / an apostrophe ('ROOM 10?'), or a plaque-shaped
+    line whose number is shorter than a room number ('ROOM 21' of ROOM 216, a lone '2' of 214A). Its numbers
+    are no room numbers and must not end up in a label."""
+    if cut_number(line):
+        return True
+    if directional(line) or not _plaque_shape(line):
+        return False
+    nums = re.findall(r"[A-Z]?\d+[A-Z]?", re.sub(r"[^A-Z0-9 ]", " ", line.upper()))
+    return bool(nums) and not any(re.fullmatch(ROOM_ID, n) or complete_room_id(n) for n in nums)
+
+
+# Words that make an OCR line a wayfinding sign even next to a poster.
+_WAYFINDING_WORDS = {"EXIT", "STAIR", "STAIRS", "STAIRWAY", "STAIRWELL", "ELEVATOR", "ELEVATORS", "LIFT", "RESTROOM",
+                     "RESTROOMS", "TOILET", "TOILETS", "WC", "MEN", "WOMEN", "LEVEL", "FLOOR", "ENTRANCE", "LOBBY"}
+
+
+def poster_lines(ocr_lines: list[str]) -> list[str]:
+    """OCR lines that belong to a poster or notice: notice text itself ('4PM ROOM 305', 'CALL 555-0199'), and,
+    when the frame shows notice text, its other lines that are not wayfinding (the headline 'SEMINAR',
+    'MATH TUTORING' printed above the time or phone number). Plaques, floor, directional and exit/stairs/
+    restroom signs in the same frame are kept apart."""
+    notes = [line for line in ocr_lines if not sign_line(line)]
+    if not notes:
+        return []
+    out = list(notes)
+    for line in ocr_lines:
+        if line in out or directional(line) or _plaque_shape(line) or _line_floors(line):
+            continue
+        if _WAYFINDING_WORDS & set(_tokens(line)):
+            continue
+        out.append(line)
+    return out
 
 
 def plaque_numbers(ocr_lines: list[str]) -> set[str]:
