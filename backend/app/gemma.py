@@ -19,6 +19,7 @@ import re
 import tempfile
 import threading
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,7 +28,7 @@ import ollama
 from PIL import Image, ImageOps
 
 from . import config, ocr
-from .matching import directional, room_id, room_ids
+from .matching import PLAQUE_PREFIX, complete_room_id, directional, room_id, room_ids
 from .schemas import FrameAnalysis, GemmaFrame, SamePlace
 
 log = logging.getLogger(__name__)
@@ -398,36 +399,139 @@ def _strip_ungrounded_numbers(text: str, lines: list[str]) -> tuple[str, bool]:
 _DOOR_PLACES = {"room", "entrance", "restroom", "stairs", "elevator", "exit"}
 
 
-def _ground(result: FrameAnalysis, lines: list[str]) -> FrameAnalysis:
-    sign_lines = [line for line in lines if ocr.sign_line(line)]  # not phone numbers or running text
+_NUM34 = re.compile(r"(?<!\d)\d{3,4}(?!\d)")
+# 'Room 2', 'RM. 118', 'Office #214A', 'Lab No. 3': the number a plaque word in a label names.
+_LABEL_PLAQUE_NUMBER = re.compile(rf"\b{PLAQUE_PREFIX}\b\.?\s*(?:NO\b\.?\s*)?#?\s*([A-Z]?\d+[A-Z]?)\b")
+_PLAQUE_WORDS = {"ROOM", "RM", "OFFICE", "OFC", "LAB", "SUITE", "STE"}
+_SAYS_POSTER = {"POSTER", "POSTERS", "NOTICE", "NOTICES", "FLYER", "FLYERS", "FLIER", "FLIERS", "BULLETIN"}
+
+
+def _notice_numbers(lines: list[str]) -> set[str]:
+    """3-4 digit numbers printed on notice text of this frame ('4PM ROOM 305', 'CALL 555-0147'): another line of
+    the same frame repeating one ('API ROOM 305', a misread of the same poster line) is no room number either."""
+    return {n for line in lines if not ocr.sign_line(line) for n in _NUM34.findall(line)}
+
+
+def _on_notice(text: str, notice_nums: set[str]) -> bool:
+    return bool(notice_nums & set(_NUM34.findall(text)))
+
+
+def _core(word: str) -> str:
+    return re.sub(r"^[^A-Z0-9]+|[^A-Z0-9]+$", "", word.upper())
+
+
+def _alpha_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[A-Z]+", text.upper()) if len(w) >= 4]
+
+
+def _word_in(w: str, toks: set[str]) -> bool:
+    """w (4+ letters) is one of the tokens, part of one ('BOOK' of 'BOOKFAIR': OCR dropped the space) or close
+    to one ('GUITAR' ~ 'UITAR', 'SEMINAR' ~ 'EMINAR': an OCR cut)."""
+    return any(w in t or SequenceMatcher(None, w, t).ratio() >= 0.8 for t in toks)
+
+
+def _numbers_ok(label: str, rooms: set[str]) -> bool:
+    """Every 3-4 digit number in the label, and every number right after Room/Office/Lab, is a kept room number."""
+    up = label.upper()
+    if any(room_id(m.group(1)) not in rooms for m in _LABEL_PLAQUE_NUMBER.finditer(up)):
+        return False
+    return all(room_id(c) in rooms for w in up.split() if _NUM34.search(c := _core(w)))
+
+
+def _poster_built(label: str, poster_toks: set[str], own_toks: set[str]) -> bool:
+    """The label names the poster ('Math Tutoring', 'Guitar Lessons hallway'): one of its words is read only on
+    the frame's poster lines. A label that says it is a poster ('Bake sale poster') is fine."""
+    words = _alpha_words(label)
+    if not poster_toks or _SAYS_POSTER & set(words):
+        return False
+    return any(_word_in(w, poster_toks) and not _word_in(w, own_toks) for w in words if w not in _PLAQUE_WORDS)
+
+
+def _drop_plaque_words(label: str, rooms: set[str], own_toks: set[str]) -> str:
+    """Drop a Room/Office/Lab/Suite word the label invents: not followed by a kept room number and not read on
+    a non-poster OCR line ('Math Tutoring Office' -> 'Math Tutoring', 'ROCI Room' -> 'ROCI')."""
+    words = label.split()
+    out = []
+    for i, w in enumerate(words):
+        core = _core(w)
+        if core in _PLAQUE_WORDS and core not in own_toks:
+            nxt = _core(words[i + 1]) if i + 1 < len(words) else ""
+            if not (nxt and room_id(nxt) in rooms):
+                continue
+        out.append(w)
+    return " ".join(out).strip(" -,–:")
+
+
+def _clean_label(text: str, number_lines: list[str], rooms: set[str], poster_toks: set[str], own_toks: set[str],
+                 directional_ok: bool = False) -> str:
+    """The label without invented Room/Office words, or '' if it is built on an ungrounded, cut or poster number
+    or on poster words. `directional_ok`: a description may repeat a directional sign ('Rooms 220 to 230
+    hallway'); its numbers were checked against that sign already."""
+    text = text.strip()
+    if not (directional_ok and directional(text)):
+        text, changed = _strip_ungrounded_numbers(text, number_lines)
+        if changed or not _numbers_ok(text, rooms):
+            return ""
+    text = _drop_plaque_words(text, rooms, own_toks)
+    if not re.search(r"[A-Za-z0-9]", text) or _poster_built(text, poster_toks, own_toks):
+        return ""
+    return text
+
+
+def _check_ocr(result: FrameAnalysis, lines: list[str]) -> FrameAnalysis:
+    """Texts, room numbers, description and label checked against the frame's OCR lines. Idempotent, so it is
+    re-applied to cached answers (see _tidy_rooms).
+
+    Notice text ('4PM ROOM 305', phone numbers, dates) and partial plaques ('ROOM 21' of ROOM 216, 'ROOM 10?')
+    ground nothing; a room number must be complete (3-4 digits) and not printed on a notice line of the same
+    frame. The label may only name kept room numbers, may not invent a Room/Office word, and may not be built
+    from a poster's words; a rejected label becomes 'Room N', else the description, else the place type."""
+    clean = [line for line in lines if ocr.sign_line(line) and not ocr.partial_plaque(line)]
+    notice_nums = _notice_numbers(lines)
     # A directional sign ('ROOMS 120-130 ->', 'ROOM 121 →') names rooms elsewhere: never this place's number.
-    own_lines = [line for line in sign_lines if not directional(line)]
+    own_lines = [line for line in clean if not directional(line)]
     if result.place_type in _DOOR_PLACES:
         number_lines = own_lines
     else:
         number_lines = [line for line in own_lines if ocr.plaque_like(line) or ocr.floor_from_lines([line])]
-    result.texts = [t for t in result.texts if ocr.grounded(t, lines) and ocr.sign_line(t)]
+    result.texts = [t for t in result.texts
+                    if ocr.grounded(t, clean) and ocr.sign_line(t) and not ocr.partial_plaque(t)
+                    and not _on_notice(t, notice_nums)]
     result.room_numbers = list(dict.fromkeys(
         rn for r in result.room_numbers
-        if not directional(r) and ocr.grounded(rn := room_id(r), number_lines)))  # 'RM 118' -> '118'
+        if not directional(r) and complete_room_id(rn := room_id(r))  # 'RM 118' -> '118'
+        and ocr.grounded(rn, number_lines) and not _on_notice(rn, notice_nums)))
     result.has_sign = bool(result.texts or result.room_numbers)
+    # numbers OCR read on a directional sign are real: fine in a description ('sign to rooms 120-130'), not a label
+    result.description, _ = _strip_ungrounded_numbers(
+        result.description, number_lines + [line for line in clean if directional(line)])
+
+    rooms = {r.upper() for r in result.room_numbers}
+    posters = ocr.poster_lines(lines)
+    poster_toks = {w for line in posters for w in _alpha_words(line)}
+    own_toks = {w for line in lines if line not in posters for w in re.findall(r"[A-Z]+", line.upper())}
+    label = _clean_label(result.suggested_label, number_lines, rooms, poster_toks, own_toks)
+    if not label:  # built on an invented, cut or poster number or on poster words: rebuild it from what is real
+        desc = _clean_label(result.description, number_lines, rooms, poster_toks, own_toks,
+                            directional_ok=True)
+        if result.room_numbers:
+            rn = result.room_numbers[0]
+            label = f"Room {rn}" if rn[:1].isdigit() else rn  # '132' (read as 'RM 132') -> 'Room 132'; 'B204' as read
+        elif desc:
+            label = desc[:1].upper() + desc[1:]
+        else:
+            label = result.place_type.capitalize()
+    result.suggested_label = label
+    return result
+
+
+def _ground(result: FrameAnalysis, lines: list[str]) -> FrameAnalysis:
+    _check_ocr(result, lines)
+    sign_lines = [line for line in lines if ocr.sign_line(line)]  # not phone numbers, notices or running text
     if result.floor_hint and not ocr.floor_grounded(result.floor_hint, lines):
         result.floor_hint = ""  # only a line like 'LEVEL 2' / '2ND FLOOR' confirms it, never a room number
     if not result.floor_hint:
         result.floor_hint = ocr.floor_from_lines(sign_lines)  # Gemma missed a clear 'LEVEL 2' sign
-    # numbers OCR read on a directional sign are real: fine in a description ('sign to rooms 120-130'), not a label
-    result.description, _ = _strip_ungrounded_numbers(
-        result.description, number_lines + [line for line in sign_lines if directional(line)])
-    label, changed = _strip_ungrounded_numbers(result.suggested_label, number_lines)
-    if changed:  # the label was built on an invented or poster number: rebuild it from what is real
-        if result.room_numbers:
-            rn = result.room_numbers[0]
-            label = f"Room {rn}" if rn[:1].isdigit() else rn  # '132' (read as 'RM 132') -> 'Room 132'; 'B204' as read
-        elif result.description:
-            label = result.description[:1].upper() + result.description[1:]
-        else:
-            label = result.place_type.capitalize()
-    result.suggested_label = label
     result.grounded = True
     return result
 
@@ -436,11 +540,12 @@ def _tidy_rooms(result: FrameAnalysis) -> FrameAnalysis:
     """Room numbers in one canonical form ('RM 118' / 'ROOM-118' -> '118', '118A' kept) and never from a
     directional sign: 'ROOMS 120-130 ->' names rooms down the hall, so it gives no room number and does not
     make the spot a "room" (the text stays in `texts`). Idempotent; also applied to cached answers, so maps
-    built from an older cache get the same room numbers without asking Gemma again."""
+    built from an older cache get the same room numbers and label checks without asking Gemma again."""
     nums = [room_id(r) for r in result.room_numbers if r.strip() and not directional(r)]
-    if result.grounded and result.ocr:  # re-check against the OCR lines that are not directional signs
-        own_lines = [line for line in result.ocr if ocr.sign_line(line) and not directional(line)]
-        nums = [r for r in nums if ocr.grounded(r, own_lines)]
+    if result.grounded and result.ocr:  # re-check texts, numbers and label against the frame's OCR (_check_ocr)
+        result.room_numbers = nums
+        _check_ocr(result, list(result.ocr))
+        nums = result.room_numbers
     elif not result.grounded:  # no OCR: Gemma's own texts tell which numbers are only on a directional sign
         elsewhere = {n for t in result.texts if directional(t) for n in re.findall(r"\d+[A-Z]?", t.upper())}
         own = room_ids(result.texts)
