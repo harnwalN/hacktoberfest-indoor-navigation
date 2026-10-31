@@ -4,7 +4,8 @@ merge it into the building map, closing loops when the walker revisits a known p
 Pipeline per walk:
   1. walk nodes:    keyframes that matter (turns, glances, dwells, signs, stairs boundaries, ends)
   2. loop closure:  match each walk node against known nodes by room-number text and ORB geometry,
-                    verified by Gemma ("same physical spot?"); auto-merge or suggest for review
+                    verified by Gemma ("same physical spot?"); auto-merge or suggest for review. Gemma's
+                    "same" alone never merges: it needs strong ORB or a shared plaque number (_gemma_backed)
   3. drift fix:     every ORB-verified match yields a heading constraint; fit c(t) = c0 + k*t so the
                     walk's integrated heading lines up with the building frame (and itself, on loops)
   4. edges:         consecutive walk nodes -> edges with heading_out / heading_in and vertical
@@ -365,6 +366,18 @@ def _label(wn: WalkNode) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------- loop closure
+# Two places of one walk recorded less than this apart are never one place: the walker was moving between them
+# (a loop back to a spot takes longer). Look-alike stretches of hallway (the same poster every few metres)
+# match well on ORB and Gemma, so neither loop closure nor consolidation may join them.
+SAME_WALK_GAP_SEC = 15.0
+
+
+def _moments_apart(a: Node, b: Node) -> bool:
+    """Both places come from the same walk, recorded less than SAME_WALK_GAP_SEC apart."""
+    return bool(a.video_id and a.video_id == b.video_id and a.t is not None and b.t is not None
+                and abs(a.t - b.t) < SAME_WALK_GAP_SEC)
+
+
 @dataclass
 class Match:
     node: Node
@@ -375,6 +388,14 @@ class Match:
     rel_yaw: float | None
 
 
+def _gemma_backed(inliers: int, shared_plaque: bool) -> bool:
+    """Whether a Gemma 'same place' may merge two spots automatically: only with real geometric support, i.e.
+    strong ORB, or the same door-plaque room number on both plus weak ORB. Gemma alone is never enough: small
+    models call look-alike spots 'identical' (the same poster on two walls, a 'LEVEL 2' sign along a whole
+    corridor), and such a merge joins places metres apart. Without support the pair is left for review."""
+    return inliers >= config.ORB_STRONG_INLIERS or (shared_plaque and inliers >= config.ORB_WEAK_INLIERS)
+
+
 def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma: bool,
                 exclude: set[str], walk_times: dict[str, float], log, w_floor: int | None = None,
                 walk_levels: dict[str, int] | None = None, w_level: int | None = None) -> Match | None:
@@ -382,6 +403,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
     this walk created itself: their Node.floor is not set until the walk is done, so the floor filter
     above cannot see them, and a walk that climbed stairs must not loop-close onto its own earlier floor."""
     w_tokens = place_tokens(wn.texts)
+    w_plaques = room_ids(wn.texts)  # plaque numbers anywhere in this walk node (frame + absorbed frames)
     w_rooms = room_ids(wayfinding_texts(wn.analysis))  # this frame's own plaque numbers, as Node.sign_texts
     w_path = frames / wn.kf.frame_id
     cands = []
@@ -394,7 +416,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
             continue  # similar corridors on different floors are never the same place
         if walk_levels is not None and node.id in walk_levels and walk_levels[node.id] != w_level:
             continue  # this walk's own place, on another floor of the same walk
-        if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < 15:
+        if node.id in walk_times and abs(wn.kf.t - walk_times[node.id]) < SAME_WALK_GAP_SEC:
             continue  # same walk, a few seconds ago: that's just the previous stretch of hallway
         text_hit = bool(w_tokens & place_tokens(node.texts))
         inliers, rel_yaw = orb_match(frames / node.frame_id, w_path)
@@ -407,6 +429,7 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
     best: Match | None = None
     for text_hit, inliers, rel_yaw, node in cands[:3]:
         signals = {"text": text_hit, "orb_inliers": inliers}
+        shared_plaque = bool(w_plaques & room_ids(node.texts))
         verdict = None
         if use_gemma:
             try:
@@ -431,7 +454,9 @@ def _find_match(wn: WalkNode, bundle: MapBundle, frames: Path, cache, use_gemma:
             conf = verdict.confidence if verdict.same_place else 0.3
             # Gemma alone is not proof (similar corridors look alike): require geometric agreement.
             auto = (verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE
-                    and inliers >= config.ORB_WEAK_INLIERS)
+                    and _gemma_backed(inliers, shared_plaque))
+            if verdict.same_place and not auto:
+                signals["note"] = "Gemma alone: no strong geometry or shared room number"
             reason = f"Gemma: {verdict.reason}"
         else:
             conf = min(1.0, 0.5 * text_hit + inliers / (2 * config.ORB_STRONG_INLIERS))
@@ -1035,7 +1060,8 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
 
     1. identity: the same OCR-verified room number on the same floor is the same place (even when the
        two walks faced opposite directions and the photos look nothing alike);
-    2. appearance: strong ORB geometry, or ORB + Gemma 'same place', between walks on the same floor;
+    2. appearance: strong ORB geometry, or Gemma 'same place' backed by geometry (_gemma_backed), between
+       walks on the same floor;
     3. heading alignment for walks that joined the map without a geometric anchor.
     Floors are never mixed: similar corridors on different floors stay separate.
 
@@ -1142,6 +1168,8 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                     merge(a, b, f"Same room {'/'.join(sorted(ra & rb))}", 1.0,
                           {"rooms": sorted(ra & rb)}, strong=True)
                 continue  # different room numbers: different places
+            if _moments_apart(a, b):
+                continue  # no shared plaque and the walk moved between them (as in loop closure): look-alikes
             sim = place_similarity(descs[a.id], descs[b.id], frames, weights)
             if sim["score"] < 0.35 or not sim["agree"]:
                 continue
@@ -1155,8 +1183,10 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
                     verdict = gemma.same_place(frames / a.frame_id, frames / b.frame_id, cache)
                 except gemma.GemmaUnavailable:
                     use_gemma = gemma.session_active()  # in a job session further calls only read the cache
-            # Gemma's visual judgement is an independent descriptor of its own
-            if verdict and verdict.same_place and verdict.confidence >= 0.8 and len(sim["agree"]) >= 1:
+            # Gemma's visual judgement is an independent descriptor of its own, but never enough without
+            # geometry: a colour histogram, shared poster words or neighbours do not show it is one spot
+            if (verdict and verdict.same_place and verdict.confidence >= 0.8 and len(sim["agree"]) >= 1
+                    and _gemma_backed(sim["orb"], bool(_room_ids(a) & _room_ids(b)))):
                 merge(a, b, f"Same place: {why}; Gemma: {verdict.reason[:120]}", sim["score"],
                       sim | {"gemma": verdict.model_dump()}, strong="name" in sim["agree"])
             elif frozenset((a.id, b.id)) not in existing_pairs and not (verdict and not verdict.same_place):
@@ -1190,7 +1220,8 @@ def consolidate(bundle: MapBundle, frames: Path, cache, use_gemma: bool, log=pri
             if gemma.ocr_conflict(verdict):
                 continue  # different plaque numbers read by OCR: never merged, never suggested
             strong = inliers >= 1.5 * config.ORB_STRONG_INLIERS
-            if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE):
+            if strong or (verdict and verdict.same_place and verdict.confidence >= config.AUTO_MERGE_CONFIDENCE
+                          and _gemma_backed(inliers, bool(_room_ids(a) & _room_ids(b)))):
                 why = f"{inliers} matching features" + (f"; Gemma: {verdict.reason}" if verdict else "")
                 merge(a, b, f"Same place across walks ({why})",
                       round(verdict.confidence if verdict else min(1.0, inliers / (2 * config.ORB_STRONG_INLIERS)), 2),

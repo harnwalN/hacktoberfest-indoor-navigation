@@ -542,7 +542,10 @@ def _tidy_rooms(result: FrameAnalysis) -> FrameAnalysis:
     make the spot a "room" (the text stays in `texts`). Idempotent; also applied to cached answers, so maps
     built from an older cache get the same room numbers and label checks without asking Gemma again."""
     nums = [room_id(r) for r in result.room_numbers if r.strip() and not directional(r)]
-    if result.grounded and result.ocr:  # re-check texts, numbers and label against the frame's OCR (_check_ocr)
+    # Re-check texts, numbers and label against the frame's OCR (_check_ocr). Lines recorded at a known
+    # revision count even when empty: OCR read nothing there (e.g. only a plaque cut at the image edge), so
+    # nothing Gemma reported is grounded.
+    if result.grounded and (result.ocr or result.ocr_rev):
         result.room_numbers = nums
         _check_ocr(result, list(result.ocr))
         nums = result.room_numbers
@@ -624,7 +627,7 @@ def _compute_frame(path: Path, model: str) -> FrameAnalysis:
         listing = "\n".join(f"- {l}" for l in lines) if lines else "(none)"
         raw = _chat(model, ANALYZE_PROMPT + OCR_NOTE.format(lines=listing), views[:1], GemmaFrame,
                     config.GEMMA_NUM_PREDICT_ANALYZE)
-        result = _ground(FrameAnalysis(**raw.model_dump(), ocr=lines), lines)
+        result = _ground(FrameAnalysis(**raw.model_dump(), ocr=lines, ocr_rev=ocr.REVISION), lines)
     else:
         raw = _chat(model, ANALYZE_PROMPT, views[:1], GemmaFrame, config.GEMMA_NUM_PREDICT_ANALYZE)
         if (raw.has_sign and not raw.texts) or (raw.place_type == "room" and not raw.room_numbers):
@@ -642,10 +645,32 @@ def _compute_frame(path: Path, model: str) -> FrameAnalysis:
     return result
 
 
+def _refresh_ocr(path: Path, result: FrameAnalysis, cache: GemmaCache, key_for) -> FrameAnalysis:
+    """A cached answer grounded on OCR lines from an older ocr.REVISION: re-read the lines from the photo (OCR
+    only, never Ollama) and store them, so _tidy_rooms re-checks Gemma's answer against what OCR keeps now.
+    Without this, a line the current OCR drops (a number cut at the image edge: '110' of plaque 110A) would
+    still ground a room number from the cache. Unchanged when OCR is off or the photo cannot be read."""
+    if not result.grounded or result.ocr_rev >= ocr.REVISION or not ocr.available():
+        return result
+    try:
+        st = Path(path).stat()
+        lines = list(_ocr_lines(str(path), st.st_mtime_ns, st.st_size))
+    except (OSError, ValueError) as exc:
+        log.debug("OCR refresh skipped for %s: %s", path, exc)
+        return result
+    if lines != result.ocr:
+        log.info("OCR lines of cached %s re-read: %s -> %s", Path(path).name, result.ocr, lines)
+    result.ocr, result.ocr_rev = lines, ocr.REVISION
+    if result._model_used:
+        cache.put(key_for(result._model_used), result.model_dump())  # Gemma's raw answer, newer OCR lines
+    return result
+
+
 def analyze_frame(path: Path, cache: GemmaCache, model: str | None = None) -> FrameAnalysis:
     """Cache first; `result._model_used` tells which model the answer is from (not serialized)."""
-    return _tidy_rooms(_cache_first(cache, _frame_key(path), FrameAnalysis, model,
-                                    lambda m: _compute_frame(path, m), mark_offline=False))
+    key_for = _frame_key(path)
+    hit = _cache_first(cache, key_for, FrameAnalysis, model, lambda m: _compute_frame(path, m), mark_offline=False)
+    return _tidy_rooms(_refresh_ocr(path, hit, cache, key_for))
 
 
 def cached_analysis(path: Path, cache: GemmaCache, model: str | None = None) -> FrameAnalysis | None:
@@ -657,7 +682,7 @@ def cached_analysis(path: Path, cache: GemmaCache, model: str | None = None) -> 
     s = _session.get()
     explicit = model or (s.model if s else None)
     hit = _cached(cache, key_for, [explicit] + _offline_models(explicit), FrameAnalysis)
-    return _tidy_rooms(hit) if hit is not None else None
+    return _tidy_rooms(_refresh_ocr(path, hit, cache, key_for)) if hit is not None else None
 
 
 OCR_CONFLICT = "OCR reads different room numbers"

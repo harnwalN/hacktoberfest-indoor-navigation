@@ -26,6 +26,12 @@ except ImportError:  # Linux/Windows, or pyobjc not installed
     _AVAILABLE = False
 
 
+# Version of what read_text_with_crops keeps. Bump it whenever that changes (e.g. the image-edge filter, rev 2):
+# a cached frame analysis stores the OCR lines it was grounded on, and one from an older revision has its lines
+# re-read from the photo (no Gemma call) so stale lines ('110' of a 110A plaque cut at the edge) cannot ground.
+REVISION = 2
+
+
 def available() -> bool:
     return _AVAILABLE and config.OCR_ENABLED
 

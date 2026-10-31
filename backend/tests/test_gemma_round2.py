@@ -321,7 +321,8 @@ def test_evidence_fields_come_before_the_verdict():
     assert fields.index("texts") < fields.index("has_sign") and fields.index("room_numbers") < fields.index("has_sign")
     old = {"has_sign": True, "texts": ["EXIT"], "room_numbers": [], "suggested_label": "Exit", "place_type": "exit",
            "stairs": "none", "floor_hint": "", "description": "exit door", "ocr": ["EXIT"], "grounded": True}
-    assert FrameAnalysis.model_validate(old).model_dump() == old  # same keys and values for readers
+    # same keys and values for readers; an old entry reads as OCR revision 0 (re-read on use, gemma._refresh_ocr)
+    assert FrameAnalysis.model_validate(old).model_dump() == old | {"ocr_rev": 0}
     sp = list(SamePlace.model_fields)
     assert sp.index("image1_sign_text") < sp.index("shared_details") < sp.index("same_place")
     SamePlace(same_place=True, confidence=1, reason="x")  # old construction still valid

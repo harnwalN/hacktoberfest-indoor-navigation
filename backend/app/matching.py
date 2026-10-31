@@ -82,10 +82,22 @@ def room_ids(texts: list[str]) -> set[str]:
 
 def place_tokens(texts: list[str]) -> set[str]:
     """Tokens that identify this place (text-hit evidence for 'same place'): text_tokens of its own signs only.
-    A directional sign ('ROOMS 120-130 ->' -> '120130') is shown at many hallway spots, and a phone number
-    ('555-0147' -> '5550147', '555 0147' -> '555') or any other notice text ('FRIDAY 10AM', '4PM ROOM 305')
-    on every copy of a flyer: neither says where you are."""
-    return text_tokens([PHONE.sub(" ", t) for t in texts if not directional(t) and not notice(t)])
+    A directional sign ('ROOMS 120-130 ->' -> '120130') is shown at many hallway spots, a floor sign ('LEVEL2',
+    'L2') all along a floor's corridors, and a phone number ('555-0147' -> '5550147', '555 0147' -> '555') or
+    any other notice text ('FRIDAY 10AM', '4PM ROOM 305') on every copy of a flyer: none says where you are."""
+    return text_tokens([PHONE.sub(" ", t) for t in texts
+                        if not directional(t) and not notice(t) and not floor_sign(t)])
+
+
+_FLOOR_SIGN = re.compile(r"(?:LEVEL|FLOOR|FLR|FL|LVL|L)\s*\d{1,2}|\d{1,2}\s*(?:ST|ND|RD|TH)?\s*(?:FLOOR|FLR|FL|LEVEL)"
+                         r"|\d{1,2}\s*(?:ST|ND|RD|TH)|\d{1,2}\s*F")
+
+
+def floor_sign(text: str) -> bool:
+    """A floor sign and nothing else: 'LEVEL 2', 'LEVEL2', 'FL 2', '2ND FLOOR', 'L2', '2F'. Every corridor of
+    that floor shows one, so it names a floor, never a place ('LEVEL 2 ROOM 214' is a plaque, not this)."""
+    s = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", text.upper())).strip()
+    return bool(s) and bool(_FLOOR_SIGN.fullmatch(s))
 
 
 # ---------------------------------------------------------------- notices and incomplete room numbers

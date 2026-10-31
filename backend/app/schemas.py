@@ -37,6 +37,7 @@ class GemmaFrame(BaseModel):
 class FrameAnalysis(GemmaFrame):
     """Gemma's answer after OCR grounding, plus the OCR evidence."""
     ocr: list[str] = []
+    ocr_rev: int = 0  # ocr.REVISION the `ocr` lines were read with (0: before revisions were recorded)
     grounded: bool = False
     _model_used: str | None = PrivateAttr(default=None)  # Gemma model the answer came from (not serialized)
 
