@@ -26,6 +26,13 @@ async function session(vp, o = {}, ctxOpts = {}) {
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
   page.on('pageerror', (e) => errors.push('PAGEERROR ' + e.message))
   const st = { queueCalls: 0, jobCalls: {}, ...o }
+  // Signed in as the owner: the Build tools (queue, upload) and the map edit tools are owner-only now.
+  await ctx.addInitScript(() => {
+    if (!localStorage.getItem('session_token')) {
+      localStorage.setItem('session_token', 'tok-owner')
+      localStorage.setItem('session_account', JSON.stringify({ id: 'u-owner', email: 'owner@example.com', is_owner: true }))
+    }
+  })
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url()); const p = url.pathname.replace(/^\/api/, ''); const m = route.request().method()
     const json = (b, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) })
@@ -137,7 +144,7 @@ for (const [vpName, vp] of [['mobile', MOBILE], ['desktop', DESKTOP]]) {
   const { ctx, page, errors, st } = await session(DESKTOP, { queue: (json) => (mode === 'fail' ? json({ detail: msg }, 500) : json(JOBS)) })
   // need jobs non-empty for the panel: first poll succeeds
   mode = 'ok'
-  await page.goto(`${BASE}/#/build?b=b1`)
+  await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
   await page.waitForSelector('ul.queue')
   mode = 'fail'
   await page.waitForSelector('.banner-dismiss[role="alert"]', { timeout: 5000 })
@@ -171,7 +178,12 @@ async function buildFlow(ctxOpts, T) {
     queue: (json) => json([]),
     job: (id, n, json) => (n < 3 ? json({ id, status: 'running', stage: 'gemma', pct: 30 * n, kind: 'video', log: ['x'] }) : json(done)),
   }, ctxOpts)
-  await page.goto(`${BASE}/#/build?b=b1`)
+  // Walk upload needs a session, and the Build tools are owner-only: seed the owner session so this flow tests the upload itself.
+  await page.addInitScript(() => {
+    localStorage.setItem('session_token', 'sess-motion')
+    localStorage.setItem('session_account', JSON.stringify({ id: 'acc-motion', email: 'builder@example.com', is_owner: true }))
+  })
+  await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
   await page.setInputFiles('input[type=file][accept="video/*"]', { name: 'w.mp4', mimeType: 'video/mp4', buffer: Buffer.from('x') })
   await page.click('button.upload-btn')
   await page.waitForSelector('[role=progressbar]')
@@ -202,7 +214,7 @@ await buildFlow({}, (n) => `[build] ${n}`)
     queue: (json) => json([{ id: 'j9', status: 'done', filename: 'old.mp4', kind: 'video', pct: 100 }]),
     job: (id, n, json) => json({ id, status: 'done', stage: 'mapping', pct: 100, kind: 'video', log: [] }),
   })
-  await page.goto(`${BASE}/#/build?b=b1`)
+  await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
   await page.waitForSelector('ul.queue')
   await page.click('.q-main')
   await page.waitForSelector('.success-pop')
@@ -326,7 +338,7 @@ await buildFlow(RM, (n) => `[reduced] ${n}`)
   const JOBS = [{ id: 'q1', status: 'running', stage: 'gemma', pct: 40, filename: 'a.mp4', kind: 'video' }]
   let mode = 'ok'
   const { ctx, page, errors } = await session(DESKTOP, { queue: (json) => (mode === 'fail' ? json({ detail: 'Queue down' }, 500) : json(JOBS)) }, RM)
-  await page.goto(`${BASE}/#/build?b=b1`)
+  await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
   await page.waitForSelector('ul.queue'); mode = 'fail'
   await page.waitForSelector('.banner-dismiss', { timeout: 5000 })
   await page.click('button[aria-label="Dismiss error"]')
@@ -355,7 +367,7 @@ await buildFlow(RM, (n) => `[reduced] ${n}`)
 for (const [vpName, vp] of [['mobile', MOBILE], ['desktop', DESKTOP]]) {
   const T = (n) => `[${vpName}] ${n}`
   const { ctx, page, errors } = await session(vp)
-  await page.goto(`${BASE}/#/review?b=b1`)
+  await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
   await page.waitForSelector('.node-card')
   await page.locator('.node-card').nth(3).click()
   const w = page.locator('.table-scroll')

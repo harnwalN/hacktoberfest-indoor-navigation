@@ -1,7 +1,14 @@
-"""Central configuration. Every value can be overridden with an environment variable."""
+"""Central configuration. Every value can be overridden with an environment variable.
+
+Values may also come from backend/.env (see .env.example). The file is read below, before any setting is
+read, and a variable already in the environment always wins. ENV_FILE=<path> reads another file; ENV_FILE= turns
+the file off (the test suite does this).
+"""
 import os
 import re
 from pathlib import Path
+
+from . import envfile
 
 
 def _f(name: str, default: float) -> float:
@@ -9,20 +16,23 @@ def _f(name: str, default: float) -> float:
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+envfile.load(os.environ.get("ENV_FILE", str(BACKEND_DIR / ".env")))
+# Legacy shared secret for scripts. With it set, a request sending header X-Owner-Token: <value> counts as the owner
+# for owner-only routes, and a map-changing /api request with neither the token nor a Bearer session is refused (401).
+# Unset = the token is not accepted and writes need an owner session.
+OWNER_TOKEN = os.getenv("OWNER_TOKEN", "")
+# Owner accounts: comma-separated sign-in emails. Blank or unset = nobody is owner (main.py logs a WARNING at startup).
+# Owners can moderate walks, manage buildings and map edits, resolve reports, and block contributors.
+OWNER_EMAILS = frozenset(e.strip().lower() for e in (os.getenv("OWNER_EMAILS") or "").split(",") if e.strip())
+if any("@" not in e for e in OWNER_EMAILS):
+    raise ValueError("OWNER_EMAILS must be a comma-separated list of email addresses")
 DATA_DIR = Path(os.getenv("DATA_DIR", BACKEND_DIR / "data"))
+# Interface the server binds to. Read by the start command (uvicorn --host), not by the app itself.
+# Local default is loopback only. deploy/Dockerfile sets 0.0.0.0 inside the container; the compose file
+# publishes it on the host's 127.0.0.1 only.
+BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1").strip()
 BUILDINGS_DIR = DATA_DIR / "buildings"
 STATIC_DIR = BACKEND_DIR / "static"
-
-# --- Access control (auth.py) ---
-# Every /api route except /api/health needs a token: the owner key, or an invite token for one building.
-# AUTH_REQUIRED=0 turns all checks off (local development only). There is no localhost bypass: the tunnel
-# delivers public traffic from 127.0.0.1 too.
-AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "1") != "0"
-# Owner key from the environment. Unset: a key is generated on first start and only its hash is kept in DATA_DIR/auth.json.
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-ADMIN_TOKEN_MIN_CHARS = 24  # with AUTH_REQUIRED=1 the server refuses to start when ADMIN_TOKEN is set and shorter
-FRAME_URL_TTL_SEC = int(os.getenv("FRAME_URL_TTL_SEC", 86400))  # how long a signed photo URL stays valid (one day)
-AUTH_MAX_FAILS = int(os.getenv("AUTH_MAX_FAILS", 20))  # failed auth attempts per client IP per minute before HTTP 429
 
 # --- Upload limits (requests over these get HTTP 413) ---
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 2048))  # one walk video
@@ -164,5 +174,38 @@ CLIMB_HINT_SEC = _f("CLIMB_HINT_SEC", 5.0)  # Gemma's stairs hint may come this 
 CLIMB_SIGN_APPROACH_SEC = _f("CLIMB_SIGN_APPROACH_SEC", 5.0)
 
 # --- "Something's wrong here" reports (reports.py) ---
-REPORTS_PER_HOUR = int(os.getenv("REPORTS_PER_HOUR", 20))  # reports one reporter may send for one building per hour
 REPORTS_MAX = int(os.getenv("REPORTS_MAX", 5000))  # reports one building may hold; past this new ones get 507
+
+# --- Magic-link sign-in email (stdlib smtplib only; the sending code lives in the auth module, not here) ---
+# log: print the sign-in link to the log instead of emailing it. Local dev only. Default when unset.
+# smtp: send through SMTP_HOST. Refuses to start without SMTP_HOST, so a missing host never silently falls back to log.
+# Footgun in the other direction: a production deploy must set MAIL_BACKEND=smtp explicitly with a real SMTP_HOST.
+# Log mode prints live sign-in links, so it must never be the mode a real deployment runs in.
+MAIL_BACKEND = os.getenv("MAIL_BACKEND", "log").strip().lower()
+if MAIL_BACKEND not in ("log", "smtp"):
+    raise ValueError(f"MAIL_BACKEND must be log or smtp (got {MAIL_BACKEND!r})")
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))  # 587 = submission with STARTTLS
+SMTP_USER = os.getenv("SMTP_USER", "").strip()  # login name; empty = no login
+# Env only: never logged, never returned by any endpoint.
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()  # sender address on outgoing sign-in mail
+SMTP_STARTTLS = os.getenv("SMTP_STARTTLS", "1") != "0"  # 0 turns STARTTLS off (plain SMTP; only for a trusted local relay)
+if MAIL_BACKEND == "smtp" and not SMTP_HOST:
+    raise ValueError("MAIL_BACKEND=smtp needs SMTP_HOST (set SMTP_HOST, or MAIL_BACKEND=log for local dev)")
+
+# --- Sign-in (auth.py, auth_router.py) ---
+# Origin users open in the browser (e.g. https://nav.example.org). Sign-in links are built from it, so a Host header
+# sent by a client can never change where a link points. Required in smtp mode; log mode falls back to the request's origin.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+if PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith(("http://", "https://")):
+    raise ValueError(f"PUBLIC_BASE_URL must start with http:// or https:// (got {PUBLIC_BASE_URL!r})")
+if MAIL_BACKEND == "smtp" and not PUBLIC_BASE_URL:
+    raise ValueError("MAIL_BACKEND=smtp needs PUBLIC_BASE_URL (the origin users open, e.g. https://nav.example.org)")
+AUTH_LINK_TTL_SEC = int(os.getenv("AUTH_LINK_TTL_SEC", 15 * 60))  # a sign-in link works once and expires after this
+AUTH_SESSION_TTL_SEC = int(os.getenv("AUTH_SESSION_TTL_SEC", 30 * 24 * 3600))  # a signed-in browser stays signed in this long
+# request-link is limited per client IP and per email address: at most this many requests per window (sliding), in memory.
+AUTH_LINK_RATE_LIMIT = int(os.getenv("AUTH_LINK_RATE_LIMIT", 5))
+AUTH_LINK_RATE_WINDOW_SEC = int(os.getenv("AUTH_LINK_RATE_WINDOW_SEC", 15 * 60))
+if AUTH_LINK_RATE_LIMIT < 1 or AUTH_LINK_RATE_WINDOW_SEC < 1:
+    raise ValueError("AUTH_LINK_RATE_LIMIT and AUTH_LINK_RATE_WINDOW_SEC must be at least 1")

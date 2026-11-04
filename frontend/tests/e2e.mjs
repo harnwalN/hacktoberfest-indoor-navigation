@@ -42,6 +42,9 @@ async function mockApi(page, o = {}) {
       if (o.mapFail && o.mapCalls <= o.mapFail) return json({ detail: 'boom' }, 500)
       return json(o.map || FULL)
     }
+    if (p === '/health') return json({ gemma: { models: [], ok: false, error: 'off' } })
+    if (p === '/buildings/b1/queue') return json([])
+    if (p === '/buildings/b1/reports' && m === 'GET') return json([])
     if (p === '/buildings/b1/route') {
       o.routeCalls = (o.routeCalls || 0) + 1
       if (o.routeDelay) await new Promise((r) => setTimeout(r, o.routeDelay))
@@ -55,6 +58,13 @@ async function mockApi(page, o = {}) {
 const browser = await chromium.launch()
 async function session(vp, o = {}) {
   const ctx = await browser.newContext({ viewport: vp })
+  // Signed in as the owner (the map edit tools are owner-only): the stored session carries is_owner.
+  await ctx.addInitScript(() => {
+    if (!localStorage.getItem('session_token')) {
+      localStorage.setItem('session_token', 'tok-owner')
+      localStorage.setItem('session_account', JSON.stringify({ id: 'u-owner', email: 'owner@example.com', is_owner: true }))
+    }
+  })
   const page = await ctx.newPage()
   const errors = []
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
@@ -244,7 +254,8 @@ for (const [vpName, vp] of [['mobile', { width: 390, height: 844 }], ['desktop',
   // ---------- Review ----------
   {
     const { ctx, page, errors } = await session(vp)
-    await page.goto(`${BASE}/#/review?b=b1`)
+    // Map edit tools (edit cards, Add connection, Save) are on the owner page, Videos & map.
+    await page.goto(`${BASE}/#/owner?s=videos&b=b1`)
     await page.waitForSelector('.node-grid')
     const cards = await page.$$eval('.node-card', (els) => els.map((e) => [e.querySelector('span').innerText, e.querySelector('.place-chip')?.innerText, e.querySelector('.place-chip')?.className]))
     const ne = cards.filter(([l]) => /no exit/i.test(l))

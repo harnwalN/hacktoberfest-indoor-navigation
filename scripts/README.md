@@ -19,7 +19,7 @@ scripts/share.sh --build    # rebuild the frontend first; needed once, and after
 
 ## Quick mode (default, no account needed)
 
-Runs `cloudflared tunnel --url http://localhost:8000`. Cloudflare gives a random
+Runs `cloudflared tunnel --url http://127.0.0.1:8000`. Cloudflare gives a random
 `https://<words>.trycloudflare.com` address. The script prints it. **It changes on every restart**, so
 use it for a one-off demo. For an address that stays the same, use named mode.
 
@@ -55,12 +55,11 @@ credentials-file: /Users/<you>/.cloudflared/<tunnel-id>.json
 
 ingress:
   - hostname: <hostname>
-    service: http://localhost:8000
+    service: http://127.0.0.1:8000
   - service: http_status:404
 ```
 
-If the tunnel connects but the page shows a 502 error, change the service to `http://127.0.0.1:8000`.
-The backend listens only on 127.0.0.1.
+The backend listens only on 127.0.0.1, so the service must be `http://127.0.0.1:8000`.
 
 Then put the names in `scripts/share.env`:
 
@@ -71,19 +70,14 @@ TUNNEL_HOSTNAME=<hostname>
 
 and run `scripts/share.sh`. The app is then at `https://<hostname>`.
 
-## Owner key and access
+## Access
 
-- The backend requires a token for every `/api` route except `/api/health`. The tunnel makes the server
-  public, so keep `AUTH_REQUIRED` unset.
-- On the first start of a fresh data folder, the backend prints the **owner key once**, on a line
-  that begins `OWNER KEY, shown only once`. It appears in the terminal, and in `logs/backend.log`.
-  Save it somewhere safe. The backend keeps only a hash of it.
-- If you missed it: `cd backend && uv run python -m app.cli owner-key --rotate` makes a new key. The old
-  one stops working immediately.
-- `logs/backend.log` holds the key in clear text. Delete the file after you have saved the key.
-- To use your own key, set `ADMIN_TOKEN` (at least 24 characters) in `scripts/share.env`.
-- `scripts/share.sh` refuses to start when `AUTH_REQUIRED=0` is set anywhere in its environment or
-  `scripts/share.env`.
+- Visitors (no sign-in) can read the maps and routes and file reports. Walk uploads need a signed-in contributor. Owner
+  actions need an owner sign-in (see "Access and roles" in the top-level README).
+- Anyone with the address can ask for a sign-in link, but a link goes only to the inbox of the address they typed. In
+  `MAIL_BACKEND=log` (the default) links go to the backend log only, so outsiders cannot sign in.
+- Keep the address private. Quick-mode addresses change on every run. Named-mode addresses stay the same, so share them only with people you trust.
+- Do not set `OWNER_TOKEN` on a tunnel you share. Anyone with that token is the owner.
 
 ## Troubleshooting
 

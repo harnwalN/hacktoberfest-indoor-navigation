@@ -1,0 +1,76 @@
+/* ---------- motion: Directions + Build (forge-dirbuild) ----------
+   Loaded after styles.css (main.jsx). Transform and opacity only, except the height collapse of the tips.
+   Everything here is switched off by the reduced-motion block in styles.css (animation/transition: none), and the
+   motion components read useReducedMotion() and use duration 0. Constants: src/motion/dirbuild.js. */
+
+/* Directions: planner art. The tiles pop in after the path draws, then bob; the walker loops slowly. */
+@keyframes tile-pop { from { opacity: 0; transform: translateY(-10px) scale(0.6); } }
+.pa-tile--stairs { animation: tile-pop 0.5s var(--ease-pop) 0.95s backwards, bob 3.4s ease-in-out 1.5s 6 alternate; }
+.pa-tile--room { animation: tile-pop 0.5s var(--ease-pop) 1.15s backwards, bob 3.4s ease-in-out 1.7s 6 alternate; }
+@supports (offset-path: path('M0 0 L1 1')) {
+  /* 3 passes (1.8s + 18s = 19.8s, under the ~20s idle budget). Ends at opacity 0 (see walk in styles.css), so the dot
+     fades out at the pin and stays hidden; "both" keeps the start state hidden during the delay. */
+  .pa-walker { animation: walk 6s ease-in-out 1.8s 3 both; }
+}
+
+/* Directions: swap crosses the values with motion; the CSS entrance would fight the spring, so it is off. */
+.place-picked { animation: none; }
+
+/* Directions: the sliding highlight replaces the flat hover/focus fill, so the row fill steps aside for it. */
+.place-option { position: relative; isolation: isolate; }
+@media (hover: hover) { .place-option:hover:not([aria-pressed='true']) { background: transparent; } }
+.place-option:focus:not([aria-pressed='true']) { background: transparent; }
+.place-hl {
+  position: absolute; inset: 0; z-index: -1; border-radius: var(--r-sm); background: var(--well); pointer-events: none;
+}
+
+/* Directions: checkboxes with a tick that pops in when checked */
+.tick-box {
+  appearance: none; -webkit-appearance: none; position: relative; display: inline-grid; place-content: center;
+  width: 24px; height: 24px; min-height: 0; margin: 0; flex: none; box-sizing: border-box;
+  border: 2px solid var(--control); border-radius: 7px; background: var(--surface); cursor: pointer;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+.tick-box::after {
+  content: ''; width: 6px; height: 11px; margin-top: -2px; border: solid var(--on-accent); border-width: 0 3px 3px 0;
+  transform: rotate(45deg) scale(0); transition: transform 0.28s var(--ease-pop);
+}
+.tick-box:checked { background: var(--accent); border-color: var(--accent); }
+.tick-box:checked::after { transform: rotate(45deg) scale(1); }
+.tick-box:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* Directions: step progress. Scales from the left, so the width change is a transform. */
+.trip-progress { height: 4px; margin: 0 16px 10px; border-radius: 2px; background: var(--well); overflow: hidden; }
+.trip-progress i { display: block; height: 100%; background: var(--accent); transform-origin: left center; transition: transform 0.45s var(--ease-out); }
+@media (min-width: 720px) { .trip-progress { margin: 0 0 12px; } }
+
+/* Build: the chosen video card */
+.file-card {
+  display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 12px; margin: 0 0 12px;
+  padding: 10px; border-radius: var(--r-md); background: var(--well);
+}
+.file-thumb { width: 72px; height: 48px; border-radius: var(--r-sm); object-fit: cover; background: var(--surface); }
+.file-meta { display: grid; gap: 2px; min-width: 0; }
+.file-meta b { overflow-wrap: anywhere; }
+.file-meta small { font-size: 0.85rem; }
+
+/* Build: the recording-tips disclosure (button + aria-expanded). The chevron turns; no native marker involved. */
+.tips-toggle {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: var(--tap); padding: 0; border: 0;
+  background: none; color: var(--text-2); font: 700 1rem var(--font); text-align: left; cursor: pointer;
+}
+.tips-toggle:hover:not(:disabled) { background: none; color: var(--text); }
+.tips-chevron { flex: none; transition: transform 0.28s var(--ease-out); }
+.tips-toggle[aria-expanded='true'] .tips-chevron { transform: rotate(180deg); }
+.tips-body { overflow: hidden; }
+.tips-body ul { padding-left: 18px; margin: 8px 0 0; }
+
+/* Build: the status banner cross-fades between ready and offline on one grid cell */
+.status-stack { display: grid; }
+.status-stack > * { grid-area: 1 / 1; }
+
+/* Build: the processed-video rows. Pill swaps cross-fade; "done" pops once when a job turns done. */
+.video-list li { overflow: hidden; }
+.pill.just-done { animation: sign-pop 0.5s var(--ease-pop) backwards; }
+.pill-stack { display: inline-grid; }
+.pill-stack > * { grid-area: 1 / 1; justify-self: start; }

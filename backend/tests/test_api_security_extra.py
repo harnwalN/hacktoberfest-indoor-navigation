@@ -27,11 +27,11 @@ def test_cors_on_413_middleware_and_route(env, monkeypatch):
     monkeypatch.setattr(config, "MAX_SENSOR_BYTES", 1000)
     h = {"Origin": "http://example.com"}
     c, bid = env["client"], env["bid"]
-    r = c.post(f"/api/buildings/{bid}/videos", headers=h,
+    r = c.post(f"/api/buildings/{bid}/videos", headers={**h, **env["auth"]},
                files={"video": ("w.mp4", b"x" * (3 * 1024 * 1024), "video/mp4")})
     assert r.status_code == 413 and r.headers.get("access-control-allow-origin") == "*"
     monkeypatch.setattr(config, "MAX_SENSOR_BYTES", 100)
     monkeypatch.setattr(config, "MAX_UPLOAD_MB", 100)
-    r = c.post(f"/api/buildings/{bid}/videos", headers=h,
+    r = c.post(f"/api/buildings/{bid}/videos", headers={**h, **env["auth"]},
                files={"video": ("w.mp4", b"x", "video/mp4"), "sensors": ("s.json", '{"a":"' + "y" * 300 + '"}')})
     assert r.status_code == 413 and r.headers.get("access-control-allow-origin") == "*"

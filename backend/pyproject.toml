@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.14.1",
     "pyobjc-framework-vision>=12.2.2; sys_platform == 'darwin'",
     "python-multipart>=0.0.32",
+    "rapidfuzz>=3.14.6",
     "uvicorn[standard]>=0.54.0",
 ]
 

@@ -4,6 +4,8 @@ ffmpeg, optical flow, keyframe extraction and Gemma are faked; jobs run synchron
 """
 import threading
 
+import cv2
+import numpy as np
 import pytest
 
 from app import config, gemma, jobs, mapper, motion, store, video
@@ -20,7 +22,7 @@ def env(tmp_path, monkeypatch):
         raise gemma.GemmaUnavailable("disabled in tests")
 
     def fake_keyframes(_hq, _track, _events, _duration, vid, frames_out, log=print):
-        (frames_out / f"{vid}_0.jpg").write_bytes(b"jpg")
+        cv2.imwrite(str(frames_out / f"{vid}_0.jpg"), np.zeros((8, 8, 3), np.uint8))  # a real, decodable keyframe
         return [Keyframe(frame_id=f"{vid}_0.jpg", video_id=vid, t=0, kind="start", heading=0)]
 
     def fake_integrate(bundle, vid, *_a, **_k):
@@ -45,7 +47,10 @@ def _add_video(bid: str, vid: str, status: str = "done") -> None:
         (vdir / name).write_bytes(b"x")
     with store.lock_for(bid):
         bundle = store.load_map(bid)
-        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status=status, duration=1.0))
+        # a processed walk on the map is approved (jobs.py only puts approved walks in a rebuild)
+        moderation = "approved" if status == "done" else "pending"
+        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status=status, duration=1.0,
+                                       moderation_status=moderation))
         if status == "done":
             bundle.nodes.append(Node(id=f"{vid}_n", label=vid, video_id=vid))
         store.save_map(bundle)

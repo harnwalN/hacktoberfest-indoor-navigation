@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { motion, useReducedMotion } from 'motion/react'
 import {
   ArrowRight, ArrowUp, ArrowUpDown, ArrowUpLeft, ArrowUpRight, ChevronLeft, ChevronRight, CornerUpLeft, CornerUpRight, Footprints,
   MapPin, RefreshCw, Search, TrendingDown, TrendingUp, Undo2, X,
@@ -6,9 +7,11 @@ import {
 import { api, detail } from '../api'
 import ErrorBoundary from './ErrorBoundary'
 import ServerPhoto from './ServerPhoto'
+import { keepFramesOffline } from '../offline'
 import SignGlyph, { PlaceChip, glyphKind, isWaypoint, placeKind } from './ArrowOverlay'
 import { Confetti, EmptyArt, PlannerArt, PlannerSkeleton } from './Motion'
 import ReportIssue from './ReportIssue'
+import { HIGHLIGHT, pick as reduced, SWAP_SPRING } from '../motion/dirbuild'
 
 const TYPE_RANK = { entrance: 0, room: 1, restroom: 2, elevator: 3, stairs: 4, exit: 5, landmark: 6 }
 // Short, glanceable headline for the sign; the full sentence sits underneath.
@@ -89,9 +92,12 @@ export function buildSteps(raw, map) {
 }
 
 // ---------- destination picker ----------
-function PlacePicker({ id, label, value, onChange, nodes, allNodes }) {
+function PlacePicker({ id, label, value, onChange, nodes, allNodes, crossed, top }) {
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
+  // The option the pointer or keyboard is on: the sliding highlight moves to it.
+  const [hl, setHl] = useState(null)
+  const reduce = useReducedMotion()
   const box = useRef(null)
   const selected = allNodes.find((n) => n.id === value)
 
@@ -130,9 +136,11 @@ function PlacePicker({ id, label, value, onChange, nodes, allNodes }) {
       onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false) }}>
       <label htmlFor={id}><span>{label}</span></label>
       {selected && !open && (
-        <p className="place-picked" key={value}>
+        <motion.p className="place-picked" key={`${value}-${crossed ? 'x' : 'p'}`}
+          initial={crossed ? { opacity: 0.4, y: top ? 26 : -26 } : { opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+          transition={reduced(reduce, crossed ? SWAP_SPRING : { duration: 0.3 })}>
           <b>{selected.label}</b> <small>floor {selected.floor}</small> <PlaceChip node={selected} />
-        </p>
+        </motion.p>
       )}
       <div className="place-search">
         <Search size={16} aria-hidden="true" />
@@ -152,7 +160,9 @@ function PlacePicker({ id, label, value, onChange, nodes, allNodes }) {
               <ul className="place-options">
                 {list.map((n) => (
                   <li key={n.id}>
-                    <button type="button" className="place-option" aria-pressed={n.id === value} onClick={() => pick(n)} onKeyDown={onOptionKey}>
+                    <button type="button" className="place-option" aria-pressed={n.id === value} onClick={() => pick(n)} onKeyDown={onOptionKey}
+                      onMouseEnter={() => setHl(n.id)} onFocus={() => setHl(n.id)}>
+                      {hl === n.id && <motion.span layoutId={`place-hl-${id}`} className="place-hl" aria-hidden="true" transition={reduced(reduce, HIGHLIGHT)} />}
                       <span>{n.label || 'Unnamed place'}</span>
                       <PlaceChip node={n} />
                     </button>
@@ -273,7 +283,7 @@ function AvoidStairs({ on, onChange }) {
   return (
     <div className="avoid-stairs">
       <label className="check">
-        <input id="avoid-stairs" type="checkbox" checked={on} onChange={(e) => onChange(e.target.checked)} aria-describedby="avoid-stairs-help" />
+        <input id="avoid-stairs" type="checkbox" className="tick-box" checked={on} onChange={(e) => onChange(e.target.checked)} aria-describedby="avoid-stairs-help" />
         <span>Avoid stairs</span>
       </label>
       <p id="avoid-stairs-help" className="check-help">Use elevators and ramps only</p>
@@ -327,6 +337,8 @@ function NavigatorInner({ building }) {
   // rendering with the React "adjust state on prop change" pattern, so no ref is mutated during render.
   const [trk, setTrk] = useState(TRK0)
   const [swapTurn, setSwapTurn] = useState(0)
+  // True from a swap until the next pick: the two values then cross over with a spring.
+  const [crossed, setCrossed] = useState(false)
   // The trip on screen: its ends, the stairs choice it was routed with, and whether its photo URLs were already
   // refetched once. Null when no trip is shown.
   const trip = useRef(null)
@@ -355,6 +367,11 @@ function NavigatorInner({ building }) {
   }, [building, reload])
 
   const steps = useMemo(() => (raw && map ? buildSteps(raw, map) : null), [raw, map])
+
+  // The photos of each route shown are kept on this device, so the route still has its photos with no signal.
+  useEffect(() => {
+    if (raw) keepFramesOffline(raw.map((s) => s.frame_url))
+  }, [raw])
 
   // One route request. A failed request leaves the trip on screen as it was.
   const routeTrip = (from, to, avoidOn, step = 0) => {
@@ -497,7 +514,7 @@ function NavigatorInner({ building }) {
       <div className="quiet-state">
         <EmptyArt />
         <h2>No map yet</h2>
-        <p>Record or upload a walk through the building in Build, and directions will appear here.</p>
+        <p>Record or upload a walk through the building in Contribute, and directions will appear here.</p>
       </div>
     )
 
@@ -509,20 +526,20 @@ function NavigatorInner({ building }) {
         <h1>Where are you going?</h1>
         <div className="trip">
           <div className="trip-line" aria-hidden="true">
-            <i className="from" />
+            <i className="from" key={start || 'none'} />
             <span />
             <i className="to" />
           </div>
           <div className="trip-fields">
-            <PlacePicker id="from" label="From" value={start} onChange={setStart} nodes={choices} allNodes={allNodes} />
-            <PlacePicker id="to" label="To" value={target} onChange={setTarget} nodes={choices} allNodes={allNodes} />
+            <PlacePicker id="from" label="From" value={start} onChange={(v) => { setCrossed(false); setStart(v) }} nodes={choices} allNodes={allNodes} crossed={crossed} top />
+            <PlacePicker id="to" label="To" value={target} onChange={(v) => { setCrossed(false); setTarget(v) }} nodes={choices} allNodes={allNodes} crossed={crossed} />
           </div>
-          <button className="icon-btn swap" aria-label="Swap start and destination" onClick={() => { setStart(target); setTarget(start); setSwapTurn((n) => n + 1) }}>
+          <button className="icon-btn swap" aria-label="Swap start and destination" onClick={() => { setStart(target); setTarget(start); setSwapTurn((n) => n + 1); setCrossed(true) }}>
             <ArrowUpDown size={18} style={{ transform: `rotate(${swapTurn * 180}deg)` }} className="swap-icon" />
           </button>
         </div>
         <label className="check">
-          <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+          <input type="checkbox" className="tick-box" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
           Show unverified places too
         </label>
         <AvoidStairs on={avoid} onChange={toggleAvoid} />
@@ -569,6 +586,10 @@ function NavigatorInner({ building }) {
           {idx + 1} of {steps.length}
         </span>
       </header>
+      {/* How far through the trip: a bar that grows by scale, not width. Decorative, the step count says it in text. */}
+      <div className="trip-progress" aria-hidden="true">
+        <i style={{ transform: `scaleX(${(idx + 1) / steps.length})` }} />
+      </div>
       <div className="trip-summary">
         <StairsBadge stepFree={stepFree} avoid={avoid} />
         <AvoidStairs on={avoid} onChange={toggleAvoid} />

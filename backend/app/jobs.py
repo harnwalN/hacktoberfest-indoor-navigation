@@ -16,11 +16,14 @@ import time
 import traceback
 import uuid
 from collections import Counter
+from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, gemma, hosted, mapper, motion, store, video
+import cv2
+
+from . import config, gemma, hosted, mapper, moderation, motion, store, video
 from .keyframes import select_keyframes
 from .schemas import Keyframe, VideoInfo
 
@@ -127,7 +130,8 @@ def _worker_loop() -> None:
 
 
 def submit_video(building_id: str, upload_path: Path, filename: str, sensors: dict | None, model: str | None,
-                 front: bool = False, start_floor: int | None = None) -> Job:
+                 front: bool = False, start_floor: int | None = None, contributor_id: str | None = None,
+                 uploader_email: str = "unknown") -> Job:
     video_id = f"v{time.strftime('%H%M%S')}{uuid.uuid4().hex[:4]}"
     vdir = store.video_dir(building_id, video_id)
     vdir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +141,9 @@ def submit_video(building_id: str, upload_path: Path, filename: str, sensors: di
         store.write_json_atomic(vdir / "sensors.json", sensors)
     with store.lock_for(building_id):
         bundle = store.load_map(building_id)
-        bundle.videos.append(VideoInfo(id=video_id, filename=filename, has_sensors=bool(sensors), start_floor=start_floor))
+        bundle.videos.append(VideoInfo(id=video_id, filename=filename, has_sensors=bool(sensors), start_floor=start_floor,
+                                       contributor_id=contributor_id, uploader_email=uploader_email,
+                                       created_at=datetime.now(UTC).isoformat(timespec="seconds")))
         store.save_map(bundle)
     job = Job(id=uuid.uuid4().hex[:10], building_id=building_id, video_id=video_id, kind="video", filename=filename)
     return _enqueue(job, lambda: _process_video(job, src, sensors, model), front)
@@ -146,6 +152,36 @@ def submit_video(building_id: str, upload_path: Path, filename: str, sensors: di
 def submit_rebuild(building_id: str) -> Job:
     job = Job(id=uuid.uuid4().hex[:10], building_id=building_id, video_id=None, kind="rebuild", filename="(rebuild)")
     return _enqueue(job, lambda: _rebuild(job))
+
+
+def submit_reprocess(building_id: str, video_id: str) -> Job:
+    """Process a walk again from its kept source file (queued at the end of the queue). Used when an owner approves a
+    walk that never reached the map (failed, or rejected before it was processed). FileNotFoundError: no source file."""
+    vdir = store.video_dir(building_id, video_id)
+    src = next(iter(sorted(vdir.glob("source.*"))), None)
+    if src is None:
+        raise FileNotFoundError(video_id)
+    sensors = store.read_json(vdir / "sensors.json")
+    v = store.get_video(building_id, video_id)
+    _set_video_status(building_id, video_id, status="queued")
+    job = Job(id=uuid.uuid4().hex[:10], building_id=building_id, video_id=video_id, kind="video",
+              filename=v.filename if v else src.name)
+    job.say("Queued again after a moderator's approval")
+    return _enqueue(job, lambda: _process_video(job, src, sensors, None))
+
+
+def cancel_building(building_id: str) -> None:
+    """Stop every job of a building that is being deleted. Queued jobs are dropped; a running one stops at its next
+    checkpoint, and its files are removed by the cancel path."""
+    with _cv:
+        for j in list(JOBS.values()):
+            if j.building_id == building_id:
+                j.cancelled = True
+                if j.status in ("queued", "paused"):
+                    j.status, j.stage = "cancelled", "cancelled"
+                    j.say("Cancelled: building deleted")
+                elif j.status == "running":
+                    j.pause_requested = True
 
 
 def pause(job_id: str) -> Job:
@@ -403,9 +439,186 @@ def _frames_ok(keyframes: list[Keyframe]) -> int:
     return sum(k.analysis is not None for k in keyframes)
 
 
+# ---------- walk moderation (moderation.py) ----------
+# Where a walk's keyframes are, by moderation status (store.py has the folders):
+#   staging_frames/  raw, then blurred, while the walk is checked. Never served.
+#   frames/          approved walks only. Served by /bfiles.
+#   rejected_frames/ blurred frames of walks that are not approved (pending, needs review, rejected, hidden). Never served.
+# Keyframes are blurred and checked before Gemma, the map or the web see them. A walk with any rejected frame
+# never reaches the map: its blurred frames move to its held folder.
+JPEG_QUALITY = 88  # the quality select_keyframes writes keyframes at
+
+
+def _move_frames(src: Path, dst: Path, video_id: str, keep: set[str] | None = None) -> int:
+    """Move one walk's keyframe files from one folder to another, replacing same-named files. Names in `keep` stay.
+    Returns the number of files moved."""
+    keep = keep or set()
+    moved = 0
+    for f in sorted(src.glob(f"{video_id}_*.jpg")):
+        if f.name in keep:
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        f.replace(dst / f.name)
+        moved += 1
+    return moved
+
+
+def _publish_walk_frames(building_id: str, video_id: str, source: Path | None = None) -> int:
+    """Put a walk's frames in the public folder: from `source` (its staging folder, just approved) or its held folder.
+    The caller holds store.lock_for(building_id) and has checked that the walk is approved."""
+    return _move_frames(source or store.held_frames_dir(building_id, video_id), store.frames_dir(building_id), video_id)
+
+
+def _hold_walk_frames(building_id: str, video_id: str) -> int:
+    """Move a walk's staging frames (blurred, not approved) into its held folder. The caller holds the building lock."""
+    return _move_frames(store.staging_frames_dir(building_id, video_id), store.held_frames_dir(building_id, video_id),
+                        video_id)
+
+
+def _archive_walk_frames(building_id: str, video_id: str, keep: set[str] | None = None) -> int:
+    """Move this walk's keyframe files out of the public frames folder into its held folder. Frames in `keep` (still
+    used by another walk's places) stay where they are. Returns the number of files moved."""
+    return _move_frames(store.frames_dir(building_id), store.held_frames_dir(building_id, video_id), video_id, keep)
+
+
+def frames_kept_without(bundle, video_id: str) -> set[str]:
+    """Frame files the map still uses once this walk is off it: the places and photos of the other walks.
+    Works on a copy, so the bundle passed in is not changed."""
+    rest = bundle.model_copy(deep=True)
+    return mapper.remove_video(rest, video_id)["referenced_frames"]
+
+
+def _drop_frames(building_id: str, video_id: str) -> None:
+    """Delete this walk's staging keyframes (raw or blurred). The public and held folders are not touched."""
+    for f in store.staging_frames_dir(building_id, video_id).glob("*.jpg"):
+        f.unlink(missing_ok=True)
+
+
+def _moderate_frames(building_id: str, video_id: str, keyframes: list[Keyframe],
+                     classify: bool) -> tuple[list[dict], str]:
+    """Blur the faces in each keyframe file, replacing the file: the unblurred frame is never kept. classify=True
+    also runs the content check on each blurred frame. Returns (rejected frames, model that answered).
+    Works on the walk's staging folder. On any failure its staging files are deleted and the error is raised, so no
+    unblurred frame stays on disk. No checkpoint inside: a pause cannot leave a half-blurred walk."""
+    frames = store.staging_frames_dir(building_id, video_id)
+    rejected: list[dict] = []
+    checked_by = ""
+    try:
+        for kf in keyframes:
+            path = frames / kf.frame_id
+            img = cv2.imread(str(path)) if path.is_file() else None
+            if img is None:
+                raise moderation.FaceBlurError(f"cannot read keyframe {kf.frame_id}")
+            if classify:
+                blurred, verdict = moderation.moderate_keyframe(img)
+                checked_by = checked_by or verdict.model
+                if not verdict.approved:
+                    rejected.append({"frame_id": kf.frame_id, "reason": verdict.reason, "notes": verdict.notes})
+            else:
+                blurred = moderation.blur_faces(img)
+            if not cv2.imwrite(str(path), blurred, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
+                raise moderation.FaceBlurError(f"cannot write blurred keyframe {kf.frame_id}")
+    except Exception:
+        _drop_frames(building_id, video_id)
+        raise
+    return rejected, checked_by
+
+
+def _moderation_record(keyframes: list[Keyframe], rejected: list[dict], checked_by: str) -> dict:
+    """The walk's moderation result, kept in walk.json."""
+    return {"approved": not rejected, "frames": len(keyframes), "rejected": rejected, "model": checked_by}
+
+
+def _reject_walk(job: Job, building_id: str, video_id: str, record: dict) -> None:
+    """Mark the walk rejected (it stays out of the map). Its blurred frames move to the held folder. A rebuild can reach
+    here for an approved walk, whose frames are then in the public folder: those are held too, except frames the map
+    still uses for other walks."""
+    reasons = "; ".join(f"{r['frame_id']}: {r['reason']}" for r in record["rejected"])
+    notes = f"Automatic moderation rejected {len(record['rejected'])} of {record['frames']} frame(s). {reasons}"
+    store.set_auto_moderation(building_id, video_id, "rejected", notes=notes[:store.MAX_MODERATION_NOTES])
+    _set_video_status(building_id, video_id, status="rejected")
+    with store.lock_for(building_id):
+        _hold_walk_frames(building_id, video_id)
+        bundle = store.load_map(building_id)
+        _archive_walk_frames(building_id, video_id, keep=frames_kept_without(bundle, video_id))
+    job.say(f"Rejected by moderation: {len(record['rejected'])} of {record['frames']} frame(s); not added to the map")
+
+
+def _owner_approved(video: VideoInfo | None) -> bool:
+    """An owner approved this walk. Its frames are still blurred, but the content check is not run again."""
+    return video is not None and video.moderated_by is not None and video.moderation_status == "approved"
+
+
+def _moderate_rebuilt(building_id: str, video_id: str, keyframes: list[Keyframe], previous: dict,
+                      owner_approved: bool = False) -> dict | None:
+    """Moderation for a walk re-extracted by a rebuild. A walk with no moderation record was published before moderation
+    existed: it is not re-checked (None). An approved walk whose keyframes are the same ones is blurred again with no new
+    content check. Otherwise (different frames) it is checked again like a new walk. An owner-approved walk is blurred
+    and not checked again."""
+    if owner_approved:
+        _moderate_frames(building_id, video_id, keyframes, classify=False)
+        return {"approved": True, "frames": len(keyframes), "rejected": [], "model": "owner", "owner_approved": True}
+    prior = previous.get("moderation")
+    if prior is None:
+        return None
+    same = [k.frame_id for k in keyframes] == [k.get("frame_id") for k in previous.get("keyframes", [])]
+    if prior.get("approved") and same:
+        _moderate_frames(building_id, video_id, keyframes, classify=False)  # the re-extracted copies are unblurred
+        return prior
+    rejected, checked_by = _moderate_frames(building_id, video_id, keyframes, classify=True)
+    return _moderation_record(keyframes, rejected, checked_by)
+
+
+def frames_in_map(bundle) -> set[str]:
+    """Every keyframe file the map still points at (place photos and connection photos)."""
+    return {n.frame_id for n in bundle.nodes if n.frame_id} | {
+        f for e in bundle.edges for f in e.frames_fwd + (e.frames_rev or [])}
+
+
+def _leave_off_map(job: Job, building_id: str, bundle, video_id: str, duration: float, n_frames: int) -> None:
+    """An owner hid or rejected the walk while it was being processed. It counts as processed, stays off the map, and its
+    frames are out of the public folder. An owner's later approval rebuilds the map with it. Caller holds the lock."""
+    info = _video_info(job, bundle, video_id)
+    info.status = "done"
+    info.duration, info.keyframes = round(duration, 1), n_frames
+    _archive_walk_frames(building_id, video_id, keep=frames_in_map(bundle))
+    store.save_map(bundle)
+    job.say(f"Not added to the map: the walk is {info.moderation_status}")
+    job.result = {"moderation": info.moderation_status, "on_map": False}
+
+
+def settle_walk_frames() -> int:
+    """Startup, safe to run again. Puts each walk's frames where its moderation status says: approved walks in the public
+    folder, any other walk in its held folder (except frames the map still uses for another walk's places). Empties the
+    staging folders, which hold raw keyframes of a walk that was interrupted. Returns the number of frame files moved."""
+    moved = 0
+    for bundle in store.all_bundles():
+        bid = bundle.building_id
+        with store.lock_for(bid):
+            keep = frames_in_map(bundle)
+            for v in bundle.videos:
+                try:
+                    vdir = store.video_dir(bid, v.id)
+                except ValueError:
+                    continue
+                shutil.rmtree(vdir / "staging_frames", ignore_errors=True)
+                if v.moderation_status == "approved":
+                    moved += _publish_walk_frames(bid, v.id)
+                else:
+                    moved += _archive_walk_frames(bid, v.id, keep=keep)
+    return moved
+
+
 def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None) -> None:
     bid, vid = job.building_id, job.video_id
     vdir = store.video_dir(bid, vid)
+    decided = store.get_video(bid, vid)
+    if decided is not None and decided.moderated_by is not None and decided.moderation_status in ("rejected", "hidden"):
+        # An owner took this walk down before it was processed: nothing is extracted, analysed or shown.
+        _set_video_status(bid, vid, status="rejected")
+        job.say(f"Owner decision ({decided.moderation_status}): not processed")
+        job.result = {"moderation": decided.moderation_status, "on_map": False}
+        return
     _set_video_status(bid, vid, status="processing")
 
     job.enter("normalize"); job.say(f"Normalizing {src.name} with ffmpeg")
@@ -421,13 +634,53 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     job.say(f"Motion events: {summary or 'none'}")
 
     job.enter("keyframes")
-    keyframes = select_keyframes(hq_path, track, events, duration, vid, store.frames_dir(bid), log=job.say)
+    # Raw keyframes are written to the staging folder: nothing unblurred is ever in a served or held folder.
+    staging = store.staging_frames_dir(bid, vid)
+    staging.mkdir(parents=True, exist_ok=True)
+    keyframes = select_keyframes(hq_path, track, events, duration, vid, staging, log=job.say)
+
+    # Before Gemma, the map or any web response: every keyframe gets its faces blurred, then the content check.
+    owner_ok = _owner_approved(store.get_video(bid, vid))
+    if owner_ok:
+        job.say(f"Moderating {len(keyframes)} keyframe(s): faces blurred; approved by the owner, not checked again")
+        rejected, checked_by = _moderate_frames(bid, vid, keyframes, classify=False)
+        record = _moderation_record(keyframes, rejected, "owner")
+        record["owner_approved"] = True
+    else:
+        job.say(f"Moderating {len(keyframes)} keyframe(s): faces blurred, content checked")
+        rejected, checked_by = _moderate_frames(bid, vid, keyframes, classify=True)
+        record = _moderation_record(keyframes, rejected, checked_by)
+    if rejected:
+        store.write_json_atomic(vdir / "walk.json", {
+            "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
+            "events": events, "gemma": False, "gemma_frames_ok": 0, "model": None, "moderation": record,
+        }, mkdir=False)
+        _reject_walk(job, bid, vid, record)
+        job.result = {"moderation": "rejected", "rejected_frames": len(rejected)}
+        return
+    # The approval and the move of the frames happen under the building lock, so an owner's decision cannot land between.
+    with store.lock_for(bid):
+        decided = store.set_auto_moderation(bid, vid, "approved", notes=None)
+        if decided.moderation_status == "approved":
+            _publish_walk_frames(bid, vid, source=staging)
+        else:
+            _hold_walk_frames(bid, vid)  # an owner hid or rejected the walk during the check
+    if decided.moderation_status != "approved":
+        store.write_json_atomic(vdir / "walk.json", {
+            "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
+            "events": events, "gemma": False, "gemma_frames_ok": 0, "model": None, "moderation": record,
+        }, mkdir=False)
+        with store.lock_for(bid):
+            _leave_off_map(job, bid, store.load_map(bid), vid, duration, len(keyframes))
+        return
+    job.say(f"Moderation passed: {len(keyframes)} frame(s) approved")
 
     run = _analyze_walk(job, keyframes, model)
     use_gemma = run.ok
     store.write_json_atomic(vdir / "walk.json", {
         "video_id": vid, "duration": duration, "keyframes": [k.model_dump() for k in keyframes],
         "events": events, "gemma": use_gemma, "gemma_frames_ok": _frames_ok(keyframes), "model": run.model,
+        "moderation": record,
     }, mkdir=False)
 
     job.enter("mapping"); job.say("Building graph and closing loops")
@@ -437,6 +690,10 @@ def _process_video(job: Job, src: Path, sensors: dict | None, model: str | None)
     with store.lock_for(bid), gemma.session(map_model, offline=not run.online):
         bundle = store.load_map(bid)
         info = _video_info(job, bundle, vid)
+        if info.moderation_status != "approved":
+            # An owner hid or rejected the walk while it was being analysed: it stays off the map.
+            _leave_off_map(job, bid, bundle, vid, duration, len(keyframes))
+            return
         result = mapper.integrate_walk(bundle, vid, keyframes, track, store.frames_dir(bid),
                                        gemma.cache_for(store.building_dir(bid)), use_gemma, log=job.say,
                                        start_floor=info.start_floor)
@@ -463,7 +720,8 @@ def _rebuild(job: Job) -> None:
     bid = job.building_id
     # only finished walks: queued/paused ones will be integrated when their own job runs
     videos = [v for v in store.load_map(bid).videos
-              if v.status == "done" and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
+              if v.status == "done" and v.moderation_status == "approved"
+              and (store.video_dir(bid, v.id) / "analysis.mp4").exists()]
     default_model = (store.load_map(bid).processed_with or {}).get("model")
     walks = []
     for i, v in enumerate(videos):
@@ -472,19 +730,41 @@ def _rebuild(job: Job) -> None:
         # Re-analyse with the model the walk was processed with, so its cached answers are reused.
         stored = _stored_model(vdir) or default_model
         try:
+            previous = store.read_json(vdir / "walk.json") or {}  # read before the rebuild overwrites it
             sensors = store.read_json(vdir / "sensors.json")
             job.enter("motion", i / len(videos))
             track = motion.compute_track(vdir / "analysis.mp4", sensors, log=job.say)
             events = motion.detect_events(track)
             store.write_json_atomic(vdir / "track.json", {**track, "events": events}, mkdir=False)
             job.enter("keyframes", i / len(videos))
+            staging = store.staging_frames_dir(bid, v.id)
+            staging.mkdir(parents=True, exist_ok=True)
             keyframes = select_keyframes(vdir / "hq.mp4", track, events, v.duration or track["t"][-1], v.id,
-                                         store.frames_dir(bid), log=job.say)
+                                         staging, log=job.say)
+            mod = _moderate_rebuilt(bid, v.id, keyframes, previous, owner_approved=v.moderated_by is not None)
+            if mod is not None and not mod["approved"]:
+                store.write_json_atomic(vdir / "walk.json", {
+                    "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
+                    "events": events, "gemma": False, "gemma_frames_ok": 0, "model": None, "moderation": mod,
+                }, mkdir=False)
+                _reject_walk(job, bid, v.id, mod)
+                continue
+            with store.lock_for(bid):
+                cur = store.get_video(bid, v.id)
+                if cur is None:
+                    job.say(f"{v.filename} was deleted, skipping it")
+                    _purge_files(bid, v.id)
+                    continue
+                if cur.moderation_status != "approved":
+                    _hold_walk_frames(bid, v.id)
+                    job.say(f"{v.filename} was decided while it was re-analysed, leaving it out")
+                    continue
+                _publish_walk_frames(bid, v.id, source=staging)
             run = _analyze_walk(job, keyframes, stored)
             store.write_json_atomic(vdir / "walk.json", {
                 "video_id": v.id, "duration": v.duration, "keyframes": [k.model_dump() for k in keyframes],
                 "events": events, "gemma": run.ok, "gemma_frames_ok": _frames_ok(keyframes),
-                "model": run.model or stored,
+                "model": run.model or stored, **({"moderation": mod} if mod is not None else {}),
             }, mkdir=False)
         except JobPaused:
             raise

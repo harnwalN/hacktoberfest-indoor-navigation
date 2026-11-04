@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Circle, Square, UploadCloud } from 'lucide-react'
 import { api, detail, MAX_FLOOR, validFloor } from '../api'
+import { useAuth } from './AuthContext'
 
 // Records the walkthrough in the phone browser AND logs the gyroscope on the same clock, so the
 // backend can use real rotation rates for turns instead of inferring them from pixels.
@@ -23,6 +24,7 @@ export default function Recorder({ building, onUploaded }) {
   const [elapsed, setElapsed] = useState(0)
   const [status, setStatus] = useState('')
   const [startFloor, setStartFloor] = useState('')
+  const { requireSignIn } = useAuth()
 
   useEffect(() => () => stream?.getTracks().forEach((t) => t.stop()), [stream])
 
@@ -87,6 +89,7 @@ export default function Recorder({ building, onUploaded }) {
   }
 
   const upload = async () => {
+    if (!requireSignIn('Sign in to upload a walk. Recording stays here until you do.')) return
     setStatus('Uploading…')
     try {
       await api.uploadVideo(building, result.file, {
@@ -95,7 +98,7 @@ export default function Recorder({ building, onUploaded }) {
         startFloor: validFloor(startFloor) ?? '',
         onProgress: (p) => setStatus(`Uploading ${Math.round(p * 100)}%`),
       })
-      setStatus('Uploaded. It jumps the queue: processing starts on the laptop now (see Build → Queue).')
+      setStatus('Uploaded. It jumps the queue. Track it under Contribute (My uploads).')
       onUploaded?.()
     } catch (e) {
       setStatus(detail(e))

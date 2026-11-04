@@ -7,11 +7,9 @@ import networkx as nx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import auth, config, routing, store
+from app import config, routing, store
 from app.main import app
 from app.schemas import Edge, MapBundle, Node
-
-OWNER = "owner-test-key-0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 def _n(nid, floor, label=None, type="hallway", vertical=None):
@@ -256,48 +254,16 @@ def test_route_avoid_stairs_must_be_a_boolean_and_nodes_must_exist(api, two_floo
     assert unknown.status_code == 404
 
 
-@pytest.fixture
-def auth_api(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "AUTH_REQUIRED", True)
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "BUILDINGS_DIR", tmp_path / "buildings")
-    monkeypatch.setattr(config, "ADMIN_TOKEN", OWNER)
-    monkeypatch.setattr(config, "AUTH_MAX_FAILS", 1000)
-    monkeypatch.setattr(auth, "_fails", {})
-    return TestClient(app)
-
-
-def test_viewer_token_can_ask_for_a_step_free_route(auth_api, two_floors, stairs_only):
-    c = auth_api
+def test_step_free_route_is_asked_with_avoid_stairs(api, two_floors):
     bid = _building("Two Floors", two_floors)
-    sid = _building("Stairs Only", stairs_only)
-    inv = c.post(f"/api/buildings/{bid}/invites", json={"role": "viewer", "label": "t"},
-                 headers={"Authorization": f"Bearer {OWNER}"})
-    assert inv.status_code == 200, inv.text
-    viewer = {"Authorization": f"Bearer {inv.json()['token']}"}
-
-    ok = c.post(f"/api/buildings/{bid}/route",
-                json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True}, headers=viewer)
+    ok = api.post(f"/api/buildings/{bid}/route",
+                  json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True})
     assert ok.status_code == 200, ok.text
     assert ok.json()["node_path"] == ["A", "E1", "E2", "U"] and ok.json()["step_free"] is True
 
-    # the token is per building: it does not open the other one (same 401 as an unknown building, by design)
-    other = c.post(f"/api/buildings/{sid}/route",
-                   json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True}, headers=viewer)
-    assert other.status_code == 401
 
-    # no token: still refused before any routing happens
-    anon = c.post(f"/api/buildings/{bid}/route",
-                  json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True})
-    assert anon.status_code == 401
-
-
-def test_viewer_gets_the_step_free_message_on_a_stairs_only_building(auth_api, stairs_only):
-    c = auth_api
+def test_stairs_only_building_gets_the_step_free_message(api, stairs_only):
     sid = _building("Stairs Only", stairs_only)
-    inv = c.post(f"/api/buildings/{sid}/invites", json={"role": "viewer", "label": "t"},
-                 headers={"Authorization": f"Bearer {OWNER}"})
-    viewer = {"Authorization": f"Bearer {inv.json()['token']}"}
-    r = c.post(f"/api/buildings/{sid}/route",
-               json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True}, headers=viewer)
+    r = api.post(f"/api/buildings/{sid}/route",
+                 json={"start_node_id": "A", "target_node_id": "U", "avoid_stairs": True})
     assert r.status_code == 400 and r.json()["detail"] == routing.NO_STEP_FREE_MESSAGE

@@ -1,6 +1,8 @@
-/* Waypoint: a friendly campus theme (pastel-consumer direction).
-   Warm grey ground, white panels, one campus green, and pale tiles whose ink is the dark of the same hue.
-   Flat fills, one big radius family, round buttons, no gradients, glass or resting shadows.
+/* Waypoint: a campus theme in two faces. The landing and the sign-in brand panel are deep navy with soft colour glows
+   (.navy); the app follows the OS (warm off-white in light, navy in dark). Display type is a serif (Instrument Serif),
+   eyebrows and small labels are mono (JetBrains Mono), and the desktop page nav is a centred white pill.
+   Still one campus green, and pale tiles whose ink is the dark of the same hue.
+   Flat fills, one big radius family, round buttons. Glows and the glass card are the only gradients or translucency.
    Shadow exception (on purpose, two places only): the direction sign (.sign) and the Start directions button
    (.go) each carry one soft drop shadow (taste-skill-ignore), so the sign reads as mounted over the photo and
    the main action lifts off the page. Nothing else gets a drop shadow. The active tab uses an inset box-shadow as a
@@ -20,15 +22,21 @@
    Record       .viewfinder .rec-badge
    Tokens: change colours only in :root and the dark block. */
 :root {
-  --ground: #f4f1ee;
+  --ground: #f2efea;
   --surface: #ffffff;
-  --well: #efebe7;
-  --border: #e4dfd9;
-  --rule: #eee9e4;
-  --control: #8c847c;
-  --text: #211d1a;
+  --well: #ebe6df;
+  --border: #dcd5cb;
+  --rule: #e9e3db;
+  --control: #7d756c;
+  --text: #1c1a18;
   --text-2: #3d3732;
-  --muted: #655d56;
+  --muted: #5b544d;
+  --amber-ink: #7a4f00;   /* amber eyebrow text on light ground (AA) */
+  --cta-bg: #1c1a18;      /* dark "Sign in" pill */
+  --cta-fg: #f2efea;
+  --nav-bg: #ece8e2;      /* the centred page nav pill */
+  --nav-on: #ffffff;      /* its active item */
+  --nav-fg: #1c1a18;
 
   --accent: #0b7a5e;
   --on-accent: #ffffff;
@@ -63,7 +71,11 @@
   --r-sm: 10px;
   --tap: 44px;
   --font: 'Atkinson Hyperlegible', system-ui, -apple-system, sans-serif;
-  --display: 'Bricolage Grotesque', 'Atkinson Hyperlegible', system-ui, sans-serif;
+  --display: 'Instrument Serif', 'Iowan Old Style', Georgia, serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --navy-ground: #0c1430;
+  --glow-blue: rgba(60, 110, 255, 0.22);   /* soft blue glow on the navy brand panel */
+  --glow-amber: rgba(240, 170, 60, 0.2);   /* amber glow on the navy brand panel (strengthened from 0.12) */
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);   /* expo out: the house curve for things that arrive */
   --ease-pop: cubic-bezier(0.34, 1.4, 0.64, 1); /* one mild overshoot, only for the two celebratory pops */
@@ -71,21 +83,27 @@
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --ground: #151412;
-    --surface: #211f1c;
-    --well: #2d2a26;
-    --border: #34312c;
-    --rule: #2b2824;
-    --control: #8f877e;
-    --text: #f4efe9;
-    --text-2: #d9d2c9;
-    --muted: #b3aba1;
+    --ground: #0c1430;
+    --surface: #141d3d;
+    --well: #1c2750;
+    --border: #2d3a63;
+    --rule: #222d52;
+    --control: #7d88a8;
+    --text: #f5f2ec;
+    --text-2: #dfe3ee;
+    --muted: #aeb7cc;
+    --amber-ink: #f0b54a;
+    --cta-bg: #f5f2ec;
+    --cta-fg: #0c1430;
+    --nav-bg: #f1eee9;
+    --nav-on: #ffffff;
+    --nav-fg: #1c1a18;
 
-    --accent: #4fd1a5;
-    --on-accent: #06251b;
-    --accent-soft: #17392e;
-    --accent-deep: #a4ecd2;
-    --danger: #ff8a7d;
+    --accent: #5fd6ad;
+    --on-accent: #062a1e;
+    --accent-soft: #17403a;
+    --accent-deep: #a8f0d6;
+    --danger: #ff9b8f;
     --danger-soft: #4a211d;
     --danger-deep: #ffc4bc;
     --on-danger: #2b0905;
@@ -98,10 +116,43 @@
     --hallway-bg: #38342f;  --hallway-fg: #ddd5cb;
     --landmark-bg: #4e2616; --landmark-fg: #ffcdb3;
 
-    --sign-bg: #38332e;
-    --scrim: rgba(10, 9, 8, 0.78);
+    --sign-bg: #242c48;
+    --scrim: rgba(5, 8, 20, 0.8);
     color-scheme: dark;
   }
+}
+/* The navy face, always, for the landing page and the sign-in brand panel (whatever the OS scheme). Same values as
+   the dark block above. Glows: .navy-bg. */
+.navy, .signin-brand {
+  --ground: #0c1430;
+  --surface: #141d3d;
+  --well: #1c2750;
+  --border: #2d3a63;
+  --rule: #222d52;
+  --control: #7d88a8;
+  --text: #f5f2ec;
+  --text-2: #dfe3ee;
+  --muted: #aeb7cc;
+  --amber-ink: #f0b54a;
+  --cta-bg: #f5f2ec;
+  --cta-fg: #0c1430;
+  --nav-bg: #f1eee9;
+  --nav-on: #ffffff;
+  --nav-fg: #1c1a18;
+  --accent: #5fd6ad;
+  --on-accent: #062a1e;
+  --accent-soft: #17403a;
+  --accent-deep: #a8f0d6;
+  --scrim: rgba(5, 8, 20, 0.8);
+  color: var(--text);
+  color-scheme: dark;
+}
+.navy-bg {
+  background-color: var(--ground);
+  background-image:
+    radial-gradient(60% 45% at 8% 30%, rgba(60, 110, 255, 0.28), transparent 70%),
+    radial-gradient(45% 40% at 96% 40%, rgba(240, 170, 60, 0.22), transparent 70%),
+    radial-gradient(55% 40% at 50% 100%, rgba(60, 200, 150, 0.2), transparent 70%);
 }
 
 * { box-sizing: border-box; }
@@ -114,8 +165,9 @@ body {
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
 }
-h1, h2, h3, h4 { margin: 0 0 8px; line-height: 1.15; font-family: var(--display); font-weight: 700; }
-h2 { font-size: 1.4rem; }
+h1, h2, h3, h4 { margin: 0 0 8px; line-height: 1.12; font-family: var(--display); font-weight: 400; letter-spacing: -0.01em; }
+h2 { font-size: 1.7rem; }
+h1 em, h2 em, h3 em, .display em { font-style: italic; }
 h3 { font-size: 1.15rem; display: flex; align-items: center; gap: 8px; }
 p { margin: 0 0 8px; }
 small, .muted { color: var(--muted); }
@@ -133,9 +185,10 @@ img { max-width: 100%; display: block; }
   padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
   background: var(--ground);
 }
-.brand { display: flex; align-items: center; gap: 10px; font: 800 1.3rem var(--display); color: var(--text); }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; border-radius: 8px; }
+.brand-word { font: italic 400 1.5rem/1 var(--display); letter-spacing: -0.01em; }
 .brand-mark, .brand > svg { flex: none; }
-.brand-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 50%; background: var(--accent); color: var(--on-accent); }
+.brand-mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--accent); background: transparent; color: var(--accent); }
 .brand > svg { color: var(--accent); }
 .building-picker { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 0 1 240px; color: var(--muted); }
 .building-picker select { min-width: 0; width: 100%; font-size: 0.95rem; }
@@ -154,7 +207,12 @@ img { max-width: 100%; display: block; }
 }
 .tabbar button svg { box-sizing: content-box; padding: 4px 18px; border-radius: 999px; transition: background 0.2s var(--ease); }
 .tabbar button.active { color: var(--text); }
-.tabbar button.active svg { background: var(--accent-soft); color: var(--accent-deep); box-shadow: inset 0 0 0 2px var(--accent); } /* inset ring; taste-skill-ignore */
+.tab-icon { display: flex; }
+.tabbar button.active svg { color: var(--accent-deep); }
+/* The active pill is one element (motion layoutId "tab-pill", see motion/README.md) that glides between tabs.
+   Phone: a capsule behind the icon (the icon box is 56x28: 20px icon plus 18px side padding and 4px top padding). */
+.tabbar button > :not(.tab-pill) { position: relative; z-index: 1; }
+.tab-pill { position: absolute; z-index: 0; top: 4px; left: calc(50% - 28px); width: 56px; height: 28px; border-radius: 999px; background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); pointer-events: none; } /* inset ring; taste-skill-ignore */
 @media (hover: hover) { .tabbar button:not(.active):hover { color: var(--text); } }
 
 /* ---------- controls ---------- */
@@ -170,8 +228,17 @@ button, .file-btn {
   button.danger.big:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 88%, var(--text)); }
   .floor-panel button.active:hover:not(:disabled) { background: color-mix(in srgb, var(--stairs) 88%, var(--text)); }
 }
-button:active:not(:disabled) { transform: scale(0.97); }
+/* Press squash only when the OS allows motion (reduced motion: no transform on press). */
+@media (prefers-reduced-motion: no-preference) {
+  button:active:not(:disabled) { transform: scale(0.97); }
+  /* Tab icon press: CSS only. The icon is a span, not focusable, so it must not carry motion whileTap. */
+  .tabbar button .tab-icon { transition: transform 0.14s var(--ease); }
+  .tabbar button:active:not(:disabled) .tab-icon { transform: scale(0.82); }
+}
 button:disabled { opacity: 0.5; cursor: default; }
+/* Save button: 'Saved' is a status, not a disabled action. Full contrast, non-interactive. Saving keeps the primary look. */
+.save-btn:disabled { opacity: 1; }
+.save-btn:disabled:not(.is-saving) { background: var(--accent-soft); border-color: var(--accent-soft); color: var(--accent-deep); }
 button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 @media (hover: hover) { button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 88%, var(--text)); } }
 button.ghost, .file-btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
@@ -344,7 +411,6 @@ small.error { color: var(--danger); }
 
 /* Bottom dock = route strip + step-nav, both sticky. The strip sits right on top of the nav (bottom offset = tab bar +
    nav height), so neither covers the other at any scroll; the dock background hides the step list passing behind. */
-.trip-view { --tabbar-h: calc(72px + env(safe-area-inset-bottom)); --step-nav-h: 84px; --strip-h: 76px; }
 .route-strip { list-style: none; display: flex; align-items: center; gap: 0; margin: 8px 20px 0; padding: 6px 0 26px; overflow-x: auto; scrollbar-width: thin; }
 .route-strip { position: sticky; bottom: calc(var(--tabbar-h) + var(--step-nav-h)); z-index: 5; height: var(--strip-h); background: var(--ground); box-shadow: -20px 0 var(--ground), 20px 0 var(--ground); }
 /* a focused step-list row scrolls clear of the dock and the top bar (WCAG 2.4.11). Done per row with scroll-margin, not a
@@ -547,24 +613,25 @@ html, body { overflow-x: clip; }
   .planner h1 { font-size: 3rem; }
   .content.is-nav { max-width: 640px; }
 }
-/* Desktop: tabs move up into the header so there is no bottom bar on a big screen. */
+/* Desktop (900px and up): tabs move up into the header, so there is no bottom bar on a wide screen. The header is a grid:
+   brand | tabs | account. Between 900 and 1159px the building picker drops to a second row (below). */
 @media (min-width: 900px) {
-  .topbar { padding-left: 32px; padding-right: 32px; min-height: 68px; }
-  .content { padding: 16px 32px 112px; }
+  .topbar { padding-left: 32px; padding-right: 32px; min-height: 68px; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); column-gap: 16px; align-items: center; }
+  .topbar > .brand { grid-column: 1; grid-row: 1; justify-self: start; }
+  .topbar > .tabbar { grid-column: 2; grid-row: 1; justify-self: center; } /* 1fr auto 1fr: the pill is centred on the page */
+  .topbar > .topbar-tools { grid-column: 3; grid-row: 1; justify-self: end; min-width: 0; justify-content: flex-end; flex-wrap: nowrap; }
+  .content { padding: 16px 32px 48px; }
+  .trip-view { --tabbar-h: 0px; }
+}
+/* 900 to 1159px: the picker is a second header row, so the header is two rows and the account stays on the first. */
+@media (min-width: 900px) and (max-width: 1159px) {
+  .topbar > .topbar-tools { display: contents; } /* beats the flex rule in the access section (same specificity, later) */
+  .topbar > .topbar-tools > :first-child { grid-column: 3; grid-row: 1; justify-self: end; }
+  .topbar > .topbar-tools > .building-picker { grid-column: 1 / -1; grid-row: 2; justify-self: start; width: min(260px, 100%); flex: none; }
+  html:has(.trip-view) { scroll-padding-top: 120px; }
 }
 @media (min-width: 1160px) {
-  .content { padding-bottom: 48px; }
-  .trip-view { --tabbar-h: 0px; }
   .scene img { height: clamp(200px, calc(100dvh - 378px), min(52vh, 460px)); }
-  .tabbar {
-    top: 0; bottom: auto; left: 50%; right: auto; transform: translateX(-50%); width: max-content;
-    padding: calc(10px + env(safe-area-inset-top)) 0 10px; background: transparent; border-radius: 0; gap: 6px;
-  }
-  .tabbar button { flex-direction: row; gap: 8px; min-height: var(--tap); padding: 0 18px; border-radius: 999px; font-size: 0.95rem; }
-  .tabbar button svg { padding: 0; background: none !important; width: 20px; height: 20px; }
-  .tabbar button.active { background: var(--accent-soft); color: var(--accent-deep); box-shadow: inset 0 0 0 2px var(--accent); } /* inset ring; taste-skill-ignore */
-  .tabbar button.active svg { color: var(--accent-deep); box-shadow: none; } /* inset ring; taste-skill-ignore */
-  @media (hover: hover) { .tabbar button:not(.active):hover { background: var(--well); } }
 }
 
 /* ---------- motion ----------
@@ -590,6 +657,9 @@ html, body { overflow-x: clip; }
 .content > :nth-child(2) { --n: 1; } .content > :nth-child(3) { --n: 2; } .content > :nth-child(4) { --n: 3; }
 .content > :nth-child(5) { --n: 4; } .content > :nth-child(6) { --n: 5; } .content > :nth-child(n+7) { --n: 6; }
 .content.is-nav > * { animation: none; } /* directions stage their own entrances */
+/* After the first tab switch the blocks appear at once (App sets .no-rise): the tab swap is then ~280 ms and content is
+   stable within the 350 ms budget. The rise stays on the first app load. */
+.content.no-rise > * { animation: none; }
 .tabbar button.active svg { animation: tab-pop 0.4s var(--ease-out); }
 @keyframes tab-pop { from { transform: scale(0.8); } }
 .brand-mark svg { animation: compass-spin 0.9s var(--ease-out) 0.1s backwards; }
@@ -616,7 +686,7 @@ html, body { overflow-x: clip; }
 }
 @keyframes walk { 0% { offset-distance: 0%; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { offset-distance: 100%; opacity: 0; } }
 .trip-line i.from { position: relative; }
-.trip-line i.from::after { content: ''; position: absolute; inset: -7px; border-radius: 50%; border: 2px solid var(--accent); animation: ping 2.2s var(--ease-out) infinite; }
+.trip-line i.from::after { content: ''; position: absolute; inset: -7px; border-radius: 50%; border: 2px solid var(--accent); animation: ping 2.2s var(--ease-out) 3; }  /* 3 pulses, then still; the from dot is keyed by start so a new start pulses again */
 .place-picker-list { animation: pop-in 0.18s var(--ease-out) backwards; transform-origin: top center; }
 .place-options li { animation: rise-sm 0.22s var(--ease-out) backwards; }
 .place-options li:nth-child(2) { animation-delay: 20ms; } .place-options li:nth-child(3) { animation-delay: 40ms; }
@@ -700,7 +770,7 @@ html, body { overflow-x: clip; }
 .route-strip li.done::after, .route-strip li.now::after { transform: translateY(-50%) scaleX(1); }
 .route-strip li.now i { animation: dot-pop 0.45s var(--ease-pop); }
 @keyframes dot-pop { from { transform: scale(0.5); } }
-.route-strip li.now i::after { content: ''; position: absolute; inset: -9px; border-radius: 50%; border: 2px solid var(--accent); animation: ping 1.8s var(--ease-out) infinite; }
+.route-strip li.now i::after { content: ''; position: absolute; inset: -9px; border-radius: 50%; border: 2px solid var(--accent); animation: ping 1.8s var(--ease-out) 3; }  /* 3 pulses per arrival at this step (the class re-added restarts it) */
 
 /* arrival: confetti from the pin */
 .confetti { position: absolute; left: 52px; top: 50%; width: 0; height: 0; z-index: 3; pointer-events: none; }
@@ -718,7 +788,7 @@ html, body { overflow-x: clip; }
 .schematic .edge:not(.vertical) { stroke-dasharray: 1; animation: draw 0.6s ease-out backwards; animation-delay: calc(var(--i, 0) * 24ms); }
 .schematic .edge.active:not(.vertical) { animation: draw 0.45s ease-out; }
 .schematic .edge.vertical { animation: fade-in 0.5s ease backwards; animation-delay: calc(var(--i, 0) * 24ms); }
-.schematic .sel-ring { fill: none; stroke: var(--accent); stroke-width: 0.06; pointer-events: none; transform-box: fill-box; transform-origin: center; animation: sel-ping 1.8s var(--ease-out) infinite; }
+.schematic .sel-ring { fill: none; stroke: var(--accent); stroke-width: 0.06; pointer-events: none; transform-box: fill-box; transform-origin: center; animation: sel-ping 1.8s var(--ease-out) 2; }  /* 2 pulses; the ring is re-mounted on each new selection, which restarts it */
 @keyframes sel-ping { from { opacity: 0.8; transform: scale(1); } to { opacity: 0; transform: scale(2.6); } }
 .node-card { animation: rise 0.4s var(--ease-out) backwards; animation-delay: calc(var(--i, 0) * 35ms); transition: background 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.2s var(--ease-out); }
 @media (hover: hover) { .node-card:hover { transform: translateY(-3px); } }
@@ -762,7 +832,7 @@ html, body { overflow-x: clip; }
 
 /* ---------- access: invites, owner key, sign out, sharing ---------- */
 [hidden] { display: none !important; } /* the attribute must win over the display rules below */
-.topbar-tools { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.topbar-tools { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
 .topbar-tools .building-picker { flex: 0 1 220px; min-width: 150px; }
 .pill.role-viewer { background: var(--hallway-bg); color: var(--hallway-fg); }
 .pill.role-editor { background: var(--room-bg); color: var(--room-fg); }
@@ -874,4 +944,217 @@ html, body { overflow-x: clip; }
   .no-print { display: none !important; }
   .poster-sheet { width: 100%; max-width: none; padding: 0; border-radius: 0; box-shadow: none; }
   .poster-qr { width: 120mm; }
+}
+
+/* Contributor sign-in (email link). Identity only: browsing never shows these. */
+.account-btn, .account-chip { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-size: 0.9rem; color: var(--text-2); }
+.account-btn { min-height: var(--tap); padding: 6px 12px; border: 1.5px solid var(--border); }
+.account-email { flex: 0 1 auto; min-width: 72px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-chip { max-width: 100%; }
+.account-out { min-height: 36px; padding: 4px 8px; color: var(--accent-deep); flex: none; white-space: nowrap; }
+.signin-scrim { position: fixed; inset: 0; z-index: 60; display: grid; place-items: end center; padding: 16px; background: rgba(33, 29, 26, 0.4); }
+.signin-sheet { width: 100%; max-width: 420px; }
+.signin-sheet form .row { align-items: stretch; }
+.signin-sheet form .field { flex: 1 1 auto; min-width: 0; margin: 0; } /* no 12 px margin: the button stretches to the input height */
+.signin-sheet .notice { margin-bottom: 0; }
+.signin-sheet form .row > button { flex: none; white-space: nowrap; } /* 'Send link' stays on one line at 390 px */
+.field-label { display: block; margin: 12px 0 6px; font-weight: 700; color: var(--text-2); }
+
+/* ---------- shared motion layer (frontend/src/motion, see motion/README.md) ---------- */
+/* Focus: a soft accent glow on text-like fields while focused by keyboard. The global :focus-visible outline above
+   stays on, so the ring is never replaced by the glow. Transitions use box-shadow and border-color only. */
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])), select, textarea {
+  transition: box-shadow 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+input:where(:not([type='checkbox'], [type='radio'], [type='file'])):focus-visible,
+select:focus-visible,
+textarea:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+
+/* Building picker while the list loads or after a switch: a skeleton covers it (the .sk shimmer). */
+.building-picker { position: relative; }
+.picker-skel { position: absolute; top: 0; right: 0; bottom: 0; left: 0; border-radius: 999px; pointer-events: none; }
+
+/* Dock heights (trip view on phone). Global so the toast region, which sits outside .trip-view, can use them too.
+   Tab bar 72 px (plus safe area), step nav 84 px, route strip 76 px. */
+:root { --tabbar-h: calc(72px + env(safe-area-inset-bottom)); --step-nav-h: 84px; --strip-h: 76px; }
+
+/* Toasts: region is always in the DOM (aria-live="polite"). Phone: above the tab bar. Desktop: under the top bar. */
+.toast-region {
+  position: fixed; z-index: 80; left: 0; right: 0; bottom: calc(84px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 16px; pointer-events: none;
+}
+.toast {
+  pointer-events: auto; display: flex; align-items: center; gap: 10px; width: 100%; max-width: 420px;
+  padding: 8px 8px 8px 14px; border-radius: var(--r-md); background: var(--well); color: var(--text-2);
+}
+.toast-success { background: var(--accent-soft); color: var(--accent-deep); }
+.toast-error { background: var(--danger-soft); color: var(--danger-deep); }
+.toast-icon { flex: none; }
+.toast-text { flex: 1; min-width: 0; font-weight: 700; font-size: 0.95rem; overflow-wrap: anywhere; }
+.toast-close { flex: none; min-width: var(--tap); min-height: var(--tap); padding: 0; color: inherit; }
+/* Trip view on phone: the bottom dock (route strip + step nav, sticky above the tab bar) sits above the tab bar.
+   Lift the toasts above it so they never cover Next/Back: tab bar + step nav + route strip + an 8 px gap
+   (72 + 84 + 76 + 8 = 240 px at no safe area). The heights come from the dock tokens in :root above. */
+@media (max-width: 1159px) {
+  :root:has(.trip-view) .toast-region { bottom: calc(var(--tabbar-h) + var(--step-nav-h) + var(--strip-h) + 8px); }
+}
+@media (min-width: 900px) {
+  .toast-region { top: calc(76px + env(safe-area-inset-top)); bottom: auto; }
+}
+
+/* ---------- theme pass: landing, sign-in, page nav, pill CTA ---------- */
+/* Dark OS scheme: the app ground gets the same navy glow as the landing (the light scheme stays plain warm off-white). */
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: #0c1430;
+    background-image:
+      radial-gradient(60% 45% at 8% 30%, rgba(60, 110, 255, 0.28), transparent 70%),
+      radial-gradient(45% 40% at 96% 40%, rgba(240, 170, 60, 0.22), transparent 70%),
+      radial-gradient(55% 40% at 50% 100%, rgba(60, 200, 150, 0.2), transparent 70%);
+    background-attachment: fixed;
+  }
+}
+.navy { min-height: 100vh; min-height: 100dvh; }
+.navy .topbar { background: transparent; }
+
+/* Top bar pieces */
+.topbar { flex-wrap: wrap; row-gap: 8px; }
+
+/* Account chip (AccountChip.jsx, unchanged): signed out, the Sign in button is the dark pill; signed in, a quiet chip. */
+/* Signed out: "Sign in" is a link to #/sign-in, drawn as the dark pill. */
+.account-signin { background: var(--cta-bg); color: var(--cta-fg); border-color: var(--cta-bg); border-radius: 999px; white-space: nowrap; flex: none; text-decoration: none; }
+@media (hover: hover) { .account-signin:hover { opacity: 0.9; } }
+.sheet-alt { margin: 16px 0 0; font-size: 0.9rem; }
+.account-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 4px 6px 4px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); color: var(--text-2); font-size: 0.88rem; max-width: 100%; }
+.account-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 14ch; }
+.account-out { min-height: 32px; padding: 4px 10px; font-size: 0.85rem; }
+.account-btn { min-height: 40px; }
+
+/* Tab bar. Below 900px: a bottom bar on the app routes only (the landing and sign-in pages have none below 1160px; the
+   landing links to every place itself). From 900px: a centred pill inside the header, between brand and account. The
+   nav is rendered in one place only (App.jsx), so tests and screen readers see one nav either way. */
+.tabbar { border-top: 1px solid var(--border); }
+.tabbar button { font-family: var(--font); }
+@media (min-width: 900px) {
+  .tabbar {
+    position: static; top: auto; bottom: auto; left: auto; right: auto; transform: none; width: auto; z-index: auto;
+    display: grid; grid-auto-flow: column; grid-auto-columns: auto; justify-content: center;
+    border: 0; border-radius: 999px; padding: 4px; gap: 2px; background: var(--nav-bg);
+  }
+  .tabbar button { flex-direction: row; gap: 8px; min-height: 38px; padding: 6px 14px; border-radius: 999px; font: 500 0.92rem var(--font); color: #4a443e; }
+  .tabbar button svg { display: none; }
+  .tabbar button > .tab-icon { display: none; }
+  .tabbar button.active { color: var(--nav-fg); font-weight: 700; }
+  .tabbar button:hover:not(.active) { background: rgba(28, 26, 24, 0.07); }
+  .tab-pill { left: 0; top: 0; right: 0; bottom: 0; width: auto; height: auto; border-radius: 999px; background: var(--nav-on); box-shadow: inset 0 0 0 1px rgba(28, 26, 24, 0.1); } /* taste-skill-ignore: hairline ring */
+}
+
+/* Eyebrow chip: mono, uppercase, small. */
+.eyebrow-chip {
+  display: inline-flex; align-items: center; gap: 8px; width: max-content; max-width: 100%; margin: 0 0 22px;
+  padding: 8px 12px; border-radius: 999px; border: 1px solid var(--border);
+  font: 500 0.7rem/1.2 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted);
+}
+.eyebrow-soft { border-color: transparent; padding-left: 0; margin-bottom: 10px; }
+.eyebrow-amber { font: 500 0.72rem/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber-ink); margin: 0 0 14px; }
+
+/* Pills: anchors and buttons that read as pills. Outline by default, solid for the main action. */
+.pill, .pill-row a, button.pill {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 10px 18px; border-radius: 999px;
+  border: 1.5px solid var(--control); background: transparent; color: var(--text); text-decoration: none;
+  font: 500 0.95rem var(--font); cursor: pointer;
+}
+.pill:hover, button.pill:hover { background: var(--well); }
+.pill-solid, .pill-solid:hover { background: var(--cta-bg); color: var(--cta-fg); border-color: var(--cta-bg); }
+.pill-sub { font: 500 0.7rem var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+
+/* Landing */
+.content.landing { max-width: 1040px; gap: 0; padding: 32px 20px 140px; }
+.landing .hero, .landing .chooser, .landing .glass-card { width: 100%; max-width: 820px; margin: 0 auto 56px; }
+.landing .hero { padding-top: 40px; }
+.landing h1.display { font-size: clamp(2.8rem, 7.4vw, 5.4rem); line-height: 1.02; margin: 0 0 20px; color: var(--text); }
+.lead { font-size: 1.08rem; color: var(--muted); max-width: 46ch; margin: 0 0 28px; }
+.pill-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.section-title { font-size: 1.6rem; margin: 0 0 12px; }
+.building-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
+.building-list .pill { font-size: 0.92rem; }
+
+.glass-card {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 20px 32px; padding: 24px; border-radius: var(--r-xl);
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+}
+.glass-head { flex: 1 1 260px; min-width: 0; }
+.card-title { font-size: 1.7rem; margin: 0; }
+.how-steps { list-style: none; margin: 0; padding: 0; flex: 2 1 340px; display: flex; flex-wrap: wrap; gap: 10px 18px; font: 1.1rem var(--display); color: var(--text-2); }
+.how-steps li { display: flex; align-items: baseline; gap: 8px; }
+.how-steps li + li::before { content: '—'; color: var(--muted); margin-right: 10px; }
+.step-num { font: 500 0.72rem var(--mono); letter-spacing: 0.08em; color: var(--amber-ink); }
+.glass-card .pill-solid { margin-left: auto; }
+
+/* Sign-in page: split screen */
+.signin-page { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-columns: 1fr; background: var(--ground); }
+@media (min-width: 900px) { .signin-page { grid-template-columns: 1fr 1fr; } }
+.signin-brand {
+  position: relative; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; gap: 32px;
+  padding: 28px 40px 24px; color: var(--text); background-color: var(--navy-ground);
+  background-image:
+    radial-gradient(60% 45% at 8% 30%, var(--glow-blue), transparent 70%),
+    radial-gradient(45% 40% at 100% 90%, var(--glow-amber), transparent 70%);
+}
+.brand-light .brand-mark { color: var(--accent); }
+.signin-brand-copy { position: relative; z-index: 1; margin-top: auto; }
+.brand-headline { font: 400 clamp(2rem, 3.6vw, 3.1rem) / 1.08 var(--display); color: var(--text); margin: 0 0 16px; max-width: 16ch; }
+.brand-headline em { font-style: italic; color: var(--amber-ink); }
+.brand-body { color: var(--muted); max-width: 40ch; margin: 0; font-size: 0.98rem; }
+.mono-foot { position: relative; z-index: 1; margin: 0; font: 400 0.68rem/1.4 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.rings { position: absolute; right: -30%; top: 50%; width: 120%; aspect-ratio: 1; transform: translateY(-50%); pointer-events: none; }
+.rings span { position: absolute; inset: 0; border-radius: 50%; border: 1px solid color-mix(in srgb, var(--text) 10%, transparent); }
+.rings span:nth-child(2) { inset: 14%; }
+.rings span:nth-child(3) { inset: 28%; }
+.signin-panel {
+  --ground: #f2efea; --surface: #ffffff; --well: #ebe6df; --border: #dcd5cb; --rule: #e9e3db; --control: #7d756c;
+  --text: #1c1a18; --text-2: #3d3732; --muted: #5b544d; --amber-ink: #7a4f00;
+  --accent: #0b7a5e; --on-accent: #ffffff; --accent-soft: #d3f0e4; --accent-deep: #064a38;
+  --cta-bg: #1c1a18; --cta-fg: #f2efea;
+  display: flex; align-items: center; justify-content: center; padding: 56px 24px; background: var(--ground); color: var(--text);
+  color-scheme: light;
+}
+.signin-form { width: 100%; max-width: 380px; }
+.segmented { display: inline-flex; gap: 2px; padding: 4px; border-radius: 999px; background: var(--well); border: 1px solid var(--border); margin-bottom: 36px; }
+.segmented button { min-height: 36px; padding: 6px 14px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font: 500 0.9rem var(--font); gap: 6px; }
+.segmented button svg { flex: none; }
+.segmented button:hover:not(:disabled) { background: rgba(28, 26, 24, 0.06); }
+.segmented button.seg-on { background: var(--surface); color: var(--text); font-weight: 700; box-shadow: inset 0 0 0 1px var(--border); } /* taste-skill-ignore: hairline ring */
+.signin-form h1.display { font-size: clamp(2.2rem, 4vw, 2.9rem); margin: 0 0 10px; color: var(--text); }
+.signin-form h1 em { color: var(--text); }
+.signin-form .muted { margin: 0 0 22px; font-size: 0.96rem; }
+.signin-form .field-label { display: block; font-size: 0.9rem; font-weight: 700; margin: 0 0 6px; }
+.signin-form .field { width: 100%; background: var(--surface); }
+.btn-black, button.btn-black {
+  display: flex; width: 100%; align-items: center; justify-content: center; gap: 10px; min-height: 52px; margin-top: 12px;
+  border: 0; border-radius: 999px; background: var(--cta-bg); color: var(--cta-fg); text-decoration: none; font: 600 1rem var(--font);
+}
+.btn-black:hover, button.btn-black:hover:not(:disabled) { background: color-mix(in srgb, var(--cta-bg) 86%, var(--cta-fg)); color: var(--cta-fg); }
+button.btn-black:disabled { opacity: 0.6; }
+.sent-note p { margin-bottom: 8px; }
+.sent-title { font-size: 1.7rem; margin: 0 0 10px; }
+.sent-title:focus { outline-offset: 4px; }
+.fine-action { margin-top: 12px; padding-left: 0; }
+.fine { font-size: 0.8rem; color: var(--muted); margin: 22px 0 0; }
+.back-link { display: inline-block; margin-top: 14px; color: var(--text-2); font-size: 0.9rem; }
+
+@media (max-width: 899px) {
+  .signin-brand { padding: 20px 20px 22px; gap: 16px; min-height: 0; }
+  .signin-brand-copy { margin-top: 12px; }
+  .brand-headline { font-size: 1.9rem; margin-bottom: 0; }
+  .brand-body, .mono-foot, .rings { display: none; }
+  .signin-panel { padding: 32px 20px 56px; align-items: flex-start; }
+}
+@media (max-width: 759px) {
+  .topbar-landing .building-picker { display: none; }
+  .content.landing { padding: 16px 16px 120px; }
+  .landing .hero { padding-top: 24px; }
+  .glass-card .pill-solid { margin-left: 0; }
 }

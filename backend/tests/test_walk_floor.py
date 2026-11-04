@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app import config, gemma, mapper, store
 from app.main import app
 from app.schemas import Edge, MapBundle, Node, VideoInfo
+from tests.auth_helpers import owner_headers
 
 
 def _quiet(*_):
@@ -113,7 +114,7 @@ def client(tmp_path, monkeypatch):
     b = _adopted()
     b.building_id = bid
     store.save_map(b)
-    return TestClient(app), bid
+    return TestClient(app, headers=owner_headers()), bid  # PATCH /videos is owner only
 
 
 def _patch(c, bid, vid, floor):
@@ -207,6 +208,6 @@ def test_upload_out_of_range_start_floor(client, floor, monkeypatch):
     called = []
     monkeypatch.setattr(jobs, "submit_video", lambda *a, **k: called.append(k))
     r = c.post(f"/api/buildings/{bid}/videos", files={"video": ("w.mp4", b"x", "video/mp4")},
-               data={"start_floor": floor})
+               data={"start_floor": floor}, headers=owner_headers())
     assert r.status_code == 422, r.text
     assert called == []

@@ -1,5 +1,5 @@
 // "Something's wrong" reports: the words shown for each kind, the limits the server enforces, and the message for each
-// refused send. Used by the directions panel (ReportIssue) and the editors' list (ReportsSection).
+// refused send. Used by the directions panel (ReportIssue) and the reports list (ReportsSection).
 import { detail } from './api'
 
 export const REPORT_KINDS = [
@@ -19,12 +19,6 @@ export const RESOLUTION_NOTE_MAX = 300
 export const THANKS = "Thanks, the map's editors will check this"
 export const TOO_MANY = "You've sent a lot of reports, try again later"
 export const REPORTS_FULL = 'Reports are full for this building'
-
-// Who sent a report, shown only as "Owner" or "Invite abcd" (the first four characters of the invite id).
-export function reporterName(id) {
-  if (!id) return ''
-  return id === 'owner' ? 'Owner' : `Invite ${String(id).slice(0, 4)}`
-}
 
 // The message for a failed send. 429 and 507 have fixed wording; 422 shows the server's detail, naming the field when
 // the server gives one. Anything else falls back to the shared message in api.js. Request headers never reach here.
