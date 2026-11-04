@@ -1,0 +1,58 @@
+/* Contributor and owner pages (ContributePage.jsx, OwnerPage.jsx). Uses the global tokens from styles.css; no new theme values. */
+
+.ow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; }
+.ow-head { display: grid; gap: 10px; }
+.ow-head h2 { display: flex; align-items: center; gap: 8px; margin: 0; }
+.ow .view-switch { display: flex; flex-wrap: wrap; max-width: 100%; gap: 4px; }
+.ow-prompt .primary.big { margin-top: 12px; }
+.ow-record h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; }
+
+.ow-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.ow-upload, .ow-building { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: var(--r-md); background: var(--well); flex-wrap: wrap; }
+.ow-building.is-current { box-shadow: inset 0 0 0 2px var(--accent); }
+.ow-upload-main { display: grid; gap: 2px; min-width: 0; }
+.ow-upload-main b { overflow-wrap: anywhere; }
+.ow-reason { overflow-wrap: anywhere; }
+.ow-reason.rejected { color: var(--danger-deep); }
+
+/* Friendly status chips. The colours are the existing status pills. */
+.ow-chip { display: inline-flex; align-items: center; gap: 4px; min-height: 24px; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; white-space: nowrap; background: var(--hallway-bg); color: var(--hallway-fg); }
+.ow-chip.processing { background: var(--room-bg); color: var(--room-fg); }
+.ow-chip.live, .ow-chip.approved { background: var(--exit-bg); color: var(--exit-fg); }
+.ow-chip.review, .ow-chip.pending { background: var(--stairs-bg); color: var(--stairs-fg); }
+.ow-chip.rejected { background: var(--noexit-bg); color: var(--noexit-fg); }
+.ow-chip.hidden, .ow-chip.other { background: var(--hallway-bg); color: var(--hallway-fg); }
+
+.danger-soft { background: var(--danger-soft); color: var(--danger-deep); border-color: transparent; }
+.danger-solid { background: var(--danger); color: var(--on-danger); border-color: transparent; }
+.button-link { display: inline-flex; align-items: center; min-height: 44px; padding: 0 16px; border-radius: var(--r-md); background: var(--accent); color: var(--on-accent); text-decoration: none; font-weight: 700; }
+
+/* Moderation */
+.ow-mod { min-width: 0; }
+.ow-mod h3 { margin: 0; }
+.ow-mod > .row.spread { flex-wrap: wrap; gap: 8px; }
+.ow-cards { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 12px; min-width: 0; }
+.ow-cards > li { min-width: 0; }
+.ow-card { background: var(--well); border-radius: var(--r-md); padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.ow-frames { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.ow-frames[data-count="1"] { grid-template-columns: 1fr; }
+.ow-frame { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: var(--r-sm); background: var(--surface); }
+.ow-frames .nophoto { aspect-ratio: 4 / 3; border-radius: var(--r-sm); }
+.ow-card-body { display: grid; gap: 6px; }
+.ow-file { overflow-wrap: anywhere; }
+.ow-bot { margin: 0; font-size: 0.92rem; }
+.ow-actions { margin-top: 4px; }
+
+/* Users */
+.ow-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.ow-table th, .ow-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--well); vertical-align: middle; }
+.ow-table td .ow-chip { margin-left: 6px; }
+.ow-table tr.is-blocked td:first-child { color: var(--muted); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .ow-frame { transition: opacity var(--dur-fast, 0.14s) ease; }
+}
+
+/* The Users table scrolls sideways inside this box. Positioned, so an sr-only label in a header cell cannot escape
+   it and widen the page (390px overflow). */
+.table-scroll { position: relative; }

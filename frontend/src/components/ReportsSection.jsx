@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
 import { Flag, MapPin, RefreshCw, RotateCcw, Check } from 'lucide-react'
 import { api, detail } from '../api'
-import { KIND_LABEL, RESOLUTION_NOTE_MAX, reporterName } from '../reports'
+import { KIND_LABEL, RESOLUTION_NOTE_MAX } from '../reports'
+import { SegButton } from './MapMotion'
+import { stillMode } from '../motion/map'
 
-// Editors and owners only (MapReview is only offered to them). Newest first, with a filter, and each item keeps its
-// history. Resolving or reopening calls onCountChanged so the open count (here and on the Map tab) is fetched again.
+// Newest first, with a filter, and each item keeps its history. Reports carry no reporter: nobody signs in.
 const FILTERS = [
   { id: 'open', label: 'Open' },
   { id: 'resolved', label: 'Resolved' },
@@ -25,12 +27,13 @@ const when = (iso) => {
     : d.toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
 
-export default function ReportsSection({ building, nodes, openCount, onCountChanged, onShowNode }) {
+export default function ReportsSection({ building, nodes, onShowNode }) {
   const [filter, setFilter] = useState('open')
   const [items, setItems] = useState(null) // null while the list loads
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [busy, setBusy] = useState('') // id of the report being changed
+  const [leaving, setLeaving] = useState(() => new Set()) // reports that were just resolved or reopened: they animate out before the reload
   const [fixing, setFixing] = useState(null) // { id, note } while the "Mark fixed" field is open
   const busyRef = useRef(false)
   const seq = useRef(0) // only the newest list request may change the screen
@@ -45,7 +48,7 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
     return api
       .reports(building, { status: filter, limit: LIMIT })
       .then((list) => {
-        if (mine === seq.current) setItems(Array.isArray(list) ? list : [])
+        if (mine === seq.current) { setItems(Array.isArray(list) ? list : []); setLeaving(new Set()) }
       })
       .catch((e) => {
         if (mine === seq.current) setError(detail(e))
@@ -81,7 +84,9 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
       .then(() => {
         setFixing(null)
         setStatus(done)
-        return load().then(() => onCountChanged?.())
+        // On the open or resolved lists the report leaves this list when it changes: let it animate out first.
+        if (filter !== 'all') setLeaving((cur) => new Set(cur).add(r.id))
+        return load()
       })
       .catch((e) => setError(detail(e)))
       .finally(() => {
@@ -114,16 +119,12 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
       <div className="row spread reports-head">
         <h3 id="reports-title">
           <Flag size={18} aria-hidden="true" /> Reports
-          {typeof openCount === 'number' && (
-            <span className={`count-badge ${openCount > 0 ? 'has-open' : ''}`}>{openCount} open</span>
-          )}
         </h3>
         <div className="view-switch" role="group" aria-label="Show reports">
           {FILTERS.map((f) => (
-            <button key={f.id} type="button" className={filter === f.id ? 'active' : ''} aria-pressed={filter === f.id}
-              onClick={() => setFilter(f.id)}>
+            <SegButton key={f.id} id="reports-pill" active={filter === f.id} onClick={() => setFilter(f.id)}>
               {f.label}
-            </button>
+            </SegButton>
           ))}
         </div>
       </div>
@@ -143,14 +144,16 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
       {items?.length === 0 && <p className="muted reports-empty">{EMPTY[filter]}</p>}
 
       {items?.length > 0 && (
-        <ul className="report-list" aria-label={`${FILTERS.find((f) => f.id === filter)?.label} reports`}>
-          {items.map((r) => {
-            const who = reporterName(r.reporter)
+        <ul key={filter} className="report-list" aria-label={`${FILTERS.find((f) => f.id === filter)?.label} reports`}>
+          <AnimatePresence initial={false} mode="popLayout">
+          {items.filter((r) => !leaving.has(r.id)).map((r) => {
             const exists = !!r.node_id && nodeById.has(r.node_id)
             const isFixing = fixing?.id === r.id
             const isBusy = busy === r.id
             return (
-              <li key={r.id} className={`report-item is-${r.status}`}>
+              <motion.li key={r.id} layout={stillMode() ? false : 'position'} className={`report-item is-${r.status}`}
+                exit={stillMode() ? { opacity: 0 } : { opacity: 0, x: 24, height: 0, paddingTop: 0, paddingBottom: 0, marginTop: -10 }}
+                transition={{ duration: 0.26, ease: [0.22, 1, 0.36, 1] }} style={{ overflow: 'hidden' }}>
                 <div className="report-main">
                   <p className="report-kind">
                     <b>{KIND_LABEL[r.kind] || r.kind}</b>
@@ -163,7 +166,6 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
                   {r.note && <blockquote className="report-note-text">{r.note}</blockquote>}
                   <p className="muted report-meta">
                     <time dateTime={r.created_at}>{when(r.created_at)}</time>
-                    {who && <span className="report-who"> · {who}</span>}
                   </p>
                   {r.status === 'resolved' && r.resolution_note && (
                     <p className="report-resolution">Fix: {r.resolution_note}</p>
@@ -171,8 +173,8 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
                 </div>
 
                 <div className="report-actions row wrap">
-                  {exists && (
-                    <button type="button" className="ghost" onClick={() => onShowNode?.(r.node_id)} disabled={isBusy}>
+                  {exists && onShowNode && (
+                    <button type="button" className="ghost" onClick={() => onShowNode(r.node_id)} disabled={isBusy}>
                       Show on map
                     </button>
                   )}
@@ -213,16 +215,16 @@ export default function ReportsSection({ building, nodes, openCount, onCountChan
                       {r.history.map((h, k) => (
                         <li key={k}>
                           {HISTORY_WORD[h.status] || h.status} · <time dateTime={h.at}>{when(h.at)}</time>
-                          {reporterName(h.by) && <> · {reporterName(h.by)}</>}
                           {h.resolution_note && <> · {h.resolution_note}</>}
                         </li>
                       ))}
                     </ol>
                   </details>
                 )}
-              </li>
+              </motion.li>
             )
           })}
+          </AnimatePresence>
         </ul>
       )}
       {items?.length >= LIMIT && <p className="muted reports-empty">Showing the newest {LIMIT}.</p>}

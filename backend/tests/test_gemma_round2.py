@@ -13,6 +13,7 @@ from PIL import Image
 
 from app import config, gemma, jobs, mapper, motion, ocr, store, video
 from app.schemas import FrameAnalysis, GemmaFrame, Keyframe, MapBundle, Node, SamePlace, VideoInfo
+from tests.auth_helpers import owner_headers
 
 FRAME = {"texts": [], "room_numbers": [], "has_sign": False, "suggested_label": "Hallway", "place_type": "hallway",
          "stairs": "none", "floor_hint": "", "description": "plain hall"}
@@ -96,8 +97,8 @@ def bid(tmp_path, monkeypatch):
     return store.create_building("Gemma Hall").building_id
 
 
-def _kfs(bid, vid="v", n=3):
-    frames = store.frames_dir(bid)
+def _kfs(bid, vid="v", n=3, frames_out=None):
+    frames = frames_out or store.frames_dir(bid)
     frames.mkdir(parents=True, exist_ok=True)
     out = []
     for i in range(n):
@@ -110,13 +111,17 @@ def _fake_video_stages(monkeypatch, bid, vid="v"):
     monkeypatch.setattr(video, "normalize", lambda src, d: (d / "analysis.mp4", d / "hq.mp4", 3.0))
     monkeypatch.setattr(motion, "compute_track", lambda *_a, **_k: {"t": [0.0, 1.0]})
     monkeypatch.setattr(motion, "detect_events", lambda _t: [])
-    monkeypatch.setattr(jobs, "select_keyframes", lambda *_a, **_k: _kfs(bid, vid))
+    # select_keyframes writes into the folder the pipeline passes (the walk's staging folder)
+    monkeypatch.setattr(jobs, "select_keyframes",
+                        lambda _hq, _track, _events, _dur, _vid, frames_out, **_k: _kfs(bid, vid, frames_out=frames_out))
 
 
 def _add_video(bid, vid="v", status="queued"):
     with store.lock_for(bid):
         bundle = store.load_map(bid)
-        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status=status))
+        # a processed walk on the map is approved (rebuilds only take approved walks)
+        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status=status,
+                                       moderation_status="approved" if status == "done" else "pending"))
         store.save_map(bundle)
     vdir = store.video_dir(bid, vid)
     vdir.mkdir(parents=True, exist_ok=True)
@@ -521,7 +526,7 @@ def test_manual_frame_analysis_error_is_not_a_500(tmp_path, monkeypatch, err):
     buf = io.BytesIO()
     Image.new("RGB", (32, 24), (200, 30, 30)).save(buf, "JPEG")
     r = TestClient(app).post(f"/api/buildings/{b}/frames/manual", files={"image": ("p.jpg", buf.getvalue(), "image/jpeg")},
-                             data={"label": ""})
+                             data={"label": ""}, headers=owner_headers())
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["node"]["label"] == "Manual photo" and "warning" in body

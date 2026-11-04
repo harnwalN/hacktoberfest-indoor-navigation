@@ -48,3 +48,5 @@ frontend/.vite/
 # Cloudflare tunnel start script (scripts/share.sh): local env file with tunnel names, and run logs
 scripts/share.env
 /logs/
+
+backups/

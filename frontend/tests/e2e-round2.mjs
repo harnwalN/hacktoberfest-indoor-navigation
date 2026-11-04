@@ -222,7 +222,7 @@ for (const scheme of ['light', 'dark']) {
     const bg = async () => page.evaluate(() => getComputedStyle(document.body).backgroundColor)
     await page.goto(`${BASE}/#/build?b=b1`); await page.waitForSelector('.tabbar'); await page.waitForTimeout(300)
     const bgBuild = await bg()
-    for (const tab of ['Map', 'Directions', 'Record', 'Build']) {
+    for (const tab of ['Map', 'Directions', 'Record', 'Contribute']) { // Build is Contribute for visitors now
       await page.click(`.tabbar >> text=${tab}`); await page.waitForTimeout(400)
     }
     await page.goto(`${BASE}/#/navigate?b=b1&from=r112&to=r201`); await page.reload(); await page.waitForSelector('.trip-view')

@@ -56,7 +56,7 @@ def test_stairs_flip(bundle):
 
 
 def test_direction_correct_photos(bundle):
-    def path(url):  # frame URLs carry ?exp=&sig=; the photo name is what these checks are about
+    def path(url):  # the photo name is what these checks are about
         return url.split("?")[0]
 
     up = routing.route(bundle, "A", "T")

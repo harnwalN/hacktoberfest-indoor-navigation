@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app import config, router, store
 from app.schemas import Edge, Node, SuggestedMerge, VideoInfo
+from tests.auth_helpers import owner_headers
 
 
 @pytest.fixture
@@ -34,7 +35,8 @@ def env(tmp_path, monkeypatch):
         SuggestedMerge(id="m1", keep="n001", remove="n003", confidence=0.6, reason="same sign"),
     ]
     store.save_map(bundle)
-    return {"client": TestClient(app), "bid": bundle.building_id}
+    # PUT /map is owner only; every request from this client carries an owner session.
+    return {"client": TestClient(app, headers=owner_headers()), "bid": bundle.building_id}
 
 
 def _get(env) -> dict:
@@ -78,7 +80,7 @@ def test_stale_videos_and_processed_with_are_ignored(env):
     assert disk.processed_with == before.processed_with
     assert disk.name == before.name and disk.building_id == env["bid"]
     assert next(n for n in disk.nodes if n.id == "n002").label == "Room 102"  # the editor edit still lands
-    assert r.json()["map"]["videos"] == [v.model_dump() for v in before.videos]
+    assert r.json()["map"]["videos"] == [v.model_dump(exclude={"uploader_email", "moderated_by"}) for v in before.videos]
 
 
 def test_frontend_style_body_without_server_fields(env):

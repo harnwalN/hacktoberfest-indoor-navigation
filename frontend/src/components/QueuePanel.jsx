@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import FlowNumber from './FlowNumber'
 import { CheckCircle2, ListOrdered, Pause, Play, SkipForward, X } from 'lucide-react'
 import { api, detail } from '../api'
+import { useAuth } from './AuthContext'
 
 // Processing queue: one video runs at a time. Pause/resume any job, or "Run next" to jump the queue
 // (the running video pauses and resumes right after; Gemma answers are cached so nothing is lost).
@@ -12,6 +14,7 @@ export default function QueuePanel({ building, selected, onSelect }) {
   // Jobs this panel has watched running. When one finishes it keeps its row footprint (full bar + "Finished"
   // in place of Pause), so the row doesn't collapse and shove the "Map is ready" card up the screen.
   const watched = useRef(new Set())
+  const { requireSignIn } = useAuth()
 
   useEffect(() => {
     let timer
@@ -33,6 +36,7 @@ export default function QueuePanel({ building, selected, onSelect }) {
   }, [building])
 
   const act = async (id, action) => {
+    if (!requireSignIn('Sign in to control the processing queue. Browsing stays open.')) return
     try {
       await api.jobAction(id, action)
       setJobs(await api.queue(building))
@@ -63,7 +67,7 @@ export default function QueuePanel({ building, selected, onSelect }) {
           <li key={j.id} className={`${j.status} ${selected === j.id ? 'sel' : ''}`} style={{ '--i': Math.min(k, 6) }}>
             <button type="button" className="ghost q-main" onClick={() => onSelect?.(j.id)} aria-pressed={selected === j.id}>
               <span className="q-name">{j.filename || j.kind}</span>
-              <span className={`pill ${j.status}`}>{j.status === 'running' ? `${j.stage} ${Math.round(j.pct)}%` : j.status}</span>
+              <span className={`pill ${j.status}`}>{j.status === 'running' ? <>{j.stage} <FlowNumber value={Math.round(j.pct)} suffix="%" /></> : j.status}</span>
             </button>
             {j.status === 'running' && (
               <div className="bar slim">

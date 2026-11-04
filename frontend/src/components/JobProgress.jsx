@@ -18,7 +18,8 @@ const WAIT = {
   error: 'Processing stopped. The details are below.',
 }
 
-export default function JobProgress({ jobId, onFinished }) {
+// celebrate: only the first walk of a building gets the confetti (the Uploader decides).
+export default function JobProgress({ jobId, onFinished, celebrate = false }) {
   const [job, setJob] = useState(null)
   const [error, setError] = useState('')
   const logRef = useRef(null)
@@ -67,7 +68,7 @@ export default function JobProgress({ jobId, onFinished }) {
       <div className="job-slot">
         {job.status === 'done' ? (
           <div className="success-pop" role="status">
-            {sawRunning.current && <Confetti count={26} spread={170} />}
+            {sawRunning.current && celebrate && <Confetti count={26} spread={170} />}
             <svg className="success-check" viewBox="0 0 52 52" aria-hidden="true" focusable="false">
               <circle cx="26" cy="26" r="24" className="sc-disc" />
               <path d="M15 27 L23 35 L38 18" pathLength="1" className="sc-tick" />

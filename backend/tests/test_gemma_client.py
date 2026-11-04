@@ -3,7 +3,9 @@ semantics (per-frame errors, circuit breaker). Ollama is faked; no server is nee
 import json
 from types import SimpleNamespace
 
+import cv2
 import httpx
+import numpy as np
 import ollama
 import pytest
 from PIL import Image
@@ -331,6 +333,10 @@ def test_walk_json_records_frames_ok(bid, monkeypatch):
         return FrameAnalysis()
 
     monkeypatch.setattr(gemma, "analyze_frame", analyze)
+    staging = store.staging_frames_dir(bid, "v")  # select_keyframes writes these in the real pipeline; moderation reads them
+    staging.mkdir(parents=True, exist_ok=True)
+    for kf in _kfs(3):
+        cv2.imwrite(str(staging / kf.frame_id), np.zeros((8, 8, 3), np.uint8))
     jobs._process_video(_job(bid), vdir / "source.mp4", None, None)
     walk = store.read_json(vdir / "walk.json")
     assert walk["gemma"] is True and walk["gemma_frames_ok"] == 2

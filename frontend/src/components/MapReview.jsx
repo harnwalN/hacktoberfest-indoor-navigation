@@ -1,12 +1,17 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
+import FlowNumber from './FlowNumber.jsx'
 import { ArrowRight, Check, GitMerge, ImagePlus, Link2, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react'
-import { api, detail, frameUrl } from '../api'
+import { api, detail, frameUrl, photoError } from '../api'
+import { useAuth } from './AuthContext'
 import ErrorBoundary from './ErrorBoundary'
 import Map3D from './Map3D'
 import ServerPhoto from './ServerPhoto'
 import { EmptyArt } from './Motion'
-import ReportsSection from './ReportsSection'
 import { PlaceChip, isMinorNode, placeKind } from './ArrowOverlay'
+import { SegButton, SlidePill } from './MapMotion'
+import { GLOW_MS, ZOOM_TWEEN_MS, easeInOut, stillMode } from '../motion/map'
+import '../styles/motion-map.css'
 
 // Fill in optional fields the backend may omit (older maps, partial edits) so the screens never crash on them.
 const normalize = (m) => ({
@@ -177,6 +182,17 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
   const [view, setView] = useState(null)
   const drag = useRef(null)
   const svgRef = useRef(null)
+  // Zoom tween state: liveView is what is on screen while a tween runs (null otherwise); raf is the frame request.
+  const liveView = useRef(null)
+  const raf = useRef(0)
+  const stopTween = () => { if (raf.current) cancelAnimationFrame(raf.current); raf.current = 0 }
+  useEffect(() => () => stopTween(), [])
+  // Floor change direction: going up slides the new floor in from above, going down from below.
+  // The direction is kept until the next floor change; the svg below is keyed by floor, so it mounts with the class.
+  const lastFloor = useRef(floor)
+  const slideDir = useRef(null)
+  if (lastFloor.current !== floor) slideDir.current = floor > lastFloor.current ? 'up' : 'down'
+  useEffect(() => { lastFloor.current = floor }, [floor])
 
   const pts = Object.values(pos)
   const bounds = pts.length
@@ -184,7 +200,7 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
        Math.max(...pts.map((p) => p[0])) + 4.5, Math.max(...pts.map((p) => p[1])) + 1.2]
     : [0, 0, 10, 6]
   const fit = { x: bounds[0], y: bounds[1], w: bounds[2] - bounds[0], h: bounds[3] - bounds[1] }
-  useEffect(() => setView(null), [floor, map])
+  useEffect(() => { stopTween(); liveView.current = null; setView(null) }, [floor, map])
   const v = view || fit
 
   // Greedy label placement: important places first, skip a label rather than overlap another.
@@ -222,11 +238,33 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
     const r = svgRef.current.getBoundingClientRect()
     return [v.x + ((e.clientX - r.left) / r.width) * v.w, v.y + ((e.clientY - r.top) / r.height) * v.h]
   }
-  const zoom = (factor, center) => {
-    const [cx, cy] = center || [v.x + v.w / 2, v.y + v.h / 2]
-    const w = Math.min(Math.max(v.w * factor, 3), fit.w * 3)
-    const h = (w / v.w) * v.h
-    setView({ x: cx - ((cx - v.x) / v.w) * w, y: cy - ((cy - v.y) / v.h) * h, w, h })
+  // Moves the view to `to` (null = fit). With animate, the viewBox is written per frame and React state is set once at the end.
+  const tweenView = (to, animate) => {
+    stopTween()
+    const from = liveView.current || v
+    if (!animate || stillMode()) { liveView.current = null; setView(to); return }
+    const target = to || fit
+    const t0 = performance.now()
+    const step = (now) => {
+      const t = Math.min(1, (now - t0) / ZOOM_TWEEN_MS)
+      const k = easeInOut(t)
+      const cur = {
+        x: from.x + (target.x - from.x) * k, y: from.y + (target.y - from.y) * k,
+        w: from.w + (target.w - from.w) * k, h: from.h + (target.h - from.h) * k,
+      }
+      liveView.current = cur
+      svgRef.current?.setAttribute('viewBox', `${cur.x} ${cur.y} ${cur.w} ${cur.h}`)
+      if (t < 1) raf.current = requestAnimationFrame(step)
+      else { raf.current = 0; liveView.current = null; setView(to) }
+    }
+    raf.current = requestAnimationFrame(step)
+  }
+  const zoom = (factor, center, animate = false) => {
+    const base = liveView.current || v
+    const [cx, cy] = center || [base.x + base.w / 2, base.y + base.h / 2]
+    const w = Math.min(Math.max(base.w * factor, 3), fit.w * 3)
+    const h = (w / base.w) * base.h
+    tweenView({ x: cx - ((cx - base.x) / base.w) * w, y: cy - ((cy - base.y) / base.h) * h, w, h }, animate)
   }
   const onWheel = (e) => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.15 : 0.87, toSvg(e)) }
   useEffect(() => {
@@ -235,7 +273,12 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
   })
-  const onDown = (e) => { drag.current = { sx: e.clientX, sy: e.clientY, v, moved: false } }
+  const onDown = (e) => {
+    // A drag during a zoom tween takes over from wherever the tween has got to.
+    const base = liveView.current || v
+    if (raf.current) { stopTween(); liveView.current = null; setView(base) }
+    drag.current = { sx: e.clientX, sy: e.clientY, v: base, moved: false }
+  }
   const onMove = (e) => {
     const d = drag.current
     if (!d) return
@@ -255,21 +298,22 @@ function Schematic({ map, floor, floors, onFloor, selected, onSelect }) {
       {floors.length > 1 && (
         <div className="floor-panel" role="group" aria-label="Floor">
           {[...floors].reverse().map((f) => (
-            <button key={f} className={f === floor ? 'active' : ''} onClick={() => onFloor(f)} aria-pressed={f === floor} aria-label={`Floor ${f}`}>
-              {f}
+            <button key={f} className={`${f === floor ? 'active' : ''} has-pill`.trim()} onClick={() => onFloor(f)} aria-pressed={f === floor} aria-label={`Floor ${f}`}>
+              {f === floor && <SlidePill id="floor-pill" tone="stairs" />}
+              <span className="seg-label">{f}</span>
             </button>
           ))}
         </div>
       )}
       <div className="map-tools">
-        <button className="icon-btn" aria-label="Zoom in" onClick={() => zoom(0.75)}>+</button>
-        <button className="icon-btn" aria-label="Zoom out" onClick={() => zoom(1.33)}>−</button>
-        <button className="icon-btn fit" aria-label="Fit floor" onClick={() => setView(null)}>Fit</button>
+        <button className="icon-btn" aria-label="Zoom in" onClick={() => zoom(0.75, null, true)}>+</button>
+        <button className="icon-btn" aria-label="Zoom out" onClick={() => zoom(1.33, null, true)}>−</button>
+        <button className="icon-btn fit" aria-label="Fit floor" onClick={() => tweenView(null, true)}>Fit</button>
       </div>
       {!nodes.length ? (
         <div className="map-empty"><EmptyArt /><p>Nothing mapped on floor {floor} yet.</p></div>
       ) : (
-        <svg ref={svgRef} className="schematic" viewBox={`${v.x} ${v.y} ${v.w} ${v.h}`} preserveAspectRatio="xMidYMid meet"
+        <svg key={floor} ref={svgRef} className={`schematic floor-slide ${slideDir.current ? `from-${slideDir.current}` : ''}`} viewBox={`${v.x} ${v.y} ${v.w} ${v.h}`} preserveAspectRatio="xMidYMid meet"
           onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}>
           {sameFloor.map((e, k) => {
             const a = pos[e.from_node]
@@ -360,16 +404,38 @@ function DirSelect({ value, onChange }) {
   )
 }
 
-// openCount: the open "something's wrong" reports (from the app, which fetches it for editors and owners only).
-export default function MapReview({ building, onChanged, openCount, onOpenChanged }) {
+// readOnly is the visitor view: the map, 2D/3D, floor switch and place details. No edit cards, no Save, no Link videos,
+// no Add photo, no merges, no connections. Editing is the owner's (Owner page, Videos & map), which uses the same map.
+// focus = { id, tick }: "Show on map" from the owner's reports list. Selects that place once per tick.
+export default function MapReview({ building, onChanged, readOnly = false, focus = null }) {
   return (
     <ErrorBoundary key={building} title="The map hit a problem">
-      <MapReviewInner building={building} onChanged={onChanged} openCount={openCount} onOpenChanged={onOpenChanged} />
+      <MapReviewInner building={building} onChanged={onChanged} readOnly={readOnly} focus={focus} />
     </ErrorBoundary>
   )
 }
 
-function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
+// Read-only place details: what a visitor sees for the selected place.
+function PlaceInfo({ node, building }) {
+  return (
+    <>
+      <div className="row spread">
+        <h3>{node.label || 'Unnamed place'}{' '}<span className="type-badge"><PlaceChip node={node} /></span></h3>
+      </div>
+      {node.frame_id && (
+        <ServerPhoto className="node-photo" src={frameUrl(building, node.frame_id, node.frame_url)} alt={`Photo of ${node.label}`}
+          placeholder={<div className="nophoto node-photo" />} />
+      )}
+      <p className="muted">
+        Floor {node.floor}
+        {node.verified ? ', verified' : ''}
+        {node.description ? ` · "${node.description}"` : ''}
+      </p>
+    </>
+  )
+}
+
+function MapReviewInner({ building, onChanged, readOnly, focus }) {
   const [map, setMap] = useState(null)
   const [dirty, setDirty] = useState(false)
   const [selected, setSelected] = useState(null)
@@ -377,11 +443,15 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
   const [newEdge, setNewEdge] = useState({ from_node: '', to_node: '', heading_out: 0, vertical: 'none' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [photoNote, setPhotoNote] = useState('')
+  const { requireSignIn } = useAuth()
   const [floor, setFloor] = useState(() => {
     const f = new URLSearchParams(window.location.hash.split('?')[1] || '').get('floor')
     return f == null ? null : Number(f)
   })
   const [note, setNote] = useState('')
+  const [saving, setSaving] = useState(false) // only the Save button's own request (busy is shared with other actions)
+  const [pickTick, setPickTick] = useState(0) // bumps on each pick from the map, so the same place picked twice still glows
   const [view3d, setView3d] = useState(() => new URLSearchParams(window.location.hash.split('?')[1] || '').get('view') === '3d')
 
   const [hideWaypoints, setHideWaypoints] = useState(false)
@@ -410,6 +480,31 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
       .catch((e) => { if (live) { setError(detail(e)); setLoadFailed(true) } })
     return () => { live = false }
   }, [building])
+
+  // "Show on map" from the reports list: select that place and bring the map into view, once per focus tick.
+  const handledFocus = useRef(null)
+  useEffect(() => {
+    if (!focus || !map || handledFocus.current === focus) return
+    const n = map.nodes.find((x) => x.id === focus.id)
+    if (!n) return
+    handledFocus.current = focus
+    setSelected(n.id)
+    setFloor(n.floor)
+    document.querySelector('.map-panel')?.scrollIntoView({ block: 'start' })
+  }, [focus, map])
+
+  // Scroll to and glow the edit card after a pick. Declared before the early returns below (Rules of Hooks).
+  useEffect(() => {
+    if (!pickTick) return undefined
+    const el = document.querySelector('.node-editor')
+    if (!el) return undefined
+    el.scrollIntoView({ behavior: stillMode() ? 'auto' : 'smooth', block: 'center' })
+    el.classList.remove('is-glow', 'is-glow-still')
+    void el.offsetWidth // restart the glow if the card was glowing already
+    el.classList.add(stillMode() ? 'is-glow-still' : 'is-glow')
+    const t = setTimeout(() => el.classList.remove('is-glow', 'is-glow-still'), GLOW_MS)
+    return () => clearTimeout(t)
+  }, [pickTick])
 
   if (!map)
     return loadFailed ? (
@@ -449,7 +544,9 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
     setDirty(true)
   }
   const save = async () => {
+    if (!requireSignIn('Sign in to save map changes. Browsing stays open.')) return
     setBusy(true)
+    setSaving(true)
     try {
       setMap(normalize(await api.saveMap(building, map)))
       setDirty(false)
@@ -458,39 +555,45 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
       setError(detail(e))
     } finally {
       setBusy(false)
+      setSaving(false)
     }
   }
-  const act = async (fn) => {
-    if (dirty && !confirm('Discard unsaved edits?')) return
+  // Returns true when the change went through, so the caller can clear its own inputs only then.
+  const act = async (fn, reason) => {
+    if (!requireSignIn(reason)) return false
+    if (dirty && !confirm('Discard unsaved edits?')) return false
     try {
       setMap(normalize(await fn()))
       setDirty(false)
       onChanged?.()
+      return true
     } catch (e) {
       setError(detail(e))
+      return false
     }
   }
   const addPhoto = async (file) => {
     if (!file) return
+    if (!requireSignIn('Sign in to add a photo. Browsing stays open.')) return
     setBusy(true)
+    setPhotoNote('')
     try {
       const r = await api.addPhoto(building, file, '')
       await load()
       setSelected(r.node.id)
     } catch (e) {
-      setError(detail(e))
+      setPhotoNote(photoError(e))
     } finally {
       setBusy(false)
     }
   }
 
-  // "Show on map" from the reports list: select the place and bring the map into view.
-  const showNode = (id) => {
-    const n = byId[id]
-    if (!n) return
+  // A pick on the map (2D or 3D) brings the place's edit card into view and flashes it. Not used by the reports
+  // "Show on map" link, which already scrolls the map itself.
+  const pickPlace = (id) => {
     setSelected(id)
-    setFloor(n.floor)
-    document.querySelector('.map-panel')?.scrollIntoView({ block: 'start' })
+    setFloor(byId[id]?.floor)
+    setPickTick((t) => t + 1)
   }
 
   const sel = selected ? byId[selected] : null
@@ -502,17 +605,19 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
         <header className="map-head">
           <div>
             <h2>Building map</h2>
-            <p className="muted">
-              {map.nodes.length} places, {map.edges.length} connections, {map.nodes.filter((n) => n.verified).length} verified
+            <p className="muted map-counts">
+              <FlowNumber value={map.nodes.length} /> places, <FlowNumber value={map.edges.length} /> connections, <FlowNumber value={map.nodes.filter((n) => n.verified).length} /> verified
             </p>
           </div>
           <div className="map-actions">
             <div className="view-switch" role="group" aria-label="Map view">
-              <button className={!view3d ? 'active' : ''} aria-pressed={!view3d} onClick={() => setView3d(false)}>2D</button>
-              <button className={view3d ? 'active' : ''} aria-pressed={view3d} onClick={() => setView3d(true)}>3D</button>
+              <SegButton id="view-pill" active={!view3d} onClick={() => setView3d(false)}>2D</SegButton>
+              <SegButton id="view-pill" active={view3d} onClick={() => setView3d(true)}>3D</SegButton>
             </div>
+            {!readOnly && <>
             <button className="ghost" disabled={busy} title="Merge places seen in several videos into one map"
               onClick={async () => {
+                if (!requireSignIn('Sign in to link videos. Browsing stays open.')) return
                 setBusy(true)
                 try {
                   const { job_id } = await api.consolidate(building)
@@ -537,27 +642,36 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
             </button>
             <label className="ghost file-btn">
               <ImagePlus size={16} /> Add photo
-              <input type="file" accept="image/*" className="file-input" onChange={(e) => addPhoto(e.target.files[0])} />
+              <input type="file" accept="image/*" className="file-input" onChange={(e) => { addPhoto(e.target.files[0]); e.target.value = '' }} />
             </label>
-            <button className="primary" disabled={!dirty || busy} onClick={save}>
-              <Save size={16} /> {dirty ? 'Save changes' : 'Saved'}
+            <button className={`primary save-btn ${dirty ? 'is-dirty' : ''} ${saving ? 'is-saving' : ''}`.trim()} disabled={!dirty || busy} onClick={save}>
+              <AnimatePresence mode="popLayout" initial={false}>
+                <motion.span key={saving ? 'saving' : dirty ? 'save' : 'saved'} className="save-icon" aria-hidden="true"
+                  initial={{ opacity: 0, scale: 0.6, rotate: -30 }} animate={{ opacity: 1, scale: 1, rotate: 0 }} exit={{ opacity: 0, scale: 0.6 }}
+                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}>
+                  {saving ? <span className="spin-ring" /> : dirty ? <Save size={16} /> : <Check size={16} />}
+                </motion.span>
+              </AnimatePresence>
+              {saving ? 'Saving…' : dirty ? 'Save changes' : 'Saved'}
             </button>
+            </>}
           </div>
         </header>
+        {photoNote && <p className="notice error" role="alert" title="Click to dismiss" onClick={() => setPhotoNote('')}>{photoNote}</p>}
         {error && <p className="notice error" role="alert" title="Click to dismiss" onClick={() => setError('')}>{error}</p>}
         {note && <pre className="log" onClick={() => setNote('')}>{note}</pre>}
         {view3d ? (
           <div className="map-stage">
-            <Map3D map={map} selected={selected} onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+            <Map3D map={map} selected={selected} onSelect={pickPlace} />
             <p className="map3d-hint">Drag to orbit, scroll to zoom, right-drag to pan. Click a place to edit it below.</p>
           </div>
         ) : (
           <Schematic map={map} floor={shownFloor} floors={floors} onFloor={setFloor} selected={selected}
-            onSelect={(id) => { setSelected(id); setFloor(byId[id]?.floor) }} />
+            onSelect={pickPlace} />
         )}
       </section>
 
-      {map.suggested_merges.length > 0 && (
+      {!readOnly && map.suggested_merges.length > 0 && (
         <section className="card">
           <h3>
             <GitMerge size={18} /> Same place? <small className="muted">loop-closure candidates</small>
@@ -578,10 +692,10 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
                 <b>{Math.round((s.confidence || 0) * 100)}%</b> · {s.reason}
               </p>
               <div className="row">
-                <button className="primary" onClick={() => act(() => api.resolveMerge(building, s.id, true))}>
+                <button className="primary" onClick={() => act(() => api.resolveMerge(building, s.id, true), 'Sign in to resolve place matches. Browsing stays open.')}>
                   <Check size={16} /> Merge
                 </button>
-                <button onClick={() => act(() => api.resolveMerge(building, s.id, false))}>
+                <button onClick={() => act(() => api.resolveMerge(building, s.id, false), 'Sign in to resolve place matches. Browsing stays open.')}>
                   <X size={16} /> Different places
                 </button>
               </div>
@@ -590,12 +704,27 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
         </section>
       )}
 
-      <ReportsSection building={building} nodes={map.nodes} openCount={openCount} onCountChanged={onOpenChanged} onShowNode={showNode} />
-
-      {sel && (
-        <section className="card node-editor">
+      <AnimatePresence initial={false}>
+      {sel && readOnly && (
+        <motion.section key="place-info" className="card node-editor"
+          exit={stillMode() ? { opacity: 0 } : { opacity: 0, height: 0, marginTop: 0, marginBottom: 0, paddingTop: 0, paddingBottom: 0 }}
+          transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }} style={{ overflow: 'hidden' }}>
+          <PlaceInfo node={sel} building={building} />
+        </motion.section>
+      )}
+      {sel && !readOnly && (
+        <motion.section key="node-editor" className="card node-editor"
+          exit={stillMode() ? { opacity: 0 } : { opacity: 0, height: 0, marginTop: 0, marginBottom: 0, paddingTop: 0, paddingBottom: 0 }}
+          transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }} style={{ overflow: 'hidden' }}>
           <div className="row spread">
-            <h3>{sel.label || 'Unnamed place'} <PlaceChip node={sel} /></h3>
+            <h3>{sel.label || 'Unnamed place'}{' '}
+              <AnimatePresence mode="popLayout" initial={false}>
+                <motion.span key={sel.type} className="type-badge" initial={{ opacity: 0, scale: 0.85 }} animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.85 }} transition={{ duration: 0.2 }}>
+                  <PlaceChip node={sel} />
+                </motion.span>
+              </AnimatePresence>
+            </h3>
             <button className="ghost danger" onClick={() => deleteNode(sel.id)}>
               <Trash2 size={16} /> Delete
             </button>
@@ -639,7 +768,7 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
               <option value="">Merge another node into this one…</option>
               {sortedNodes.filter((n) => n.id !== sel.id).map((n) => <option key={n.id} value={n.id}>{n.label || n.id} (floor {n.floor})</option>)}
             </select>
-            <button disabled={!mergeWith} onClick={() => act(() => api.mergeNodes(building, sel.id, mergeWith)).then(() => setMergeWith(''))}>
+            <button disabled={!mergeWith} onClick={() => act(() => api.mergeNodes(building, sel.id, mergeWith), 'Sign in to merge places. Browsing stays open.').then((ok) => ok && setMergeWith(''))}>
               <GitMerge size={16} /> Merge
             </button>
           </div>
@@ -668,10 +797,11 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
             </tbody>
           </table>
           </SideScroll>
-        </section>
+        </motion.section>
       )}
+      </AnimatePresence>
 
-      <section className="card">
+      {!readOnly && <section className="card">
         <h3>
           <Plus size={18} /> Add connection
         </h3>
@@ -691,7 +821,7 @@ function MapReviewInner({ building, onChanged, openCount, onOpenChanged }) {
           </select>
           <button disabled={!newEdge.from_node || !newEdge.to_node || newEdge.from_node === newEdge.to_node} onClick={addEdge}>Add</button>
         </div>
-      </section>
+      </section>}
 
       <section className="card">
         <h3>All places</h3>

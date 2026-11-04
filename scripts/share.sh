@@ -8,8 +8,10 @@
 # in the environment or in scripts/share.env. See scripts/README.md for the one-time setup.
 #
 # The backend listens on 127.0.0.1 only, not 0.0.0.0. The tunnel connector runs on this same Mac and
-# connects to localhost, so nothing needs to be reachable from the local network. Binding 0.0.0.0 would
-# expose the unauthenticated-by-default server to every device on the same Wi-Fi.
+# connects to 127.0.0.1, so nothing needs to be reachable from the local network. Binding 0.0.0.0 would
+# expose the server to every device on the same Wi-Fi.
+#
+# The tunnel address is open to anyone who has it. Keep it private and do not share it widely.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +24,7 @@ ENV_FILE="$SCRIPT_DIR/share.env"
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT="8000"
 HEALTH_URL="http://$BACKEND_HOST:$BACKEND_PORT/api/health"
-LOCAL_URL="http://localhost:$BACKEND_PORT"
+LOCAL_URL="http://$BACKEND_HOST:$BACKEND_PORT"
 
 BUILD=0
 MODE="quick"
@@ -90,35 +92,15 @@ parse_args() {
 load_env_file() {
   [ -f "$ENV_FILE" ] || return 0
   # Variables already set in the environment win over the file.
-  local tn="${TUNNEL_NAME-}" th="${TUNNEL_HOSTNAME-}" at="${ADMIN_TOKEN-}" ar="${AUTH_REQUIRED-}" oh="${OLLAMA_HOST-}"
+  local tn="${TUNNEL_NAME-}" th="${TUNNEL_HOSTNAME-}" oh="${OLLAMA_HOST-}"
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
   [ -n "$tn" ] && TUNNEL_NAME="$tn"
   [ -n "$th" ] && TUNNEL_HOSTNAME="$th"
-  [ -n "$at" ] && ADMIN_TOKEN="$at"
-  [ -n "$ar" ] && AUTH_REQUIRED="$ar"
   [ -n "$oh" ] && OLLAMA_HOST="$oh"
   return 0
-}
-
-check_auth_setting() {
-  if [ "${AUTH_REQUIRED-}" = "0" ]; then
-    cat >&2 <<'EOF'
-========================================================================
-  REFUSING TO START: AUTH_REQUIRED=0 is set.
-
-  AUTH_REQUIRED=0 turns off every access check in the backend. Behind a
-  public tunnel, anyone who gets the address could read or change every
-  building, and every photo in them.
-
-  Remove AUTH_REQUIRED=0 from your environment and from scripts/share.env
-  (or set AUTH_REQUIRED=1), then run this script again.
-========================================================================
-EOF
-    exit 1
-  fi
 }
 
 determine_mode() {
@@ -201,7 +183,7 @@ start_backend() {
   (cd "$BACKEND_DIR" && uv sync)
   [ -x "$BACKEND_DIR/.venv/bin/uvicorn" ] || die "backend/.venv/bin/uvicorn not found after uv sync"
 
-  # Show backend output in this terminal too (the owner key is printed here on first start).
+  # Show backend output in this terminal too.
   touch "$LOG_DIR/backend.log"
   tail -n 0 -F "$LOG_DIR/backend.log" &
   TAIL_PID=$!
@@ -222,17 +204,6 @@ start_backend() {
     sleep 1
   done
   die "the backend did not answer $HEALTH_URL within 90 seconds; see logs/backend.log"
-}
-
-owner_key_reminder() {
-  cat <<EOF
-
-[share] OWNER KEY: on the first start of a fresh data folder the backend prints it ONCE, on a line
-        that begins "OWNER KEY, shown only once". Look for it above in this terminal. If you did not
-        copy it, run:  cd backend && uv run python -m app.cli owner-key --rotate
-        (that replaces the key, and the old one stops working). Skip this if ADMIN_TOKEN is set.
-        logs/backend.log also holds the key in clear text, so delete that file once you have saved it.
-EOF
 }
 
 watch_for_quick_url() {
@@ -270,7 +241,6 @@ run_named_tunnel() {
 main() {
   parse_args "$@"
   load_env_file
-  check_auth_setting
   determine_mode
   check_prereqs
   mkdir -p "$LOG_DIR"
@@ -281,7 +251,6 @@ main() {
   OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
   start_ollama
   start_backend
-  owner_key_reminder
   if [ "$MODE" = "named" ]; then
     run_named_tunnel
   else

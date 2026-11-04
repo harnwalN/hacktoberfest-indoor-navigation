@@ -16,6 +16,7 @@ from PIL import Image
 from app import config, gemma, jobs, router, store
 from app.main import app
 from app.schemas import VideoInfo
+from tests.auth_helpers import owner_headers, signed_in_headers
 
 
 @pytest.fixture
@@ -32,16 +33,18 @@ def env(tmp_path, monkeypatch):
 
     submitted = []
 
-    def fake_submit(building_id, upload_path, filename, sensors, model, front=False, start_floor=None):
+    def fake_submit(building_id, upload_path, filename, sensors, model, front=False, start_floor=None,
+                    contributor_id=None, uploader_email="unknown"):
         dest = tmp_path / f"moved_{len(submitted)}"
         shutil.move(str(upload_path), dest)  # like the real one: the temp file is moved away
-        submitted.append({"path": dest, "sensors": sensors, "filename": filename})
+        submitted.append({"path": dest, "sensors": sensors, "filename": filename,
+                          "contributor_id": contributor_id})
         return jobs.Job(id=f"j{len(submitted)}", building_id=building_id, video_id="v1200001234", kind="video")
 
     monkeypatch.setattr(jobs, "submit_video", fake_submit)
     bundle = store.create_building("Test Hall")
     return {"client": TestClient(app), "bid": bundle.building_id, "tmpdir": tmpdir, "submitted": submitted,
-            "root": tmp_path}
+            "root": tmp_path, "auth": signed_in_headers(), "owner": owner_headers()}
 
 
 def _jpeg() -> bytes:
@@ -61,7 +64,7 @@ def test_video_upload_ok_and_fd_closed(env, monkeypatch):
         return fd, name
 
     monkeypatch.setattr(router.tempfile, "mkstemp", spy)
-    r = env["client"].post(f"/api/buildings/{env['bid']}/videos",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/videos", headers=env["auth"],
                            files={"video": ("walk.mp4", b"x" * 3000, "video/mp4"),
                                   "sensors": ("sensors.json", json.dumps({"a": 1}), "application/json")})
     assert r.status_code == 200, r.text
@@ -83,7 +86,7 @@ def _closed(fd: int) -> bool:
 
 def test_oversized_video_413_no_temp_left(env, monkeypatch):
     monkeypatch.setattr(config, "MAX_UPLOAD_MB", 1)
-    r = env["client"].post(f"/api/buildings/{env['bid']}/videos",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/videos", headers=env["auth"],
                            files={"video": ("walk.mp4", b"x" * (1024 * 1024 + 10), "video/mp4")})
     assert r.status_code == 413
     assert env["submitted"] == []
@@ -93,7 +96,7 @@ def test_oversized_video_413_no_temp_left(env, monkeypatch):
 def test_content_length_over_total_limit_rejected_early(env, monkeypatch):
     monkeypatch.setattr(config, "MAX_UPLOAD_MB", 1)
     monkeypatch.setattr(config, "MAX_SENSOR_BYTES", 1000)
-    r = env["client"].post(f"/api/buildings/{env['bid']}/videos",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/videos", headers=env["auth"],
                            files={"video": ("walk.mp4", b"x" * (3 * 1024 * 1024), "video/mp4")})
     assert r.status_code == 413
     assert env["submitted"] == []
@@ -102,7 +105,7 @@ def test_content_length_over_total_limit_rejected_early(env, monkeypatch):
 
 def test_oversized_sensors_413(env, monkeypatch):
     monkeypatch.setattr(config, "MAX_SENSOR_BYTES", 100)
-    r = env["client"].post(f"/api/buildings/{env['bid']}/videos",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/videos", headers=env["auth"],
                            files={"video": ("walk.mp4", b"x" * 10, "video/mp4"),
                                   "sensors": ("s.json", json.dumps({"k": "y" * 200}), "application/json")})
     assert r.status_code == 413
@@ -111,7 +114,7 @@ def test_oversized_sensors_413(env, monkeypatch):
 
 
 def test_bad_sensors_400_no_temp_left(env):
-    r = env["client"].post(f"/api/buildings/{env['bid']}/videos",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/videos", headers=env["auth"],
                            files={"video": ("walk.mp4", b"x" * 10, "video/mp4"),
                                   "sensors": ("s.json", b"\xff\xfenot json", "application/json")})
     assert r.status_code == 400
@@ -119,7 +122,7 @@ def test_bad_sensors_400_no_temp_left(env):
 
 
 def test_manual_frame_ok(env):
-    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual", headers=env["owner"],
                            files={"image": ("sign.html", _jpeg(), "image/jpeg")}, data={"label": "Sign"})
     assert r.status_code == 200, r.text
     frame_id = r.json()["node"]["frame_id"]
@@ -128,14 +131,14 @@ def test_manual_frame_ok(env):
 
 
 def test_manual_frame_non_image_400(env):
-    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual", headers=env["owner"],
                            files={"image": ("x.jpg", b"definitely not an image", "image/jpeg")})
     assert r.status_code == 400
     assert list(store.frames_dir(env["bid"]).iterdir()) == []
 
 
 def test_manual_frame_truncated_image_400(env):
-    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual", headers=env["owner"],
                            files={"image": ("x.jpg", _jpeg()[:200], "image/jpeg")})
     assert r.status_code == 400
     assert list(store.frames_dir(env["bid"]).iterdir()) == []
@@ -143,7 +146,7 @@ def test_manual_frame_truncated_image_400(env):
 
 def test_manual_frame_too_large_413(env, monkeypatch):
     monkeypatch.setattr(config, "MAX_IMAGE_BYTES", 100)
-    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual",
+    r = env["client"].post(f"/api/buildings/{env['bid']}/frames/manual", headers=env["owner"],
                            files={"image": ("x.jpg", _jpeg(), "image/jpeg")})
     assert r.status_code == 413
     assert list(store.frames_dir(env["bid"]).iterdir()) == []
@@ -193,7 +196,7 @@ def test_delete_video_bad_id_404_before_touching_map(env):
     assert exc.value.status_code == 404
     assert store.building_dir(env["bid"]).is_dir()
     assert any(v.id == ".." for v in store.load_map(env["bid"]).videos)  # map untouched
-    assert env["client"].delete(f"/api/buildings/{env['bid']}/videos/v.1").status_code == 404
+    assert env["client"].delete(f"/api/buildings/{env['bid']}/videos/v.1", headers=env["owner"]).status_code == 404
 
 
 def test_bfiles_serves_frames_only(env):
@@ -205,7 +208,6 @@ def test_bfiles_serves_frames_only(env):
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
     assert r.content == frame.read_bytes()
-    # AUTH_REQUIRED=0 (this file's default): the plain path, no signature (signed URLs are tested in test_auth.py)
     assert store.frame_url(bid, "v1200001234_0001.jpg") == f"/bfiles/{bid}/frames/v1200001234_0001.jpg"
 
     for path in [f"/bfiles/{bid}/map.json", f"/bfiles/{bid}/gemma_cache.json",

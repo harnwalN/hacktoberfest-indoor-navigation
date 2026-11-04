@@ -87,6 +87,9 @@ class Node(BaseModel):
     verified: bool = False
     soft: bool = False
     video_id: str | None = None
+    # Account.id of the contributor who added this place's photo by hand (POST /frames/manual); None for walk places.
+    # Server-owned: PUT /map keeps the value already on disk, whatever the editor sends.
+    contributor_id: str | None = None
     t: float | None = None
     x: float | None = None  # metres east of the map origin (solved from all connections)
     y: float | None = None  # metres north
@@ -130,11 +133,26 @@ class VideoInfo(BaseModel):
     start_floor: int | None = None  # floor the walk starts on, as entered by the uploader
     floor_offset: int = 0  # floor actually applied to this walk's places (start_floor, or inferred)
     anchored: bool = False  # headings aligned with the building frame (first walk, or matched geometrically)
+    contributor_id: str | None = None  # Account.id of whoever uploaded the walk; None = not recorded (every pre-accounts walk)
+    # Uploader's sign-in email, kept on the walk. Private: never in a public map response (see VideoPublic).
+    # "unknown" for walks uploaded before this was recorded.
+    uploader_email: str = "unknown"
+    created_at: str | None = None  # ISO 8601 UTC, set at upload; None for walks from before this was recorded
+    moderation_status: Literal["pending", "approved", "rejected", "hidden"] = "pending"
+    moderation_notes: str | None = None  # reason or note: automatic (jobs.py) or from a moderator (store.set_video_moderation)
+    # Owner who made the last moderation decision (owner email, or "owner-token"). None = automatic only.
+    # While set, automatic moderation does not change moderation_status (store.set_auto_moderation).
+    moderated_by: str | None = None
+
+
+# Campus a building belongs to. Groundwork for multi-campus support; nothing branches on it yet.
+DEFAULT_CAMPUS = "ucsd"
 
 
 class MapBundle(BaseModel):
     building_id: str
     name: str = ""
+    campus: str = Field(DEFAULT_CAMPUS, min_length=1)  # plain string; a map.json without it loads as DEFAULT_CAMPUS
     nodes: list[Node] = []
     edges: list[Edge] = []
     suggested_merges: list[SuggestedMerge] = []
@@ -143,10 +161,21 @@ class MapBundle(BaseModel):
     processed_with: dict = {}
 
 
+# ---------- Contributor accounts (store.py, accounts.json) ----------
+class Account(BaseModel):
+    """Email-identified contributor. No password: sign-in is by emailed link (auth.py)."""
+    id: str  # uuid4 hex; the key other records (VideoInfo.contributor_id) refer to
+    email: str  # normalized: stripped and lowercased (store.normalize_email)
+    created_at: str  # ISO 8601, UTC
+    moderator_of: list[str] = []  # building ids this account created (creator = moderator) or was granted
+    blocked: bool = False  # set by an owner: no uploads (403 on POST /videos). Sign-in and reads still work.
+    last_seen: str | None = None  # ISO 8601 UTC of the last session use (updated at most once an hour)
+
+
 # ---------- Map as returned by the API ----------
-# The signed photo URLs below are built per response (router._map_out) and never stored: store.save_map drops them.
+# The photo URLs below are built per response (router._map_out) and never stored: store.save_map drops them.
 class NodeOut(Node):
-    frame_url: str | None = None  # signed /bfiles URL of frame_id (plain path with AUTH_REQUIRED=0), or null
+    frame_url: str | None = None  # /bfiles URL of frame_id, or null
 
 
 class EdgeOut(Edge):
@@ -154,9 +183,36 @@ class EdgeOut(Edge):
     frames_rev_urls: list[str | None] | None = None  # same order as frames_rev
 
 
+class VideoPublic(BaseModel):
+    """A walk as a public map response shows it: VideoInfo without the uploader's email and the moderator's email."""
+    id: str
+    filename: str
+    duration: float = 0.0
+    keyframes: int = 0
+    has_sensors: bool = False
+    status: str = "queued"
+    start_floor: int | None = None
+    floor_offset: int = 0
+    anchored: bool = False
+    contributor_id: str | None = None
+    created_at: str | None = None
+    moderation_status: Literal["pending", "approved", "rejected", "hidden"] = "pending"
+    moderation_notes: str | None = None
+
+
 class MapOut(MapBundle):
     nodes: list[NodeOut] = []
     edges: list[EdgeOut] = []
+    videos: list[VideoPublic] = []
+
+
+class FloorMapOut(BaseModel):
+    """GET /buildings/{id}/floors/{floor}/map: one floor of the map, with the same photo URLs as MapOut."""
+    building_id: str
+    floor: int
+    nodes: list[NodeOut] = []  # places whose floor is this floor
+    edges: list[EdgeOut] = []  # connections with both ends on this floor
+    links: list[EdgeOut] = []  # connections with one end on this floor and one on another (stairs, lifts, ramps)
 
 
 # ---------- API payloads ----------
@@ -170,11 +226,6 @@ class MapEdit(BaseModel):
 
 class CreateBuilding(BaseModel):
     name: str
-
-
-class InviteCreate(BaseModel):
-    role: Literal["viewer", "editor"]
-    label: str | None = Field(default="", max_length=80)
 
 
 class RouteRequest(BaseModel):
@@ -252,3 +303,20 @@ class ReportStatusUpdate(BaseModel):
     @classmethod
     def _resolution_note(cls, value: str | None) -> str | None:
         return _stripped_note(value, 300)
+
+
+# ---------- owner moderation and contributor views (owner.py, owner_router.py) ----------
+class ModerationDecision(BaseModel):
+    """POST /api/owner/videos/{building_id}/{video_id}/moderation. approve puts the walk on the map (rebuilding it when
+    needed); reject and hide take it off the map (hide is a takedown; reject is a declined walk)."""
+    action: Literal["approve", "reject", "hide"]
+    note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return _stripped_note(value, 1000)
+
+
+class UserBlock(BaseModel):
+    blocked: bool

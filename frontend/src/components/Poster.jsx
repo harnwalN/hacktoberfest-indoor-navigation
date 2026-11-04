@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Printer, X } from 'lucide-react'
+import useModal from '../motion/useModal.js'
 
 // The QR encoder (qrcode-generator, MIT, no dependencies) is loaded only when a poster is opened, so the main bundle
 // does not carry it. Encoding happens here in the browser: the link never goes to an outside service.
@@ -25,8 +26,8 @@ export function encodeQr(qrcode, text) {
   return { size: n + QUIET * 2, path: d, modules: n }
 }
 
-// Entrance poster for a viewer link: the building name, a large code for the full join link, the call to action and
-// the link written out below it. It is shown in a full-screen layer over the app; only the poster prints.
+// Entrance poster: the building name, a large code for the building's directions link, the call to action and the
+// link written out below it. It is shown in a full-screen layer over the app; only the poster prints.
 export default function Poster({ name, link, onClose, returnFocusTo }) {
   const [code, setCode] = useState(null)
   const [err, setErr] = useState('')
@@ -49,28 +50,25 @@ export default function Poster({ name, link, onClose, returnFocusTo }) {
     }
   }, [link])
 
-  // A modal layer: the app underneath is inert while it is open, Escape closes it, and focus goes back on close.
+  // Shared modal layer (motion/useModal.js): the app underneath is inert while it is open, and focus goes back on
+  // close. Declared before the focus effect below so the opener is captured first.
+  useModal(dialog, { returnFocusTo })
+
+  // Escape closes it, and focus starts on the first button.
   useEffect(() => {
-    const root = document.getElementById('root')
-    const wasInert = root ? root.inert : false
-    if (root) root.inert = true
     const onKey = (e) => {
       if (e.key === 'Escape') closeRef.current()
     }
     document.addEventListener('keydown', onKey)
     dialog.current?.querySelector('button')?.focus()
-    return () => {
-      document.removeEventListener('keydown', onKey)
-      if (root) root.inert = wasInert
-      returnFocusTo?.current?.focus()
-    }
-  }, [returnFocusTo])
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
 
   return createPortal(
     <div className="poster-root" ref={dialog} role="dialog" aria-modal="true" aria-label={`Entrance poster for ${title}`}>
       <div className="poster-bar no-print">
         <p>
-          <b>Anyone who scans this poster gets viewer access to {title}.</b> Revoke the invite in the list to switch the poster off.
+          <b>Anyone who scans this poster opens directions for {title}.</b> Print it and put it at the entrance.
         </p>
         <div className="row wrap">
           <button type="button" className="primary" onClick={() => window.print()}>
@@ -85,7 +83,7 @@ export default function Poster({ name, link, onClose, returnFocusTo }) {
       <article className="poster-sheet">
         <h1 className="poster-name">{name || 'Building'}</h1>
         {code ? (
-          <svg className="poster-qr" viewBox={`0 0 ${code.size} ${code.size}`} role="img" aria-label="QR code for the invite link"
+          <svg className="poster-qr" viewBox={`0 0 ${code.size} ${code.size}`} role="img" aria-label="QR code for the directions link"
             shapeRendering="crispEdges" data-modules={code.modules}>
             <rect width={code.size} height={code.size} fill="#ffffff" />
             <path d={code.path} fill="#000000" />

@@ -1,0 +1,59 @@
+/* ---------- Map tab motion (MapReview, Map3D, ReportsSection, MapMotion) ----------
+   Transform and opacity only, plus height on collapses. Reduced motion: styles.css turns every animation off
+   (global rule), and the JS checks stillMode() (reduced motion or low-end) before any tween. Static states below
+   stay readable with animation off: the glow ring is visible for its 1.2s even when it does not fade. */
+
+/* sliding pill behind the active segment (2D/3D, floors, report filters) */
+.seg-label { position: relative; }
+.slide-pill { position: absolute; inset: 0; z-index: -1; border-radius: 999px; background: var(--accent); pointer-events: none; }
+.slide-pill.stairs { border-radius: 50%; background: var(--stairs); }
+.view-switch button.has-pill { position: relative; isolation: isolate; }
+.view-switch button.has-pill.active,
+.view-switch button.has-pill.active:hover:not(:disabled) { background: transparent; color: var(--on-accent); }
+.floor-panel button.has-pill { position: relative; isolation: isolate; }
+.floor-panel button.has-pill.active,
+.floor-panel button.has-pill.active:hover:not(:disabled) { background: transparent; color: var(--stairs-ink); border-color: var(--text); }
+
+/* 2D floor change: the new floor slides in from above (going up) or below (going down) */
+@keyframes floor-in-up { from { opacity: 0; transform: translateY(-18px); } }
+@keyframes floor-in-down { from { opacity: 0; transform: translateY(18px); } }
+.schematic.floor-slide.from-up { animation: floor-in-up 0.32s var(--ease-out) backwards; }
+.schematic.floor-slide.from-down { animation: floor-in-down 0.32s var(--ease-out) backwards; }
+
+/* header counts roll with NumberFlow; keep the line from jumping while digits change */
+.map-counts { font-variant-numeric: tabular-nums; }
+
+/* Saved / Save changes: spinner morphs into the check; a dirty map gets a soft ring */
+.save-btn { display: inline-flex; align-items: center; gap: 6px; position: relative; transition: box-shadow 0.3s var(--ease-out); }
+.save-btn .save-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; }
+.save-btn.is-dirty:not(:disabled) { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }
+.spin-ring { display: inline-block; width: 14px; height: 14px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin-ring 0.8s linear infinite; }
+@keyframes spin-ring { to { transform: rotate(360deg); } }
+
+/* press feedback and smooth expansion for Link videos / Add photo and their notices */
+.map-actions .ghost, .map-actions .file-btn { transition: transform 0.12s var(--ease-out), background-color 0.15s ease; }
+.map-actions .ghost:active:not(:disabled), .map-actions .file-btn:active { transform: scale(0.96); }
+@keyframes reveal-down { from { opacity: 0; transform: translateY(-6px); clip-path: inset(0 0 100% 0); } to { opacity: 1; transform: none; clip-path: inset(0 0 0 0); } }
+.map-panel > .log, .map-panel > .notice { animation: reveal-down 0.3s var(--ease-out) backwards; }
+
+/* edit card: stagger on open, photo fades in inside a reserved 4:3 box, type badge cross-fades, verified tick */
+.node-editor { position: relative; }
+.node-editor > * { animation: rise-sm 0.35s var(--ease-out) backwards; }
+.node-editor > :nth-child(2) { animation-delay: 40ms; }
+.node-editor > :nth-child(3) { animation-delay: 80ms; }
+.node-editor > :nth-child(4) { animation-delay: 120ms; }
+.node-editor > :nth-child(5) { animation-delay: 160ms; }
+.node-editor > :nth-child(n+6) { animation-delay: 200ms; }
+.node-editor .node-photo { width: 100%; height: auto; aspect-ratio: 4 / 3; object-fit: contain; background: var(--well); animation: fade-in 0.45s ease backwards; }
+.node-editor .type-badge { display: inline-flex; vertical-align: middle; }
+.node-editor .check input[type='checkbox']:checked { animation: check-tick 0.32s var(--ease-pop); }
+@keyframes check-tick { 0% { transform: scale(0.7); } 60% { transform: scale(1.15); } }
+
+/* a place picked on the map: the card glows once (accent ring, fades out over GLOW_MS) */
+.node-editor.is-glow::after,
+.node-editor.is-glow-still::after { content: ''; position: absolute; inset: 0; border-radius: inherit; border: 3px solid var(--accent); pointer-events: none; }
+.node-editor.is-glow::after { animation: glow-ring 1.2s var(--ease-out) both; }
+@keyframes glow-ring { from { opacity: 1; } to { opacity: 0; } }
+
+/* report items: keep the list height steady while items leave */
+.report-list > li { min-width: 0; }

@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app import config, floors, mapper, router, store
 from app.schemas import MapBundle, VideoInfo
+from tests.auth_helpers import owner_headers
 from tests.test_floor_links import QUIET, _kf, _track
 
 
@@ -55,7 +56,7 @@ def test_ahead_sightings_on_two_floors_do_not_link(tmp_path):
 def test_vertical_round_trips_through_put_map(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "BUILDINGS_DIR", tmp_path / "buildings")
     app = FastAPI(); app.include_router(router.api)
-    c = TestClient(app)
+    c = TestClient(app, headers=owner_headers())  # PUT /map needs an owner session
     bun = store.create_building("T")
     bid = bun.building_id
     body = {"nodes": [{"id": "n001", "label": "Hallway", "vertical": "stairs"},

@@ -593,7 +593,7 @@ def test_offline_hosted_walk_does_not_read_local_answers(gemini, ollama, bid):
 def _add_done_walk(bid, model, vid="v"):
     with store.lock_for(bid):
         bundle = store.load_map(bid)
-        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status="done"))
+        bundle.videos.append(VideoInfo(id=vid, filename=f"{vid}.mp4", status="done", moderation_status="approved"))
         store.save_map(bundle)
     vdir = store.video_dir(bid, vid)
     vdir.mkdir(parents=True, exist_ok=True)

@@ -1,8 +1,8 @@
 // "Something's wrong" reports and the entrance poster. Run: node tests/e2e-reports.mjs  (needs `playwright` resolvable and
 // a vite dev server at BASE, default http://localhost:5199). The API is mocked with page.route: the mock answers the
-// reports, access and invite calls the way the backend contract says, so the frontend's own request and render code is
+// reports calls the way the backend contract says, so the frontend's own request and render code is
 // what runs. Covers: the report panel (focus, body, every message, double submit), the editors' list (filter, show on
-// map, resolve with and without a note, reopen, the open count), what viewers never see, and the poster (QR, text, print).
+// map, resolve with and without a note, reopen, the open count), that the Map tab and Reports are open to everyone, and the poster (QR, text, print).
 import { chromium } from 'playwright'
 
 const BASE = process.env.BASE || 'http://localhost:5199'
@@ -28,7 +28,6 @@ const STEPS = [
   { step_index: 1, node_id: 'bh', label: 'Room 210', frame_url: null, action: 'destination_reached', vertical: 'none', floor: 1, instruction_text: 'Room 210 is on the left', turn_degrees: 0 },
 ]
 const NODE_LABEL = Object.fromEntries(nodes.map((n) => [n.id, n.label]))
-const LINK_TOKEN = 'poster-tok-0123456789abcdef'
 
 const results = []
 const check = (name, ok, info = '') => {
@@ -38,38 +37,60 @@ const check = (name, ok, info = '') => {
 const realErrors = (errs) => errs.filter((e) => !/Failed to load resource/.test(e))
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// Wait until a control stops moving before a click. A lazily loaded section (the owner page) rises in with a CSS
+// animation (translateY); Playwright's own stability check then retries "element is not stable" for as long as the
+// rise runs. Here: every running animation on the page has finished, then the control's box is the same on two
+// frames in a row.
+async function settled(locator, timeout = 8000) {
+  const page = locator.page()
+  await locator.waitFor({ state: 'visible', timeout })
+  await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running' && a.playState !== 'pending'), null, { timeout }).catch(() => {})
+  const deadline = Date.now() + timeout
+  let prev = null
+  while (Date.now() < deadline) {
+    const box = JSON.stringify(await locator.boundingBox().catch(() => null))
+    if (box !== 'null' && box === prev) return
+    prev = box
+    await sleep(60)
+  }
+}
+
 // The stored reports. The list returns them newest first; node_label is computed from the map, as the server does.
 const seedReports = () => [
   { id: 'rp-a', kind: 'wrong_direction', note: 'Turned the wrong way at the lift', node_id: 'bh', step_index: 1, from_node: 'r112', to_node: 'bh',
-    created_at: '2026-10-30T09:00:00Z', reporter: 'i-viewer', status: 'open', resolution_note: null, updated_at: '2026-10-30T09:00:00Z',
-    history: [{ status: 'open', at: '2026-10-30T09:00:00Z', by: 'i-viewer', resolution_note: null }] },
+    created_at: '2026-10-30T09:00:00Z', status: 'open', resolution_note: null, updated_at: '2026-10-30T09:00:00Z',
+    history: [{ status: 'open', at: '2026-10-30T09:00:00Z', by: 'x', resolution_note: null }] },
   { id: 'rp-b', kind: 'place_missing', note: '', node_id: 'gone', step_index: null, from_node: null, to_node: null,
-    created_at: '2026-10-29T09:00:00Z', reporter: 'owner', status: 'open', resolution_note: null, updated_at: '2026-10-29T09:00:00Z',
+    created_at: '2026-10-29T09:00:00Z', status: 'open', resolution_note: null, updated_at: '2026-10-29T09:00:00Z',
     history: [{ status: 'open', at: '2026-10-29T09:00:00Z', by: 'owner', resolution_note: null }] },
   { id: 'rp-c', kind: 'blocked', note: 'Door is chained', node_id: 'r112', step_index: 0, from_node: 'r112', to_node: 'bh',
-    created_at: '2026-10-28T09:00:00Z', reporter: 'i-abcdef', status: 'resolved', resolution_note: 'Door cleared', updated_at: '2026-10-28T12:00:00Z',
+    created_at: '2026-10-28T09:00:00Z', status: 'resolved', resolution_note: 'Door cleared', updated_at: '2026-10-28T12:00:00Z',
     history: [
       { status: 'open', at: '2026-10-28T09:00:00Z', by: 'i-abcdef', resolution_note: null },
       { status: 'resolved', at: '2026-10-28T12:00:00Z', by: 'owner', resolution_note: 'Door cleared' },
     ] },
 ]
 
-// One mock session. role is what GET /buildings says the signed-in user is.
-async function session(vp, role, opts = {}) {
+// One mock session. Signed in as the owner unless opts.visitor (the reports list is an owner tool now).
+async function session(vp, opts = {}) {
   const ctx = await browser.newContext({ viewport: vp })
+  if (!opts.visitor) {
+    await ctx.addInitScript(() => {
+      if (!localStorage.getItem('session_token')) {
+        localStorage.setItem('session_token', 'tok-owner')
+        localStorage.setItem('session_account', JSON.stringify({ id: 'u-owner', email: 'owner@example.com', is_owner: true }))
+      }
+    })
+  }
   const page = await ctx.newPage()
   const errors = []
   const st = {
-    role,
     reportMode: 'ok', // ok | 429 | 507 | 422 | slow
     reportBodies: [],
     reports: seedReports(),
     gets: [], // the query of each GET /reports
     patches: [], // { id, body }
-    accessCalls: 0,
     urls: [],
-    invites: [],
-    created: 0,
     ...opts,
   }
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
@@ -78,7 +99,7 @@ async function session(vp, role, opts = {}) {
   page.on('request', (req) => {
     if (!req.url().startsWith(ORIGIN) && !req.url().startsWith('data:') && !req.url().startsWith('blob:')) st.external = (st.external || []).concat(req.url())
   })
-  await page.route('**/api/**', async (route) => {
+  await ctx.route('**/api/**', async (route) => {
     const req = route.request()
     const url = new URL(req.url())
     const p = url.pathname.replace(/^\/api/, '')
@@ -86,17 +107,12 @@ async function session(vp, role, opts = {}) {
     st.urls.push(req.url())
     const json = (b, status = 200, headers = {}) => route.fulfill({ status, contentType: 'application/json', headers, body: JSON.stringify(b) })
 
-    if (p === '/buildings' && m === 'GET') return json([{ id: 'b1', name: 'Hall B', role }])
+    if (p === '/buildings' && m === 'GET') return json([{ id: 'b1', name: 'Hall B' }])
     if (p === '/buildings/b1/map') return json(MAP)
     if (p === '/buildings/b1/queue') return json([])
     if (p === '/buildings/b1/route' && m === 'POST') {
       if (st.reportMode === 'slow') await sleep(700)
       return json({ steps: STEPS, node_path: ['r112', 'bh'], step_free: true })
-    }
-    if (p === '/buildings/b1/access' && m === 'GET') {
-      st.accessCalls += 1
-      if (role === 'viewer') return json({ role })
-      return json({ role, open_reports: st.reports.filter((r) => r.status === 'open').length })
     }
     if (p === '/buildings/b1/reports' && m === 'POST') {
       const body = JSON.parse(req.postData() || '{}')
@@ -108,7 +124,7 @@ async function session(vp, role, opts = {}) {
       st.seq = (st.seq || 0) + 1
       const id = `rp-new-${st.seq}`
       st.reports.unshift({ id, kind: body.kind, note: body.note || '', node_id: body.node_id || null, step_index: body.step_index ?? null,
-        from_node: body.from_node || null, to_node: body.to_node || null, created_at: new Date().toISOString(), reporter: 'i-viewer',
+        from_node: body.from_node || null, to_node: body.to_node || null, created_at: new Date().toISOString(),
         status: 'open', resolution_note: null, updated_at: new Date().toISOString(), history: [] })
       return json({ id, status: 'open' })
     }
@@ -136,14 +152,6 @@ async function session(vp, role, opts = {}) {
       r.history = [...r.history, { status: body.status, at, by: 'owner', resolution_note: r.resolution_note }]
       return json({ ...r, node_label: r.node_id && NODE_LABEL[r.node_id] ? NODE_LABEL[r.node_id] : null })
     }
-    if (p === '/buildings/b1/invites' && m === 'GET') return json(st.invites.map(({ token, ...rest }) => rest))
-    if (p === '/buildings/b1/invites' && m === 'POST') {
-      const body = JSON.parse(req.postData() || '{}')
-      st.created += 1
-      const inv = { id: `i-new-${st.created}`, role: body.role, label: body.label || '', created_at: new Date().toISOString(), revoked: false }
-      st.invites.push(inv)
-      return json({ ...inv, token: LINK_TOKEN, join_path: `#/join?b=b1&t=${LINK_TOKEN}` })
-    }
     return json({ detail: 'nope' }, 404)
   })
   return { ctx, page, errors, st }
@@ -162,13 +170,12 @@ const startTrip = async (page) => {
   await page.waitForSelector('.trip-view', { timeout: 6000 }).catch(() => {})
 }
 const sentBodies = (st) => st.reportBodies
-const openBadge = (page) => page.locator('.count-badge').first().innerText().catch(() => '')
 
 // ---------- directions: the report panel ----------
 for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   const T = (n) => `[${vpName}] ${n}`
   {
-    const { ctx, page, errors, st } = await session(vp, 'viewer')
+    const { ctx, page, errors, st } = await session(vp)
     await page.goto(`${BASE}/${tripLinkHash}`)
     await startTrip(page)
     const btn = reportButton(page)
@@ -222,7 +229,7 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
 
 // ---------- directions: body rules, messages, double submit (desktop) ----------
 {
-  const { ctx, page, errors, st } = await session(DESKTOP, 'viewer')
+  const { ctx, page, errors, st } = await session(DESKTOP)
   await page.goto(`${BASE}/${tripLinkHash}`)
   await startTrip(page)
   // First step: step_index 0 is sent (it is a real step, not "missing"), and an empty note is left out.
@@ -276,7 +283,7 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
 
 // ---------- directions: a report on the second step, and the Escape key does not step the route ----------
 {
-  const { ctx, page, st } = await session(DESKTOP, 'viewer')
+  const { ctx, page, st } = await session(DESKTOP)
   await page.goto(`${BASE}/${tripLinkHash}`)
   await startTrip(page)
   await page.getByRole('button', { name: 'Next' }).click()
@@ -292,43 +299,37 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await ctx.close()
 }
 
-// ---------- viewers: the report button yes, the list and the badge never ----------
+// ---------- visitors: a report can be sent from Directions; the Map has no Reports list (that is the owner's) ----------
 {
-  const { ctx, page, st } = await session(DESKTOP, 'viewer')
+  const { ctx, page, st } = await session(DESKTOP, { visitor: true })
   await page.goto(`${BASE}/${tripLinkHash}`)
   await startTrip(page)
-  check('viewer: can send a report from Directions', (await reportButton(page).count()) === 1)
-  check('viewer: no Map tab', (await page.getByRole('button', { name: /^Map/ }).count()) === 0)
-  await page.goto(`${BASE}/#/review?b=b1`)
+  check('visitor: can send a report from Directions', (await reportButton(page).count()) === 1)
+  check('visitor: the Map tab is there', (await page.getByRole('button', { name: /^Map/ }).count()) === 1)
+  await page.getByRole('button', { name: /^Map/ }).click()
   await sleep(600)
-  check('viewer: no Reports section on the review route', (await page.getByRole('heading', { name: 'Reports', exact: true }).count()) === 0)
-  check('viewer: no list request and no access count request', st.gets.length === 0 && st.accessCalls === 0, JSON.stringify({ gets: st.gets, access: st.accessCalls }))
-  check('viewer: no open-count badge anywhere', (await page.locator('.count-badge, .tab-badge').count()) === 0)
+  check('visitor: the Map tab has no Reports section', (await page.getByRole('heading', { name: /^Reports/ }).count()) === 0)
+  check('visitor: no reports list is requested', st.gets.length === 0, JSON.stringify(st.gets))
+  // Sign-in is identity only: no sign-in or invite gate may block the page.
+  check('visitor: no sign-in or access gate', (await page.getByRole('dialog').count()) === 0 && (await page.getByText(/invite|owner key/i).count()) === 0)
   await ctx.close()
 }
 
-// ---------- editors: the list, its filter, show on map, resolve, reopen, and the badge ----------
+// ---------- the list, its filter, show on map, resolve, reopen, and the badge ----------
 for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   const T = (n) => `[${vpName}] ${n}`
-  const { ctx, page, errors, st } = await session(vp, 'editor')
-  await page.goto(`${BASE}/#/review?b=b1`)
+  const { ctx, page, errors, st } = await session(vp)
+  await page.goto(`${BASE}/#/owner?s=reports&b=b1`)
   await page.getByRole('heading', { name: 'Reports', exact: true }).waitFor({ timeout: 8000 }).catch(() => {})
   const list = () => page.getByRole('list', { name: 'Open reports' })
-  check(T('list: the Reports section is on the Map tab'), (await page.getByRole('heading', { name: /^Reports/ }).count()) === 1)
+  check(T('list: the Reports section is on the owner page'), (await page.getByRole('heading', { name: /^Reports/ }).count()) === 1)
   check(T('list: starts on Open, newest first, with the open items only'), (await list().locator('.report-item').count()) === 2 && st.gets.at(-1)?.includes('status=open'), st.gets.at(-1))
   check(T('list: the request asks for the newest 100'), st.gets.at(-1)?.includes('limit=100'), st.gets.at(-1))
   check(T('list: the first item is the newest report'), (await list().locator('.report-item').first().innerText()).includes('Directions are wrong'))
   check(T('list: the note is shown'), (await list().getByText('Turned the wrong way at the lift').count()) === 1)
   check(T('list: the kind is in plain words'), (await list().getByText('A place is missing').count()) === 1)
   check(T('list: a place no longer on the map is named so'), (await list().getByText('Place no longer on the map').count()) === 1)
-  check(T('list: the reporter shows only as Owner or Invite xxxx'), (await list().getByText('Invite i-vi', { exact: false }).count()) >= 1 && (await list().getByText('Owner', { exact: false }).count()) >= 1)
   check(T('list: the date is shown'), (await list().locator('.report-meta time').count()) === 2)
-
-  // The open count: badge in the section header and on the Map tab, from /access.
-  check(T('badge: section header shows 2 open'), (await openBadge(page)) === '2 open', await openBadge(page))
-  const tabBadge = await page.locator('.tab-badge').first().innerText().catch(() => '')
-  check(T('badge: Map tab shows 2'), tabBadge === '2', tabBadge)
-  check(T('badge: Map tab name carries the count for screen readers'), (await page.getByRole('button', { name: /^Map.*2 open reports/ }).count()) === 1)
 
   // Filter.
   await page.getByRole('button', { name: 'Resolved', exact: true }).click()
@@ -350,6 +351,9 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await list().getByRole('button', { name: 'Show on map' }).click()
   await sleep(200)
   check(T('show on map: the node editor opens on that place'), (await page.locator('.node-editor h3').innerText().catch(() => '')).includes('Room 210'))
+  // Show on map opens the owner's Videos & map section; the reports list is one sub-tab back.
+  await page.getByRole('button', { name: 'Reports', exact: true }).click()
+  await sleep(300)
 
   // Mark fixed with a resolution note.
   await list().locator('.report-item').first().getByRole('button', { name: 'Mark fixed' }).click()
@@ -363,8 +367,6 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   check(T('resolve: PATCH sends status resolved with the note'),
     patch?.id === 'rp-a' && JSON.stringify(patch.body) === JSON.stringify({ status: 'resolved', resolution_note: 'Sign replaced on Tuesday' }), JSON.stringify(patch))
   check(T('resolve: the report leaves the open list'), (await list().locator('.report-item').count()) === 1)
-  check(T('resolve: the header badge updates to 1 open'), (await openBadge(page)) === '1 open', await openBadge(page))
-  check(T('resolve: the Map tab badge updates to 1'), (await page.locator('.tab-badge').first().innerText().catch(() => '')) === '1')
   check(T('resolve: the status line says it is done'), (await page.getByRole('status').filter({ hasText: 'Marked as fixed.' }).count()) === 1)
 
   // Mark fixed without a note: no resolution_note key at all. Cancel first, to check focus goes back.
@@ -378,7 +380,6 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await sleep(400)
   const bare = st.patches.at(-1)
   check(T('resolve without a note: body has no resolution_note'), bare?.id === 'rp-b' && JSON.stringify(bare.body) === JSON.stringify({ status: 'resolved' }), JSON.stringify(bare))
-  check(T('resolve without a note: badge now 0 open'), (await openBadge(page)) === '0 open', await openBadge(page))
   check(T('resolve without a note: an empty open list says so'), (await page.locator('.reports-empty').innerText().catch(() => '')).includes('No open reports'))
 
   // Reopen a resolved report.
@@ -388,7 +389,6 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await sleep(400)
   const reopen = st.patches.at(-1)
   check(T('reopen: PATCH sends status open and no note'), JSON.stringify(reopen?.body) === JSON.stringify({ status: 'open' }), JSON.stringify(reopen))
-  check(T('reopen: the badge counts the reopened report again'), (await openBadge(page)) === '1 open', await openBadge(page))
 
   check(T('editors: no page errors'), realErrors(errors).length === 0, realErrors(errors).join('|').slice(0, 200))
   await ctx.close()
@@ -396,8 +396,8 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
 
 // ---------- editors: a failed resolve shows the server's message, and the list is still usable ----------
 {
-  const { ctx, page, st } = await session(DESKTOP, 'editor')
-  await page.goto(`${BASE}/#/review?b=b1`)
+  const { ctx, page, st } = await session(DESKTOP)
+  await page.goto(`${BASE}/#/owner?s=reports&b=b1`)
   await page.getByRole('heading', { name: /^Reports/ }).waitFor({ timeout: 8000 }).catch(() => {})
   await page.getByRole('list', { name: 'Open reports' }).locator('.report-item').first().getByRole('button', { name: 'Mark fixed' }).click()
   // The report is gone on the server after the list loaded: the resolve is refused and the reason is shown.
@@ -410,27 +410,20 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await ctx.close()
 }
 
-// ---------- owner: the poster ----------
+// ---------- the poster ----------
 {
-  const { ctx, page, errors, st } = await session(DESKTOP, 'owner')
-  const external = []
-  await page.goto(`${BASE}/#/build?b=b1`)
-  await page.getByRole('heading', { name: /Share this building/ }).waitFor({ timeout: 8000 }).catch(() => {})
-  check('poster: no "Make a poster" before a viewer link exists', (await page.getByRole('button', { name: 'Make a poster' }).count()) === 0)
-  await page.getByLabel('Label (optional)').fill('Entrance poster')
-  check('poster: the label field suggests "Entrance poster" for a viewer link', (await page.locator('.share-form').innerText()).includes('Entrance poster'))
-  await page.getByRole('button', { name: 'Create link' }).click()
-  await page.getByRole('region', { name: 'New invite link' }).waitFor({ timeout: 5000 }).catch(() => {})
-  const made = await page.getByRole('region', { name: 'New invite link' }).getByLabel('Invite link').inputValue()
-  check('poster: the link is the full join link', made.endsWith(`#/join?b=b1&t=${LINK_TOKEN}`), made)
+  const { ctx, page, errors, st } = await session(DESKTOP)
+  await page.goto(`${BASE}/#/owner?s=buildings&b=b1`)
   const offer = page.getByRole('button', { name: 'Make a poster' })
-  check('poster: "Make a poster" offered after a viewer link', (await offer.count()) === 1)
-  const offerText = await page.getByRole('region', { name: 'New invite link' }).innerText()
-  check('poster: says anyone who scans gets viewer access', /scans? .*viewer access/i.test(offerText), offerText.slice(0, 300))
-  check('poster: says revoking the invite disables the poster', /revok\w* .*poster|poster .*revok/i.test(offerText), offerText.slice(0, 300))
+  await offer.waitFor({ timeout: 8000 }).catch(() => {})
+  await settled(offer)
+  check('poster: "Make a poster" is offered with no invite step', (await offer.count()) === 1)
+  check('poster: says no sign-in is needed', (await page.locator('.poster-panel').innerText()).includes('No sign-in is needed'))
+  const made = `${ORIGIN}/#/navigate?b=b1`
 
   // Open the poster. Network requests must stay on this site (no external QR service).
   const externalBefore = (st.external || []).length
+  await settled(offer)
   await offer.click()
   const dialog = page.getByRole('dialog', { name: 'Entrance poster for Hall B' })
   await dialog.waitFor({ timeout: 5000 }).catch(() => {})
@@ -445,7 +438,7 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   check('poster: the building name is the heading', (await page.locator('h1.poster-name').innerText()) === 'Hall B')
   check('poster: "Scan for directions inside Hall B"', (await page.locator('.poster-cta').innerText()) === 'Scan for directions inside Hall B')
   const printed = await page.locator('.poster-link').innerText()
-  check('poster: the link written below matches the link copied', printed === made, printed)
+  check('poster: the link written below matches the directions link', printed === made, printed)
   check('poster: the app underneath is inert while the poster is open', await page.evaluate(() => document.getElementById('root').inert === true))
   check('poster: no request leaves this site while it renders', (st.external || []).length === externalBefore, JSON.stringify((st.external || []).slice(externalBefore)))
 
@@ -467,7 +460,7 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
     return found[0]?.rawValue ?? ''
   })
   if (decoded === null) console.log('INFO  poster: BarcodeDetector not available in this browser, decode skipped')
-  else check('poster: the code decodes to the join link', decoded === made, String(decoded).slice(0, 120))
+  else check('poster: the code decodes to the directions link', decoded === made, String(decoded).slice(0, 120))
 
   // Print: only the poster prints. The app is hidden and the poster is laid out on its own.
   await page.emulateMedia({ media: 'print' })
@@ -497,9 +490,7 @@ for (const [vpName, vp] of [['desktop', DESKTOP], ['mobile', MOBILE]]) {
   await sleep(150)
   check('poster: Close button closes it', (await dialog.count()) === 0)
 
-  // Revoking the invite switches the poster off: the link stops working, and the made region goes with "Done".
-  await page.getByRole('button', { name: 'Done' }).click()
-  check('poster: "Done" removes the offer', (await page.getByRole('button', { name: 'Make a poster' }).count()) === 0)
+  check('poster: the link carries no token', !printed.includes('&t=') && /#\/navigate\?b=b1$/.test(printed), printed)
   check('poster: no page errors', realErrors(errors).length === 0, realErrors(errors).join('|').slice(0, 200))
   await ctx.close()
 }

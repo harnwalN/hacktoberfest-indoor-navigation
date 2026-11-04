@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app import config, gemma, mapper, store
 from app.main import app
 from app.schemas import Edge, FrameAnalysis, Keyframe, MapBundle, Node, VideoInfo
+from tests.auth_helpers import owner_headers
 
 
 def _quiet(*_):
@@ -212,7 +213,7 @@ def client(tmp_path, monkeypatch):
     b.suggested_merges = [mapper.SuggestedMerge(id="m001", keep="n001", remove="n009", confidence=0.6,
                                                 reason="70 matching image features")]
     store.save_map(b)
-    return TestClient(app), bid
+    return TestClient(app, headers=owner_headers()), bid
 
 
 def test_manual_merge_across_floors_is_400_and_map_unchanged(client):
@@ -298,7 +299,7 @@ def test_probe_consolidate_default_to_default_still_merges(monkeypatch, tmp_path
 
 def test_probe_unknown_node_id_in_merge_endpoints(client):
     c, bid = client
-    c2 = TestClient(app, raise_server_exceptions=False)
+    c2 = TestClient(app, raise_server_exceptions=False, headers=owner_headers())
     r = c2.post(f"/api/buildings/{bid}/merge", json={"keep": "n001", "remove": "nope"})
     assert r.status_code == 400  # guarded by the id check in manual_merge
     s = store.load_map(bid)
